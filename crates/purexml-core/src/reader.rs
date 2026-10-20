@@ -1300,7 +1300,10 @@ impl Engine {
             };
             // Same rule as entity expansion: the full value counts on every
             // injection, even though the bytes live in one shared `Arc`.
-            self.ratio_bytes += (name.len() + value.len()) as u64;
+            // Saturating addition never panics if a raised input cap lets the
+            // numerator reach `u64::MAX`.
+            let charge = (name.len() as u64).saturating_add(value.len() as u64);
+            self.ratio_bytes = self.ratio_bytes.saturating_add(charge);
             let position = self.err_pos();
             self.check_expansion_ratio(position)?;
             attrs.push((owned_qname(&name), RawStr::Shared(value)));
@@ -2257,7 +2260,7 @@ impl Engine {
         }
         let repl_len = self.entities[idx].len() as u64;
         self.expanded_bytes += repl_len;
-        self.ratio_bytes += repl_len;
+        self.ratio_bytes = self.ratio_bytes.saturating_add(repl_len);
         if self.expanded_bytes > self.config.max_expanded_bytes {
             return Err(Error::new(
                 ErrorKind::SecurityLimit {
@@ -2285,7 +2288,13 @@ impl Engine {
     fn check_expansion_ratio(&self, position: Position) -> Result<()> {
         if self.ratio_bytes > EXPANSION_RATIO_FLOOR_BYTES {
             let consumed = self.pos as u64;
-            let allowed = consumed.saturating_mul(self.config.max_expansion_ratio);
+            // `u64::MAX` disables the check even when nothing has been
+            // consumed yet: `0 * u64::MAX` would otherwise stay 0.
+            let allowed = if self.config.max_expansion_ratio == u64::MAX {
+                u64::MAX
+            } else {
+                consumed.saturating_mul(self.config.max_expansion_ratio)
+            };
             if self.ratio_bytes > allowed {
                 return Err(Error::new(
                     ErrorKind::SecurityLimit {

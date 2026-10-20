@@ -101,7 +101,9 @@ assert_eq!(
 - 这些默认属性字节**不**计入 1 MiB 的 `ExpandedBytes`，也**不**计入实体展开次数
 - 分母：到目前为止已经消费的**原始输入**字节数（解析游标，不是整个缓冲区的长度，也不把替换文本算进分母）
 - 只有分子 **大于** 64 KiB 之后才比较
-- 若分子大于 `分母 * max_expansion_ratio`，错误为 `ExpansionRatio`。此时 `limit` 是当时允许的字节数（`已消费字节 * 比率`），`actual` 是比率分子
+- 若分子大于 `分母 * max_expansion_ratio`，错误为 `ExpansionRatio`。此时 `limit` 是当时允许的字节数（`已消费字节 * 比率`，乘法饱和），`actual` 是比率分子。分子用饱和加法，加到 `u64::MAX` 就停住，不会 panic
+- `max_expansion_ratio = 0`：分子一旦大于 64 KiB，允许量是 0，下一次展开或补默认属性就报 `ExpansionRatio`。不超过地板时仍然通过
+- `max_expansion_ratio = u64::MAX`：比率检查关闭。一般实体展开仍受 1 MiB 的 `ExpandedBytes` 约束
 
 内部一般实体默认可用，但受上述上限约束。预定义实体（`lt` `gt` `amp` `apos` `quot`）和字符引用不计入展开次数。不存在任何开关可以打开外部实体或外部 DTD 加载。
 

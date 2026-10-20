@@ -223,41 +223,46 @@ fn check_distinct_attributes(attributes: &[Attribute<'_>]) -> Result<(), WriteEr
     Ok(())
 }
 
+/// Reserved-namespace rules shared by the event API and the string API.
+fn check_namespace_binding(prefix: Option<&str>, uri: &str) -> Result<(), WriteError> {
+    if prefix == Some("xmlns") {
+        return Err(WriteError::Syntax(
+            "the xmlns prefix must not be declared".to_string(),
+        ));
+    }
+    if prefix == Some("xml") && uri != XML_NAMESPACE {
+        return Err(WriteError::Syntax(
+            "the xml prefix is bound to the XML namespace".to_string(),
+        ));
+    }
+    if prefix.is_some() && uri.is_empty() {
+        return Err(WriteError::Syntax(
+            "a prefixed namespace declaration must not have an empty URI".to_string(),
+        ));
+    }
+    if uri == XML_NAMESPACE && prefix != Some("xml") {
+        return Err(WriteError::Syntax(
+            "the XML namespace must not be bound to another prefix".to_string(),
+        ));
+    }
+    if uri == XMLNS_NAMESPACE {
+        return Err(WriteError::Syntax(
+            "the xmlns namespace must not be declared".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn check_namespace_decls(namespaces: &[Namespace<'_>]) -> Result<(), WriteError> {
     let mut seen_prefix: HashSet<Option<&str>> = HashSet::with_capacity(namespaces.len());
     for ns in namespaces {
         let prefix = ns.prefix.as_deref();
-        let uri = ns.uri.as_str();
         if !seen_prefix.insert(prefix) {
             return Err(WriteError::Syntax(
                 "duplicate namespace declaration".to_string(),
             ));
         }
-        if prefix == Some("xmlns") {
-            return Err(WriteError::Syntax(
-                "the xmlns prefix must not be declared".to_string(),
-            ));
-        }
-        if prefix == Some("xml") && uri != XML_NAMESPACE {
-            return Err(WriteError::Syntax(
-                "the xml prefix is bound to the XML namespace".to_string(),
-            ));
-        }
-        if prefix.is_some() && uri.is_empty() {
-            return Err(WriteError::Syntax(
-                "a prefixed namespace declaration must not have an empty URI".to_string(),
-            ));
-        }
-        if uri == XML_NAMESPACE && prefix != Some("xml") {
-            return Err(WriteError::Syntax(
-                "the XML namespace must not be bound to another prefix".to_string(),
-            ));
-        }
-        if uri == XMLNS_NAMESPACE {
-            return Err(WriteError::Syntax(
-                "the xmlns namespace must not be declared".to_string(),
-            ));
-        }
+        check_namespace_binding(prefix, ns.uri.as_str())?;
     }
     Ok(())
 }
@@ -607,6 +612,9 @@ impl<W: Write> Writer<W> {
             } else {
                 regular.push((prefix, local, attr));
             }
+        }
+        for (prefix, uri) in &decls {
+            check_namespace_binding(*prefix, uri)?;
         }
         let mut expanded: HashSet<(String, String)> = HashSet::new();
         for (prefix, _) in &decls {

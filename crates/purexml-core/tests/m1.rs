@@ -682,6 +682,47 @@ fn expansion_ratio_is_streaming_and_respects_the_floor() {
 }
 
 #[test]
+fn expansion_ratio_zero_rejects_past_the_floor_and_max_disables_the_check() {
+    let under = ratio_doc(64, "", "");
+    assert!(
+        parse_with(
+            &under,
+            ParserConfig {
+                max_expansion_ratio: 0,
+                ..ParserConfig::default()
+            },
+        )
+        .is_ok(),
+        "at the 64 KiB floor a zero ratio still parses"
+    );
+
+    let err = parse_with(
+        &ratio_doc(65, "", ""),
+        ParserConfig {
+            max_expansion_ratio: 0,
+            ..ParserConfig::default()
+        },
+    )
+    .unwrap_err();
+    let (kind, limit, actual) = limit_of(&err);
+    assert_eq!(kind, LimitKind::ExpansionRatio);
+    assert_eq!(limit, 0);
+    assert!(actual > EXPANSION_RATIO_FLOOR_BYTES);
+
+    assert!(
+        parse_with(
+            &ratio_doc(65, "", ""),
+            ParserConfig {
+                max_expansion_ratio: u64::MAX,
+                ..ParserConfig::default()
+            },
+        )
+        .is_ok(),
+        "u64::MAX disables the ratio check"
+    );
+}
+
+#[test]
 fn injected_defaults_use_the_expansion_ratio_not_the_byte_cap() {
     let once = format!(
         "<!DOCTYPE r [<!ATTLIST e a CDATA \"{}\">]><r><e/></r>",

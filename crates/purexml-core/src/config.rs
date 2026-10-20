@@ -39,6 +39,10 @@ pub const DEFAULT_MAX_EXPANDED_BYTES: u64 = 1024 * 1024;
 /// [`ParserConfig::max_expansion_ratio`] for that use. Injected defaults do
 /// not count toward [`DEFAULT_MAX_EXPANDED_BYTES`] or
 /// [`DEFAULT_MAX_ENTITY_EXPANSIONS`].
+///
+/// The numerator uses saturating addition. The allowed size is
+/// `bytes_consumed * max_expansion_ratio`, also saturated. See
+/// [`ParserConfig::max_expansion_ratio`] for `0` and [`u64::MAX`].
 pub const DEFAULT_MAX_EXPANSION_RATIO: u64 = 10;
 
 /// The expansion-ratio check is skipped while the ratio numerator is less
@@ -75,6 +79,17 @@ pub struct ParserConfig {
     /// bytes and its full value bytes to the numerator, even though the
     /// value is a shared `Arc`. Heavy default-attribute use may require
     /// raising this limit. See [`DEFAULT_MAX_EXPANSION_RATIO`].
+    ///
+    /// `0` allows no growth once the numerator passes
+    /// [`EXPANSION_RATIO_FLOOR_BYTES`]. The allowed numerator is then 0, so
+    /// the next entity expansion or default injection is
+    /// [`crate::LimitKind::ExpansionRatio`]. Input that stays at or below
+    /// the floor still parses.
+    ///
+    /// [`u64::MAX`] turns this check off. The allowed numerator is
+    /// [`u64::MAX`], the comparison is strict, and neither the multiply nor
+    /// the numerator's saturating add panics. General-entity expansion is
+    /// still capped by [`Self::max_expanded_bytes`].
     pub max_expansion_ratio: u64,
 }
 
