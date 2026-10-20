@@ -16,3 +16,13 @@
 | writer_roundtrip-crash-a91aac12-min.xml | M1 第三轮 writer_roundtrip 目标（2026-10-21 01:19 台北时间，ddaaacc）最小化 | 真实缺陷 D23（同族）：Reader 接受 DOCTYPE 名 `r:`（不是 QName），Writer 拒绝写出 |
 
 M1 测试轮：第 3 轮 parse、reader 各连续跑 900 秒（另有前两轮约 25 分钟，期间只有 box 暂停导致的假超时），没有发现真实的 crash / OOM / 超时。
+
+### D23 已知模式（Lead 第三轮裁决：D23 移到 M2，fuzz 不跳过）
+
+`fuzz/fuzz_targets/writer_roundtrip.rs` **不对 D23 做任何过滤或跳过**。在 D23 修复（M2）之前，writer_roundtrip 预计还会反复报出下面这类“解析成功、写不回去”的崩溃，分拣时归入 D23，不算新缺陷：
+
+- PI 目标含冒号：`<?a: x?>`、`<?a:b x?>`（Writer 报 `Syntax("empty name")` 或 invalid name）
+- DOCTYPE 名不是 QName：`<!DOCTYPE r: ...>`、`<!DOCTYPE a:b:c>`
+- 实体名、记号名含冒号（只出现在内部子集里，Reader 不产生对应事件，一般不会触发往返失败）
+
+崩溃信息里 panic 的事件是 `ProcessingInstruction` 或 `Doctype`、名字含 `:`，就属于这一类。其他任何 writer_roundtrip 崩溃仍按新缺陷分拣。断言在 `tests/regression_m1.rs::d23_colons_in_pi_entity_notation_names_rejected`（`#[ignore = "M2: D23"]`，用 `cargo test -- --ignored` 运行）。

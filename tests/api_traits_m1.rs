@@ -333,7 +333,7 @@ fn xmltext_methods_and_traits() {
     );
     // Display
     assert_eq!(format!("{b}|{s}"), "abc|abc");
-    assert_eq!(format!("{b:>5}"), "  abc", "Display 应遵守格式化宽度");
+    // Display 的宽度和对齐（D24）拆到 xmltext_display_respects_width，M2 处理
     // into_owned / into_cow / From<XmlText> for Cow：借用值转 Cow 时保持借用、不分配
     let (cow, n) = measure(|| b.clone().into_cow());
     assert!(matches!(cow, Cow::Borrowed("abc")));
@@ -344,6 +344,14 @@ fn xmltext_methods_and_traits() {
     assert_eq!(cow, "abc");
     assert_eq!(b.clone().into_owned(), String::from("abc"));
     assert_eq!(s.clone().into_owned(), String::from("abc"));
+}
+
+/// D24（M2）：Display 应遵守格式化宽度和对齐（从 xmltext_methods_and_traits 原样拆出，断言不变）
+#[test]
+fn xmltext_display_respects_width() {
+    let buf = String::from("abc");
+    let b = XmlText::borrowed(&buf);
+    assert_eq!(format!("{b:>5}"), "  abc", "Display 应遵守格式化宽度");
 }
 
 /// Debug 和 Eq、Hash 一样只取决于内容：两个变体的 Debug 输出必须相同，并且与 `str` 的 Debug 一致。
@@ -358,8 +366,10 @@ fn xmltext_debug_is_content_based() {
 
 // ───────────── 零拷贝 ─────────────
 
-#[test]
-fn borrowed_paths_are_zero_copy() {
+/// 零拷贝扫描：from_bytes 和 from_str 两条路径，返回没有借用输入（或不在输入缓冲内）的字段。
+/// 每个事件的分配量上限（与 1 MiB 值长度无关）和检查点数量在扫描内直接断言。
+fn zero_copy_violations() -> Vec<String> {
+    let mut all_bad: Vec<String> = Vec::new();
     let big = "v".repeat(1 << 20);
     let doc = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE r SYSTEM \"s.dtd\"><r xmlns:p=\"urn:p\" a=\"{big}\" p:b=\"plain\">{big}<![CDATA[{big}]]><!--{big}--><?t {big}?><p:k/></r>"
@@ -419,11 +429,32 @@ fn borrowed_paths_are_zero_copy() {
             }
         }
         assert!(seen >= 16, "{mode}: 只检查了 {seen} 处");
-        assert!(
-            bad.is_empty(),
-            "没有借用输入（或不在输入缓冲内）的字段：{bad:?}"
-        );
+        all_bad.extend(bad);
     }
+    all_bad
+}
+
+/// 除 Namespace.prefix 外的全部字段（与下面的完整断言重叠；保留它是为了在 D25 未修时仍能单独看出其余字段是否回退）
+#[test]
+fn borrowed_paths_are_zero_copy_m1() {
+    let bad: Vec<String> = zero_copy_violations()
+        .into_iter()
+        .filter(|x| !x.ends_with(": ns prefix"))
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "没有借用输入（或不在输入缓冲内）的字段：{bad:?}"
+    );
+}
+
+/// 完整断言（含 Namespace.prefix）。Lead 已定 D25 在 M1 修，保持开启
+#[test]
+fn borrowed_paths_are_zero_copy() {
+    let bad = zero_copy_violations();
+    assert!(
+        bad.is_empty(),
+        "没有借用输入（或不在输入缓冲内）的字段：{bad:?}"
+    );
 }
 
 /// 反面对照：需要实体展开或规范化的值必须是自有的，内容正确
