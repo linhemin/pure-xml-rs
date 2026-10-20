@@ -37,3 +37,10 @@ path = "fuzz_targets/writer_roundtrip.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "parse_small_stack"
+path = "fuzz_targets/parse_small_stack.rs"
+test = false
+doc = false
+bench = false

@@ -438,3 +438,267 @@ fn d19_expanded_name_dedup_not_proportional_to_uri_length() {
         "用时 {e:?}：属性去重随 URI 长度线性增长"
     );
 }
+
+// ═════════════ 第三轮（ddaaacc）新增 ═════════════
+//
+// 按 ddaaacc 的 XmlText API 编写。各缺陷的实测数据见 M1-test-report.md 第三轮。
+
+fn failure(x: &str) -> Option<common::Failure> {
+    common::parse_default(x.as_bytes()).err()
+}
+
+// ───────────── D14 残留：字面默认值每个元素都重新做一遍 UTF-8 校验 ─────────────
+
+/// 16 MiB 字面 CDATA 默认值，加 1 万个 `<e/>`（输入约 16.8 MB，其中元素部分只有 40 KB）。
+/// 6b29230 把字面默认值保存为输入里的区间，每次物化时都调用 `std::str::from_utf8` 重新校验整段，
+/// 实测 6.3 s（约 0.63 ms/元素）。按 Lead 的 O(1) 共享语义，应在 1.5 s 内完成，主要耗时只是读一遍输入。
+#[test]
+fn d14_literal_default_not_revalidated_per_element() {
+    let s = format!(
+        "<!DOCTYPE r [<!ATTLIST e a CDATA \"{}\">]><r>{}</r>",
+        "v".repeat((16 << 20) - 64),
+        "<e/>".repeat(10_000)
+    );
+    let t = Instant::now();
+    let (r, peak) = guarded("d14r3", 60, s);
+    let e = t.elapsed();
+    assert_eq!(r, Ok(()));
+    assert!(peak < 64 << 20, "峰值 {peak}");
+    assert!(
+        e < Duration::from_millis(1500),
+        "用时 {e:?}：默认值随元素数整段重扫"
+    );
+}
+
+// ───────────── D21（新）：默认属性的数量放大不受任何限额约束 ─────────────
+
+/// 1024 个默认属性，加 5 万个 `<e/>`（输入约 300 KB）。每个 4 字节的空元素要补出 1024 个属性，
+/// 而且每次都复制属性名、建 HashSet，实测约 11 s。安全优先的实现要么把补出的默认属性计入限额
+/// （展开字节或比例）并报 SecurityLimit，要么做到与默认属性数无关。两种结果都接受，只要求在 2 s 内结束。
+#[test]
+fn d21_default_attribute_amplification_bounded() {
+    let mut d = String::from("<!DOCTYPE r [");
+    for i in 0..1024 {
+        d.push_str(&format!("<!ATTLIST e attribute_name_{i:04} CDATA \"\">"));
+    }
+    d.push_str("]>");
+    let s = format!("{d}<r>{}</r>", "<e/>".repeat(50_000));
+    let t = Instant::now();
+    let (r, _) = guarded("d21", 60, s);
+    let e = t.elapsed();
+    assert!(
+        matches!(r, Ok(()) | Err(ErrorClass::SecurityLimit)),
+        "{r:?}"
+    );
+    assert!(
+        e < Duration::from_secs(2),
+        "用时 {e:?}：默认属性放大没有上界"
+    );
+}
+
+// ───────────── D16 残留：EndElement 出错时留下 `</`；PUBLIC 缺少系统标识 ─────────────
+
+#[test]
+fn d16_end_element_error_leaves_no_partial_output() {
+    use purexml::{EndElement, Event, QName, Writer, XmlText};
+    let mut w = Writer::new(Vec::new());
+    let ev = Event::EndElement(EndElement {
+        name: QName {
+            prefix: None,
+            local: XmlText::borrowed("a b"),
+            namespace: None,
+        },
+    });
+    assert!(w.write_event(&ev).is_err());
+    assert!(
+        w.get_ref().is_empty(),
+        "出错后 sink 里留下了 {:?}",
+        String::from_utf8_lossy(w.get_ref())
+    );
+}
+
+/// `<!DOCTYPE r PUBLIC "p">` 不良构：doctypedecl 里的 ExternalID 写 PUBLIC 时必须同时给出 SystemLiteral
+#[test]
+fn d16_doctype_public_requires_system_id() {
+    use purexml::{Doctype, Event, Writer, XmlText};
+    let mut w = Writer::new(Vec::new());
+    let dt = Doctype {
+        name: XmlText::borrowed("r"),
+        system_id: None,
+        public_id: Some(XmlText::borrowed("p")),
+        has_internal_subset: false,
+    };
+    let r = w.write_event(&Event::Doctype(dt));
+    assert!(
+        r.is_err(),
+        "写出了不良构的 {:?}",
+        String::from_utf8_lossy(w.get_ref())
+    );
+}
+
+// ───────────── D22（新）：Writer 不检查重复属性和保留的命名空间声明 ─────────────
+
+#[test]
+fn d22_writer_rejects_duplicate_attributes() {
+    use purexml::Writer;
+    let mut w = Writer::new(Vec::new());
+    assert!(
+        w.write_start("a", &[("x", "1"), ("x", "2")]).is_err(),
+        "写出了不良构的 {:?}",
+        String::from_utf8_lossy(w.get_ref())
+    );
+    let mut w = Writer::new(Vec::new());
+    assert!(w.write_empty("a", &[("p:x", "1"), ("p:x", "2")]).is_err());
+}
+
+#[test]
+fn d22_writer_rejects_reserved_namespace_declarations() {
+    use purexml::{Event, Namespace, QName, StartElement, Writer, XmlText};
+    for (prefix, uri) in [
+        (Some("xmlns"), "urn:x"),
+        (Some("p"), ""),
+        (Some("xml"), "urn:not-xml"),
+        (None, "http://www.w3.org/2000/xmlns/"),
+    ] {
+        let el = StartElement {
+            name: QName {
+                prefix: None,
+                local: XmlText::borrowed("a"),
+                namespace: None,
+            },
+            attributes: vec![],
+            namespaces: vec![Namespace {
+                prefix: prefix.map(XmlText::borrowed),
+                uri: XmlText::borrowed(uri),
+            }],
+        };
+        let mut w = Writer::new(Vec::new());
+        assert!(
+            w.write_event(&Event::StartElement(el)).is_err(),
+            "命名空间不良构的声明被写出：{:?}",
+            String::from_utf8_lossy(w.get_ref())
+        );
+    }
+}
+
+// ───────────── D23（新）：PI 目标、实体名、记号名里的冒号 ─────────────
+//
+// Namespaces in XML §7："No entity names, processing instruction targets, or notation names contain any colons."
+// 6b29230 和 ddaaacc 全部接受；Writer 又拒绝 `a:` 但接受 `a:b`，所以解析成功的事件会写不出去（writer_roundtrip crash-543336e4）。
+
+#[test]
+fn d23_colons_in_pi_entity_notation_names_rejected() {
+    for x in [
+        "<r><?a:b x?></r>",
+        "<r><?a: x?></r>",
+        "<?p:q?><r/>",
+        "<!DOCTYPE r [<?a:b x?>]><r/>",
+        "<!DOCTYPE r [<!ENTITY a:b \"x\">]><r/>",
+        "<!DOCTYPE r [<!NOTATION a:b SYSTEM \"x\">]><r/>",
+        // DOCTYPE 名是元素类型名，必须是 QName（ddaaacc 上 writer_roundtrip crash-a91aac12）
+        "<!DOCTYPE r: SYSTEM \"x.dtd\"><r/>",
+        "<!DOCTYPE a:b:c><r/>",
+    ] {
+        assert_syntax(x);
+    }
+    assert_wf("<r><?ab x?></r>");
+}
+
+// ───────────── D18 边界：实体替换文本内的嵌套计入元素深度 ─────────────
+
+#[test]
+fn d18_entity_nesting_depth_boundary() {
+    let doc = |n: usize| {
+        format!(
+            "<!DOCTYPE r [<!ENTITY e \"{}{}\">]><r>&e;</r>",
+            "<a>".repeat(n),
+            "</a>".repeat(n)
+        )
+    };
+    // <r> 占 1 层，实体内 255 层，合计 256 层，正好达到上限
+    assert_eq!(class(&doc(255)), Ok(()));
+    let f = failure(&doc(256)).expect("257 层应报错");
+    assert_eq!(f.class, ErrorClass::SecurityLimit);
+    assert_eq!(f.limit.as_deref(), Some("ElementDepth"));
+    // 远超上限：报错且不崩溃（栈上限另见 stack_depth_m1.rs）
+    let f = failure(&doc(100_000)).expect("应报错");
+    assert_eq!(f.limit.as_deref(), Some("ElementDepth"));
+}
+
+// ───────────── D20 边界（默认配置）：内容模型 256 层通过，257 层报 ElementDepth ─────────────
+//
+// 1024 层上限和小栈余量会让 debug 构建栈溢出，单独放在 stack_depth_r3_m1.rs。
+
+#[test]
+fn d20_content_model_default_depth_boundary() {
+    let doc = |n: usize| {
+        format!(
+            "<!DOCTYPE r [<!ELEMENT r {}a{}>]><r/>",
+            "(".repeat(n),
+            ")".repeat(n)
+        )
+    };
+    let run = |s: String| {
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || common::parse_default(s.as_bytes()).map(|_| ()))
+            .unwrap()
+            .join()
+            .unwrap()
+    };
+    assert!(run(doc(256)).is_ok());
+    let f = run(doc(257)).unwrap_err();
+    assert_eq!(f.class, ErrorClass::SecurityLimit);
+    assert_eq!(f.limit.as_deref(), Some("ElementDepth"));
+    assert_eq!(f.limit_value, Some(256));
+}
+
+// ───────────── D15 / D19 第三轮复测：已修复，作为护栏 ─────────────
+
+/// D15 放大版：1024 个默认属性，500 个元素各自显式给全 1024 个属性。带不带 ATTLIST 的耗时比应低于 2 倍
+#[test]
+fn d15_presence_check_scaled_up() {
+    let mut el = String::from("<e");
+    for i in 0..1024 {
+        el.push_str(&format!(" a{i}=\"\""));
+    }
+    el.push_str("/>");
+    let body = format!("<r>{}</r>", el.repeat(500));
+    let mut dtd = String::from("<!DOCTYPE r [");
+    for i in 0..1024 {
+        dtd.push_str(&format!("<!ATTLIST e a{i} CDATA \"v\">"));
+    }
+    dtd.push_str("]>");
+    let with = format!("{dtd}{body}");
+    let without = format!("<!DOCTYPE r []>{body}");
+    let time = |x: &str| {
+        let t = Instant::now();
+        assert_eq!(class(x), Ok(()));
+        t.elapsed()
+    };
+    let _ = time(&without);
+    let b = time(&without);
+    let a = time(&with);
+    assert!(a < b * 2 + Duration::from_millis(50), "{a:?} vs {b:?}");
+}
+
+/// D19 放大版：16 MiB URI，100 个元素各带 1000 个该前缀的属性，输入约 17.9 MB，应在 3 s 内完成
+#[test]
+fn d19_sixteen_mib_uri_hundred_elements() {
+    let mut el = String::from("<p:e");
+    for i in 0..1000 {
+        el.push_str(&format!(" p:a{i}=\"1\""));
+    }
+    el.push_str("/>");
+    let s = format!(
+        "<r xmlns:p=\"{}\">{}</r>",
+        "u".repeat((16 << 20) - 64),
+        el.repeat(100)
+    );
+    let n = s.len();
+    let t = Instant::now();
+    let (r, peak) = guarded("d19r3", 30, s);
+    assert_eq!(r, Ok(()));
+    assert!(peak < 3 * n, "峰值 {peak} vs 输入 {n}");
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+}

@@ -25,7 +25,13 @@ enum N {
 }
 
 fn qn(q: &purexml::QName<'_>) -> String {
-    format!("{:?}|{}|{:?}", q.prefix, q.local, q.namespace.as_deref())
+    // 只比较文本内容：XmlText 的 Debug 会带出 Borrowed/Shared 内部表示，不能参与比较
+    format!(
+        "{:?}|{}|{:?}",
+        q.prefix.as_deref(),
+        &*q.local,
+        q.namespace.as_deref()
+    )
 }
 
 fn open(
@@ -35,12 +41,12 @@ fn open(
 ) -> String {
     let mut a: Vec<String> = attrs
         .iter()
-        .map(|x| format!("{}={:?}", qn(&x.name), x.value))
+        .map(|x| format!("{}={:?}", qn(&x.name), &*x.value))
         .collect();
     a.sort();
     let mut n: Vec<String> = nss
         .iter()
-        .map(|x| format!("{:?}={:?}", x.prefix, x.uri))
+        .map(|x| format!("{:?}={:?}", x.prefix.as_deref(), &*x.uri))
         .collect();
     n.sort();
     format!("{} {:?} {:?}", qn(name), a, n)
