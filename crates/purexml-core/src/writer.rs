@@ -183,6 +183,13 @@ fn check_name(name: &str) -> Result<(), WriteError> {
     Ok(())
 }
 
+fn split_qname(name: &str) -> (Option<&str>, &str) {
+    match name.split_once(':') {
+        Some((prefix, local)) => (Some(prefix), local),
+        None => (None, name),
+    }
+}
+
 fn check_ncname(name: &str) -> Result<(), WriteError> {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
@@ -256,14 +263,24 @@ fn check_namespace_decls(namespaces: &[Namespace<'_>]) -> Result<(), WriteError>
 }
 
 /// Writes events or individual nodes to any [`Write`] sink.
+///
+/// Open elements keep their namespace declarations. The string API resolves
+/// attribute prefixes against that stack and against `xmlns` declarations in
+/// the same call, then rejects duplicate expanded names before writing.
 pub struct Writer<W> {
     sink: W,
+    /// Declarations of elements opened and not yet closed, outermost first.
+    /// `None` is the default namespace, which does not apply to attributes.
+    ns_stack: Vec<Vec<(Option<String>, String)>>,
 }
 
 impl<W: Write> Writer<W> {
     /// Wrap a sink. Nothing is written until a `write_*` method is called.
     pub fn new(sink: W) -> Self {
-        Self { sink }
+        Self {
+            sink,
+            ns_stack: Vec::new(),
+        }
     }
 
     /// Write one event.
@@ -284,8 +301,12 @@ impl<W: Write> Writer<W> {
         }
     }
 
-    /// Write `<name attr="value">`. `name` is used literally and is not checked
-    /// beyond being non-empty.
+    /// Write `<name attr="value">`.
+    ///
+    /// Prefixes on attributes are resolved against `xmlns` declarations in
+    /// `attrs` and against declarations still in scope from elements this
+    /// writer has opened. Duplicate expanded names are rejected before any
+    /// byte of this call is written.
     pub fn write_start(&mut self, name: &str, attrs: &[(&str, &str)]) -> Result<(), WriteError> {
         self.write_start_raw(name, attrs, false)
     }
@@ -301,6 +322,7 @@ impl<W: Write> Writer<W> {
         self.sink.write_all(b"</")?;
         self.sink.write_all(name.as_bytes())?;
         self.sink.write_all(b">")?;
+        self.ns_stack.pop();
         Ok(())
     }
 
@@ -393,6 +415,7 @@ impl<W: Write> Writer<W> {
         self.sink.write_all(b"</")?;
         self.write_qname(&el.name)?;
         self.sink.write_all(b">")?;
+        self.ns_stack.pop();
         Ok(())
     }
 
@@ -504,6 +527,17 @@ impl<W: Write> Writer<W> {
             self.sink.write_all(b"/>")?;
         } else {
             self.sink.write_all(b">")?;
+            self.ns_stack.push(
+                namespaces
+                    .iter()
+                    .map(|ns| {
+                        (
+                            ns.prefix.as_ref().map(|prefix| prefix.as_str().to_string()),
+                            ns.uri.as_str().to_string(),
+                        )
+                    })
+                    .collect(),
+            );
         }
         Ok(())
     }
@@ -526,14 +560,7 @@ impl<W: Write> Writer<W> {
         empty: bool,
     ) -> Result<(), WriteError> {
         check_name(name)?;
-        let mut seen = HashSet::with_capacity(attrs.len());
-        for (attr, value) in attrs {
-            check_name(attr)?;
-            check_chars(value, "attribute value")?;
-            if !seen.insert(*attr) {
-                return Err(WriteError::Syntax(format!("duplicate attribute `{attr}`")));
-            }
-        }
+        let decls = self.check_raw_attributes(attrs)?;
         self.sink.write_all(b"<")?;
         self.sink.write_all(name.as_bytes())?;
         for (attr, value) in attrs {
@@ -547,8 +574,95 @@ impl<W: Write> Writer<W> {
             self.sink.write_all(b"/>")?;
         } else {
             self.sink.write_all(b">")?;
+            self.ns_stack.push(
+                decls
+                    .into_iter()
+                    .map(|(prefix, uri)| (prefix.map(str::to_string), uri.to_string()))
+                    .collect(),
+            );
         }
         Ok(())
+    }
+
+    /// Namespace declarations in this attribute list, after lexical and
+    /// expanded-name checks. Nothing is written on error.
+    fn check_raw_attributes<'a>(
+        &self,
+        attrs: &'a [(&'a str, &'a str)],
+    ) -> Result<Vec<(Option<&'a str>, &'a str)>, WriteError> {
+        let mut lexical = HashSet::with_capacity(attrs.len());
+        let mut decls = Vec::new();
+        let mut regular = Vec::new();
+        for &(attr, value) in attrs {
+            check_name(attr)?;
+            check_chars(value, "attribute value")?;
+            if !lexical.insert(attr) {
+                return Err(WriteError::Syntax(format!("duplicate attribute `{attr}`")));
+            }
+            let (prefix, local) = split_qname(attr);
+            if prefix == Some("xmlns") {
+                decls.push((Some(local), value));
+            } else if prefix.is_none() && local == "xmlns" {
+                decls.push((None, value));
+            } else {
+                regular.push((prefix, local, attr));
+            }
+        }
+        let mut expanded: HashSet<(String, String)> = HashSet::new();
+        for (prefix, _) in &decls {
+            let local = prefix.unwrap_or("xmlns");
+            if !expanded.insert((XMLNS_NAMESPACE.to_string(), local.to_string())) {
+                return Err(WriteError::Syntax(format!(
+                    "duplicate attribute `{}`",
+                    match prefix {
+                        Some(prefix) => format!("xmlns:{prefix}"),
+                        None => "xmlns".to_string(),
+                    }
+                )));
+            }
+        }
+        for (prefix, local, raw) in regular {
+            let Some(prefix) = prefix else {
+                continue;
+            };
+            let Some(uri) = self.lookup_prefix(&decls, prefix) else {
+                continue;
+            };
+            if uri.is_empty() {
+                continue;
+            }
+            if !expanded.insert((uri.to_string(), local.to_string())) {
+                return Err(WriteError::Syntax(format!("duplicate attribute `{raw}`")));
+            }
+        }
+        Ok(decls)
+    }
+
+    fn lookup_prefix<'a>(
+        &'a self,
+        local_decls: &'a [(Option<&str>, &str)],
+        prefix: &str,
+    ) -> Option<&'a str> {
+        if prefix == "xml" {
+            return Some(XML_NAMESPACE);
+        }
+        if let Some((_, uri)) = local_decls
+            .iter()
+            .rev()
+            .find(|(declared, _)| *declared == Some(prefix))
+        {
+            return Some(*uri);
+        }
+        for frame in self.ns_stack.iter().rev() {
+            if let Some((_, uri)) = frame
+                .iter()
+                .rev()
+                .find(|(declared, _)| declared.as_deref() == Some(prefix))
+            {
+                return Some(uri.as_str());
+            }
+        }
+        None
     }
 
     fn write_quoted(&mut self, value: &str) -> Result<(), WriteError> {
@@ -583,6 +697,31 @@ mod tests {
         );
         assert!(matches!(escape_text("plain"), Cow::Borrowed("plain")));
         assert!(matches!(escape_attribute("a'b"), Cow::Borrowed("a'b")));
+    }
+
+    #[test]
+    fn string_api_rejects_duplicate_expanded_names() {
+        let mut writer = Writer::new(Vec::new());
+        let err = writer.write_start(
+            "a",
+            &[
+                ("xmlns:p", "urn:x"),
+                ("xmlns:q", "urn:x"),
+                ("p:x", "1"),
+                ("q:x", "2"),
+            ],
+        );
+        assert!(err.is_err());
+        assert!(writer.get_ref().is_empty());
+
+        let mut writer = Writer::new(Vec::new());
+        writer.write_start("a", &[("xmlns:p", "urn:x")]).unwrap();
+        let err = writer.write_empty("b", &[("xmlns:q", "urn:x"), ("p:x", "1"), ("q:x", "2")]);
+        assert!(err.is_err());
+        assert_eq!(
+            String::from_utf8(writer.into_inner()).unwrap(),
+            "<a xmlns:p=\"urn:x\">"
+        );
     }
 
     #[test]
