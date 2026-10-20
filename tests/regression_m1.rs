@@ -323,7 +323,9 @@ fn d14_attlist_default_not_copied_per_element() {
         "v".repeat(4 << 20),
         "<e/>".repeat(20_000)
     );
-    let (r, peak) = guarded("d14", 5, s);
+    // 严格 D21 口径下 4 MiB × 2 万次注入远超默认 10 倍比例；本用例只测“不逐元素复制”，故显式调高比例
+    let cfg = purexml::ParserConfig::default().with_max_expansion_ratio(1_000_000);
+    let (r, peak, _) = parse_cfg_guarded("d14", 5, s, cfg);
     assert_eq!(r, Ok(()));
     assert!(peak < 32 << 20, "峰值 {peak} 字节");
 }
