@@ -54,10 +54,12 @@ pub enum LimitKind {
     /// Checked when a general entity is expanded and when a default attribute
     /// is injected, once the numerator exceeds
     /// [`crate::EXPANSION_RATIO_FLOOR_BYTES`]. The numerator is cumulative
-    /// replacement-text bytes, plus the name bytes of every injected default,
-    /// plus each shared default value's length the first time it is injected.
-    /// Those default bytes are not part of [`LimitKind::ExpandedBytes`] and
-    /// do not increment the expansion count.
+    /// replacement-text bytes plus, on every injection, the default
+    /// attribute's name bytes and its full value bytes. Sharing that value
+    /// in one `Arc` does not reduce the count. Those default bytes are not
+    /// part of [`LimitKind::ExpandedBytes`] and do not increment the
+    /// expansion count. Heavy default-attribute use may require a higher
+    /// `max_expansion_ratio`.
     /// `limit` is `bytes_consumed_so_far * max_expansion_ratio` and `actual`
     /// is the numerator. The denominator is original input bytes the parser
     /// has consumed, not the full buffer length and not bytes inside a

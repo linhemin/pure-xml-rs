@@ -697,9 +697,12 @@ fn injected_defaults_use_the_expansion_ratio_not_the_byte_cap() {
         "v".repeat(80 * 1024),
         "<e/>".repeat(20)
     );
-    assert!(
-        parse(&repeated).is_ok(),
-        "repeating one shared default value does not multiply its bytes in the ratio"
+    let err = must_err(&repeated);
+    let (kind, _, _) = limit_of(&err);
+    assert_eq!(
+        kind,
+        LimitKind::ExpansionRatio,
+        "twenty injections of one 80 KiB default exceed the expansion ratio"
     );
 
     let name = "n".repeat(400);

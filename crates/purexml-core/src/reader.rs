@@ -4,10 +4,13 @@
 //! `BufRead` source up to `max_total_input` and then walks that buffer; it
 //! never opens a file or a socket itself.
 //!
-//! General-entity limits are enforced incrementally:
-//! numerator = cumulative replacement-text bytes, denominator = original input
-//! bytes consumed so far. The ratio is checked on every expansion once the
-//! numerator exceeds [`EXPANSION_RATIO_FLOOR_BYTES`].
+//! General-entity limits are enforced incrementally. The expansion-ratio
+//! numerator is cumulative replacement-text bytes plus, on every injected
+//! default attribute, that attribute's name bytes and its full value bytes.
+//! The denominator is original input bytes consumed so far. The ratio is
+//! checked on every expansion and every default injection once the numerator
+//! exceeds [`EXPANSION_RATIO_FLOOR_BYTES`]. Repeating a large default may
+//! require a higher `max_expansion_ratio`.
 
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
@@ -214,9 +217,9 @@ struct AttDef {
     ///
     /// Validated once when the declaration is parsed, then shared. Applying
     /// the default clones the [`Arc`] and does not scan the bytes again.
+    /// Each injection still adds the full value length to the expansion-ratio
+    /// numerator.
     default_value: Option<Arc<str>>,
-    /// The shared value's length has already been added to the ratio numerator.
-    value_charged: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -365,9 +368,11 @@ struct Engine {
     expansion_count: u64,
     /// Entity replacement bytes. This is the absolute [`LimitKind::ExpandedBytes`] cap.
     expanded_bytes: u64,
-    /// Expansion-ratio numerator: `expanded_bytes` plus the name and value
-    /// bytes of every injected default attribute. Defaults do not move
-    /// `expanded_bytes` or `expansion_count`.
+    /// Expansion-ratio numerator: entity replacement bytes, plus the name
+    /// bytes and the full value bytes of every injected default attribute.
+    /// The value is one shared [`Arc`], and each injection still adds its
+    /// full length. Defaults do not move `expanded_bytes` or
+    /// `expansion_count`.
     ratio_bytes: u64,
 }
 
@@ -1117,7 +1122,6 @@ impl Engine {
             name,
             cdata,
             default_value,
-            value_charged: false,
         });
         Ok(())
     }
@@ -1289,25 +1293,14 @@ impl Engine {
                 .collect::<Vec<_>>()
         };
         for index in pending {
-            let (name, charge, value) = {
-                let def = &mut self
-                    .attlists
-                    .get_mut(element)
-                    .expect("attribute list")
-                    .order[index];
+            let (name, value) = {
+                let def = &self.attlists.get(element).expect("attribute list").order[index];
                 let value = Arc::clone(def.default_value.as_ref().expect("default value"));
-                // The shared value is one allocation, so its bytes join the
-                // numerator once. Every injection still adds the name: that
-                // string is materialized on the element, and it is what makes
-                // a long list of defaults expensive.
-                let mut charge = def.name.len() as u64;
-                if !def.value_charged {
-                    charge += value.len() as u64;
-                    def.value_charged = true;
-                }
-                (def.name.clone(), charge, value)
+                (def.name.clone(), value)
             };
-            self.ratio_bytes += charge;
+            // Same rule as entity expansion: the full value counts on every
+            // injection, even though the bytes live in one shared `Arc`.
+            self.ratio_bytes += (name.len() + value.len()) as u64;
             let position = self.err_pos();
             self.check_expansion_ratio(position)?;
             attrs.push((owned_qname(&name), RawStr::Shared(value)));
@@ -1470,34 +1463,41 @@ impl Engine {
         let mut nss = Vec::new();
         let mut regular = Vec::new();
         for (name, value) in attrs {
-            let prefix = name
-                .prefix
-                .as_ref()
-                .map(|value| value.as_str(input).to_string());
-            let local = name.local.as_str(input).to_string();
-            if prefix.as_deref() == Some("xmlns") || (prefix.is_none() && local == "xmlns") {
-                let decl_prefix = if prefix.is_some() { Some(local) } else { None };
-                nss.push((decl_prefix, value));
-            } else {
-                regular.push((name, value));
+            match name.prefix {
+                Some(prefix) if prefix.as_str(input) == "xmlns" => {
+                    // Keep the local-name slice. A literal `xmlns:p` stays a
+                    // borrow of the input on `Namespace.prefix`.
+                    nss.push((Some(name.local), value));
+                }
+                None if name.local.as_str(input) == "xmlns" => {
+                    nss.push((None, value));
+                }
+                prefix => {
+                    regular.push((
+                        RawQName {
+                            prefix,
+                            local: name.local,
+                        },
+                        value,
+                    ));
+                }
             }
         }
 
-        let mut prepared = Vec::with_capacity(nss.len());
         let mut raw_nss = Vec::with_capacity(nss.len());
         for (decl_prefix, value) in nss {
-            let uri = value.as_str(input).to_string();
-            self.validate_xmlns(decl_prefix.as_deref(), &uri)?;
+            let prefix_text = decl_prefix.as_ref().map(|prefix| prefix.as_str(input));
+            let uri_text = value.as_str(input);
+            self.validate_xmlns(prefix_text, uri_text)?;
+            // The intern pool is internal. The event keeps `decl_prefix` and
+            // `value`, so a declaration written in the input stays borrowed.
+            let interned_prefix = prefix_text.map(|prefix| self.intern(prefix));
+            let interned_uri = self.intern(uri_text);
             raw_nss.push(RawNs {
-                prefix: decl_prefix.clone().map(RawStr::Owned),
+                prefix: decl_prefix,
                 uri: value,
             });
-            prepared.push((decl_prefix, uri));
-        }
-        for (prefix, uri) in prepared {
-            let prefix = prefix.map(|prefix| self.intern(&prefix));
-            let uri = self.intern(&uri);
-            self.push_ns(prefix, uri, new_depth);
+            self.push_ns(interned_prefix, interned_uri, new_depth);
         }
 
         let resolved_name = self.resolve_name(input, qname, true)?;

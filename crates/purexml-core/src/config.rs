@@ -30,11 +30,14 @@ pub const DEFAULT_MAX_EXPANDED_BYTES: u64 = 1024 * 1024;
 /// `bytes_consumed * max_expansion_ratio` once
 /// [`EXPANSION_RATIO_FLOOR_BYTES`] is passed.
 ///
-/// The numerator is cumulative general-entity replacement bytes, plus the
-/// name bytes of every injected default attribute, plus each shared default
-/// value's length the first time that default is injected. Later elements
-/// that reuse the same `Arc` do not add the value again. Injected defaults
-/// do not count toward [`DEFAULT_MAX_EXPANDED_BYTES`] or
+/// The numerator is cumulative general-entity replacement bytes plus, on
+/// every injected default attribute, that attribute's name bytes and its
+/// full value bytes. The value is stored once in a shared `Arc`, and each
+/// injection still adds the full length, the same way entity expansion
+/// counts the full replacement every time. A document that applies a large
+/// default on many elements can exceed the ratio; raise
+/// [`ParserConfig::max_expansion_ratio`] for that use. Injected defaults do
+/// not count toward [`DEFAULT_MAX_EXPANDED_BYTES`] or
 /// [`DEFAULT_MAX_ENTITY_EXPANSIONS`].
 pub const DEFAULT_MAX_EXPANSION_RATIO: u64 = 10;
 
@@ -68,9 +71,10 @@ pub struct ParserConfig {
     /// Cumulative general-entity replacement bytes. Injected default
     /// attributes do not count toward this cap.
     pub max_expanded_bytes: u64,
-    /// Streaming ratio cap. The numerator includes entity replacement bytes,
-    /// every injected default attribute's name, and each shared default
-    /// value once. See [`DEFAULT_MAX_EXPANSION_RATIO`].
+    /// Streaming ratio cap. Every injected default attribute adds its name
+    /// bytes and its full value bytes to the numerator, even though the
+    /// value is a shared `Arc`. Heavy default-attribute use may require
+    /// raising this limit. See [`DEFAULT_MAX_EXPANSION_RATIO`].
     pub max_expansion_ratio: u64,
 }
 
