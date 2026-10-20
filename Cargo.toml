@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [".", "crates/purexml-core"]
+
+[package]
+name = "purexml"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT OR Apache-2.0"
+description = "Pure-Rust, security-first XML toolkit (facade)"
+readme = "README.md"
+repository = "https://github.com/linhemin/pure-xml-rs"
+keywords = ["xml", "parser", "security"]
+categories = ["parser-implementations"]
+
+[dependencies]
+purexml-core = { path = "crates/purexml-core", version = "0.1.0" }

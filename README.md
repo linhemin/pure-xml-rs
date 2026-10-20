@@ -1,2 +1,145 @@
-# pure-xml-rs
-Pure Rust high-performance, security-first XML toolkit. Foundational library for parsing, DOM, XPath, validation with safe defaults against XXE and related attacks. Autonomous development via Grok Bots.
+# purexml
+
+纯 Rust、安全优先的 XML 工具库。0.x 阶段只提供**流式拉取解析器**和**基础写出器**；DOM、XPath、校验与完整往返留到后续里程碑。
+
+**0.x API 不稳定**，在 1.0 之前事件、配置字段和错误结构都可能调整。
+
+解析器不包含任何 `unsafe`，也没有运行时依赖或 C 绑定。它**从不**根据 system id / public id 打开文件或网络；调用方传入的 `BufRead` 只是字节来源，解析器不会把外部标识符解释成路径。
+
+## 用法
+
+```rust
+use purexml::{Event, Reader};
+
+let xml = br#"<root id="1">hello</root>"#;
+let mut reader = Reader::from_bytes(xml);
+
+let start = reader.read_event().unwrap().unwrap();
+match start {
+    Event::StartElement(element) => {
+        assert_eq!(element.name.local.as_ref(), "root");
+        let id = element.attribute("id").unwrap();
+        assert_eq!(id.value.as_ref(), "1");
+        for attr in element.attributes() {
+            assert_eq!(attr.name.local.as_ref(), "id");
+        }
+    }
+    other => panic!("unexpected {other:?}"),
+}
+
+match reader.read_event().unwrap().unwrap() {
+    Event::Text(text) => assert_eq!(text.as_ref(), "hello"),
+    other => panic!("unexpected {other:?}"),
+}
+assert!(matches!(
+    reader.read_event().unwrap().unwrap(),
+    Event::EndElement(_)
+));
+assert!(reader.read_event().unwrap().is_none());
+```
+
+`read_event` 返回 `Result<Option<Event>>`。`Ok(None)` 表示根元素之后的输入已经结束。事件里的字符串在不需要换行规范化或实体展开时借用输入（`Cow::Borrowed`），否则为 `Cow::Owned`。下一次 `read_event` 之前必须放下当前事件。
+
+未声明的一般实体是语法错误：
+
+```rust
+use purexml::{ErrorKind, Reader};
+
+let mut reader = Reader::from_str("<a>&nope;</a>");
+let err = loop {
+    match reader.read_event() {
+        Ok(Some(_)) => {}
+        Ok(None) => panic!("expected an error"),
+        Err(err) => break err,
+    }
+};
+assert!(matches!(err.kind, ErrorKind::Syntax));
+assert_eq!(err.position.line, 1);
+```
+
+## 写出
+
+文本和属性的转义不同：属性额外转义双引号。
+
+```rust
+use purexml::Writer;
+
+let mut writer = Writer::new(Vec::new());
+writer.write_start("note", &[("lang", "a<b&\"c")]).unwrap();
+writer.write_text("x<y&z>").unwrap();
+writer.write_end("note").unwrap();
+let xml = String::from_utf8(writer.into_inner()).unwrap();
+assert_eq!(
+    xml,
+    "<note lang=\"a&lt;b&amp;&quot;c\">x&lt;y&amp;z&gt;</note>"
+);
+```
+
+## 安全默认
+
+这些限制都放在公开的 `ParserConfig` 里，默认值是同名常量。超出任一限制会得到 `ErrorKind::SecurityLimit`，并用 `LimitKind` 标出是哪一个。`limit` / `actual` 与该限制使用同一单位。
+
+| 常量 | 默认值 | `LimitKind` |
+| --- | --- | --- |
+| `DEFAULT_MAX_DEPTH` | 256 | `ElementDepth` |
+| `DEFAULT_MAX_ATTRS` | 1024 | `Attributes` |
+| `DEFAULT_MAX_NAME_LEN` | 1024 字节 | `NameLength` |
+| `DEFAULT_MAX_TEXT_LEN` | 16 MiB | `TextLength`（单个文本节点） |
+| `DEFAULT_MAX_TEXT_LEN` | 16 MiB | `AttrValueLength`（规范化并展开之后的单个属性值，`limit` 就是 `max_text_len`） |
+| `DEFAULT_MAX_TOTAL_INPUT` | 1 GiB | `TotalInput` |
+| `DEFAULT_MAX_ENTITY_DEPTH` | 8 | `EntityDepth`（文档中的引用算第 1 层，第 9 层失败） |
+| `DEFAULT_MAX_ENTITY_EXPANSIONS` | 10_000 | `EntityExpansions`（同一个实体的重复引用也计数；10_000 次可以，10_001 次失败） |
+| `DEFAULT_MAX_EXPANDED_BYTES` | 1 MiB | `ExpandedBytes` |
+| `DEFAULT_MAX_EXPANSION_RATIO` | 10 | `ExpansionRatio` |
+| `EXPANSION_RATIO_FLOOR_BYTES` | 64 KiB | 累计替换文本不超过该值时不检查比率 |
+
+展开比率按流式方式在**每一次**一般实体展开时计算：
+
+- 分子：到目前为止，所有展开产生的替换文本字节数（每次展开加上该实体的替换文本长度）
+- 分母：到目前为止已经消费的**原始输入**字节数（解析游标，不是整个缓冲区的长度，也不把替换文本算进分母）
+- 只有分子 **大于** 64 KiB 之后才比较
+- 若分子大于 `分母 * max_expansion_ratio`，错误为 `ExpansionRatio`。此时 `limit` 是当时允许的替换字节数（`已消费字节 * 比率`），`actual` 是累计替换字节数
+
+内部一般实体默认可用，但受上述上限约束。预定义实体（`lt` `gt` `amp` `apos` `quot`）和字符引用不计入展开次数。不存在任何开关可以打开外部实体或外部 DTD 加载。
+
+### DTD 与实体
+
+- `<!DOCTYPE>` 上的 `SYSTEM` / `PUBLIC` **不是错误**。外部子集直接跳过、从不读取；`Doctype` 事件会带上 `system_id` 和 `public_id`。
+- 内部子集里的一般实体声明会记录并允许在文档中展开。
+- 带 `SYSTEM` 或 `PUBLIC` 的**实体声明**（包括外部参数实体）是 `ExternalEntityForbidden`。
+- 内部参数实体声明（`<!ENTITY % name "...">`）允许，只记录、永不使用。
+- 任何参数实体引用 `%name;` 都是 `ExternalEntityForbidden`。
+- 引用没有内部声明的一般实体是 `Syntax`（即使 DOCTYPE 指向了外部 DTD，因为那个 DTD 不会被加载）。
+
+### 编码
+
+只接受 UTF-8。UTF-8 BOM 会跳过。UTF-16 BOM、无 BOM 的 UTF-16 `<?` 模式，或声明中的 UTF-16 / 其他编码，都是 `ErrorKind::Encoding`。0.x **不做转码**。非法 UTF-8 同样是 `Encoding`；非法 XML 码点（包括字符引用）是 `Syntax`。
+
+### 错误形状
+
+```text
+Error { kind, position, message }
+
+position: Position { line, column, offset }  // 行、列从 1 开始，offset 为原始输入字节，从 0 开始
+
+ErrorKind::SecurityLimit { kind: LimitKind, limit: u64, actual: u64 }
+ErrorKind::ExternalEntityForbidden
+ErrorKind::Syntax
+ErrorKind::Encoding
+ErrorKind::Io
+
+LimitKind::EntityDepth | EntityExpansions | ExpandedBytes | ExpansionRatio
+        | ElementDepth | Attributes | NameLength | TextLength
+        | TotalInput | AttrValueLength
+```
+
+列按 Unicode 标量值计数。展开过程中的错误位置指向原文档里最外层 `&`。
+
+## 模块
+
+- `purexml`：门面，重新导出 core。
+- `purexml-core`：`config`（限制与 `ParserConfig`）、`error`、`event`、`reader`（拉取解析）、`writer`（转义写出）。名字字符类是私有实现细节。
+
+## 许可证
+
+MIT OR Apache-2.0。见 `LICENSE-MIT` 与 `LICENSE-APACHE`。
