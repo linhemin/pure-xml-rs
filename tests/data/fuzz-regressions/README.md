@@ -10,5 +10,7 @@
 |---|---|---|
 | parse-slow-asan-e9e98bb9.bin | M1 测试轮 parse 目标第 1 次运行（2026-10-20 22:59 台北时间） | libFuzzer 报 timeout（57 秒），但两个目标在同一秒同时“超时”，判断是宿主机暂停造成的假超时。非插桩 release 下 0.6 ms 结束（Encoding：malformed UTF-8）。留作冒烟样本 |
 | reader-slow-asan-87bd6bea.bin | 同上，reader 目标 | 同上；release 下 1.1 ms 结束（SecurityLimit(ExpansionRatio)） |
+| parse-crash-stackoverflow-5830f432.bin | M1 第二轮 parse 目标（2026-10-21 00:21 台北时间），41 772 字节 | 真实缺陷 D18：实体替换文本内约 7000 层 `<a>` 嵌套，ASan 下栈溢出。非插桩 release 需要 8 MiB 栈下约 4.4 万层才溢出，最小化后的确定性复现见 `tests/stack_depth_m1.rs`（在内存中生成 10 万层，2 MiB 栈） |
+| writer_roundtrip-crash-42afd53c-min.xml | M1 第二轮 writer_roundtrip 目标（2026-10-21 00:15 台北时间），由 188 字节手工最小化到 45 字节 | 真实缺陷 D17：ATTLIST 默认属性名 `a:` 没有经过 QName 校验就被补上，Writer 写回时报 `invalid name`。断言在 `tests/regression_m1.rs::d17_*`；这里只回放 Reader（不 panic、两种入口一致） |
 
 M1 测试轮：第 3 轮 parse、reader 各连续跑 900 秒（另有前两轮约 25 分钟，期间只有 box 暂停导致的假超时），没有发现真实的 crash / OOM / 超时。
