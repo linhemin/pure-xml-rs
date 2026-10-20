@@ -25,10 +25,11 @@ use crate::name::{
     is_whitespace, is_xml_char,
 };
 
-/// Deepest ELEMENT content-model nesting walked recursively.
+/// Hard cap on ELEMENT content-model nesting, applied together with `max_depth`.
 ///
-/// `max_depth` still applies when it is smaller. The ceiling keeps a caller who
-/// raises `max_depth` from overflowing a 2 MiB thread stack.
+/// The walk is an explicit heap stack, so thread-stack use does not grow with
+/// the model. The ceiling still stops a caller who raises `max_depth` from
+/// building an arbitrarily deep model.
 const MODEL_DEPTH_CEILING: usize = 1024;
 
 /// Streaming XML reader.
@@ -211,14 +212,18 @@ struct AttDef {
     cdata: bool,
     /// `None` for `#REQUIRED` and `#IMPLIED`.
     ///
-    /// A literal default stays a range into the input. A normalized one is
-    /// interned once and shared, so applying it does not copy the bytes.
-    default_value: Option<StoredDefault>,
+    /// Validated once when the declaration is parsed, then shared. Applying
+    /// the default clones the [`Arc`] and does not scan the bytes again.
+    default_value: Option<Arc<str>>,
+    /// The shared value's length has already been added to the ratio numerator.
+    value_charged: bool,
 }
 
-enum StoredDefault {
-    Range(Range<usize>),
-    Shared(Arc<str>),
+#[derive(Clone, Copy)]
+struct ContentGroup {
+    allow_mixed: bool,
+    sep: Option<u8>,
+    saw_cp: bool,
 }
 
 #[derive(Default)]
@@ -358,7 +363,12 @@ struct Engine {
     entity_depth: usize,
     open_entities: Vec<usize>,
     expansion_count: u64,
+    /// Entity replacement bytes. This is the absolute [`LimitKind::ExpandedBytes`] cap.
     expanded_bytes: u64,
+    /// Expansion-ratio numerator: `expanded_bytes` plus the name and value
+    /// bytes of every injected default attribute. Defaults do not move
+    /// `expanded_bytes` or `expansion_count`.
+    ratio_bytes: u64,
 }
 
 impl Engine {
@@ -391,6 +401,7 @@ impl Engine {
             open_entities: Vec::new(),
             expansion_count: 0,
             expanded_bytes: 0,
+            ratio_bytes: 0,
         }
         .with_builtin_namespaces()
     }
@@ -925,59 +936,98 @@ impl Engine {
             self.advance_n(input, "ANY".len())?;
             return Ok(());
         }
-        self.parse_content_group(input, true, 1)
+        self.parse_content_group(input)
     }
 
-    /// Content-model parentheses are attacker-controlled. Recursion is capped
-    /// by `max_depth` and by [`MODEL_DEPTH_CEILING`], so raising `max_depth`
-    /// cannot overflow a 2 MiB thread stack.
-    fn parse_content_group(&mut self, input: &[u8], allow_mixed: bool, depth: usize) -> Result<()> {
+    /// Content-model parentheses are attacker-controlled. Nesting is an
+    /// explicit heap stack, capped by `max_depth` and [`MODEL_DEPTH_CEILING`],
+    /// so thread-stack use stays flat in every build profile.
+    fn parse_content_group(&mut self, input: &[u8]) -> Result<()> {
         let limit = self.config.max_depth.min(MODEL_DEPTH_CEILING);
+        let mut stack = Vec::new();
+        self.open_content_group(input, &mut stack, 1, true, limit)?;
+        while let Some(frame) = stack.last().copied() {
+            if !frame.saw_cp {
+                self.skip_ws(input)?;
+                self.reject_dtd_pe(input)?;
+                if self.starts_with(input, b"#PCDATA") {
+                    if !frame.allow_mixed {
+                        return Err(self.syntax(
+                            "mixed content is only allowed as the top-level content specification",
+                        ));
+                    }
+                    self.parse_mixed(input)?;
+                    stack.pop();
+                    if let Some(parent) = stack.last_mut() {
+                        parent.saw_cp = true;
+                    }
+                    continue;
+                }
+                self.push_content_particle(input, &mut stack, limit)?;
+                continue;
+            }
+            self.skip_ws(input)?;
+            self.reject_dtd_pe(input)?;
+            if let Some(sep) = self
+                .peek_byte(input)
+                .filter(|byte| matches!(byte, b'|' | b','))
+            {
+                if frame.sep.is_none() || frame.sep == Some(sep) {
+                    stack.last_mut().expect("open content group").sep = Some(sep);
+                    self.advance_one(input)?;
+                    self.skip_ws(input)?;
+                    self.reject_dtd_pe(input)?;
+                    self.push_content_particle(input, &mut stack, limit)?;
+                    continue;
+                }
+            }
+            self.expect_byte(input, b')')?;
+            self.skip_occurrence(input)?;
+            stack.pop();
+            if let Some(parent) = stack.last_mut() {
+                parent.saw_cp = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn open_content_group(
+        &mut self,
+        input: &[u8],
+        stack: &mut Vec<ContentGroup>,
+        depth: usize,
+        allow_mixed: bool,
+        limit: usize,
+    ) -> Result<()> {
         if depth > limit {
             return Err(self.limit(LimitKind::ElementDepth, limit as u64, depth as u64));
         }
         self.expect_byte(input, b'(')?;
-        self.skip_ws(input)?;
-        self.reject_dtd_pe(input)?;
-        if self.starts_with(input, b"#PCDATA") {
-            if !allow_mixed {
-                return Err(self.syntax(
-                    "mixed content is only allowed as the top-level content specification",
-                ));
-            }
-            return self.parse_mixed(input);
-        }
-        self.parse_cp(input, depth)?;
-        self.skip_ws(input)?;
-        self.reject_dtd_pe(input)?;
-        if matches!(self.peek_byte(input), Some(b'|' | b',')) {
-            let sep = self.peek_byte(input).unwrap_or(b'|');
-            let mut separated = false;
-            while self.peek_byte(input) == Some(sep) {
-                separated = true;
-                self.advance_one(input)?;
-                self.skip_ws(input)?;
-                self.reject_dtd_pe(input)?;
-                self.parse_cp(input, depth)?;
-                self.skip_ws(input)?;
-                self.reject_dtd_pe(input)?;
-            }
-            if sep == b'|' && !separated {
-                return Err(self.syntax("choice list is missing an alternative"));
-            }
-        }
-        self.expect_byte(input, b')')?;
-        self.skip_occurrence(input)
+        stack.push(ContentGroup {
+            allow_mixed,
+            sep: None,
+            saw_cp: false,
+        });
+        Ok(())
     }
 
-    fn parse_cp(&mut self, input: &[u8], depth: usize) -> Result<()> {
+    /// One `cp`: a name, or a nested group pushed onto `stack`.
+    fn push_content_particle(
+        &mut self,
+        input: &[u8],
+        stack: &mut Vec<ContentGroup>,
+        limit: usize,
+    ) -> Result<()> {
         self.reject_dtd_pe(input)?;
         if self.peek_byte(input) == Some(b'(') {
-            self.parse_content_group(input, false, depth + 1)
-        } else {
-            let _name = self.read_name(input, false)?;
-            self.skip_occurrence(input)
+            let depth = stack.len() + 1;
+            self.open_content_group(input, stack, depth, false, limit)?;
+            return Ok(());
         }
+        let _name = self.read_name(input, false)?;
+        self.skip_occurrence(input)?;
+        stack.last_mut().expect("open content group").saw_cp = true;
+        Ok(())
     }
 
     fn parse_mixed(&mut self, input: &[u8]) -> Result<()> {
@@ -1067,6 +1117,7 @@ impl Engine {
             name,
             cdata,
             default_value,
+            value_charged: false,
         });
         Ok(())
     }
@@ -1128,7 +1179,7 @@ impl Engine {
         Err(self.syntax("invalid attribute type"))
     }
 
-    fn parse_default_decl(&mut self, input: &[u8], cdata: bool) -> Result<Option<StoredDefault>> {
+    fn parse_default_decl(&mut self, input: &[u8], cdata: bool) -> Result<Option<Arc<str>>> {
         if self.starts_with_token(input, b"#REQUIRED") {
             self.advance_n(input, "#REQUIRED".len())?;
             return Ok(None);
@@ -1143,9 +1194,13 @@ impl Engine {
             self.reject_dtd_pe(input)?;
         }
         let raw = self.parse_attr_value(input)?;
+        // One UTF-8 check at the declaration. Later elements clone the `Arc`.
         if cdata {
             if let RawStr::Range(range) = raw {
-                return Ok(Some(StoredDefault::Range(range)));
+                let bytes = &input[range.start..range.end];
+                let text = std::str::from_utf8(bytes)
+                    .map_err(|_| self.encoding("malformed UTF-8 in attribute default"))?;
+                return Ok(Some(Arc::from(text)));
             }
         }
         let text = raw.into_string(input);
@@ -1154,7 +1209,7 @@ impl Engine {
         } else {
             crate::wf::collapse_spaces(&text)
         };
-        Ok(Some(StoredDefault::Shared(Arc::from(text))))
+        Ok(Some(Arc::from(text)))
     }
 
     fn parse_notation_decl(&mut self, input: &[u8]) -> Result<()> {
@@ -1217,27 +1272,47 @@ impl Engine {
         input: &[u8],
         element: &str,
         attrs: &mut Vec<(RawQName, RawStr)>,
-    ) {
-        let Some(list) = self.attlists.get(element) else {
-            return;
-        };
-        let mut explicit = HashSet::with_capacity(attrs.len());
-        for (qname, _) in attrs.iter() {
-            explicit.insert(raw_qname_string(input, qname));
-        }
-        for def in &list.order {
-            let Some(value) = &def.default_value else {
-                continue;
+    ) -> Result<()> {
+        let pending = {
+            let Some(list) = self.attlists.get(element) else {
+                return Ok(());
             };
-            if explicit.contains(&def.name) {
-                continue;
+            let mut explicit = HashSet::with_capacity(attrs.len());
+            for (qname, _) in attrs.iter() {
+                explicit.insert(raw_qname_string(input, qname));
             }
-            let raw = match value {
-                StoredDefault::Range(range) => RawStr::Range(range.clone()),
-                StoredDefault::Shared(text) => RawStr::Shared(Arc::clone(text)),
+            list.order
+                .iter()
+                .enumerate()
+                .filter(|(_, def)| def.default_value.is_some() && !explicit.contains(&def.name))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        };
+        for index in pending {
+            let (name, charge, value) = {
+                let def = &mut self
+                    .attlists
+                    .get_mut(element)
+                    .expect("attribute list")
+                    .order[index];
+                let value = Arc::clone(def.default_value.as_ref().expect("default value"));
+                // The shared value is one allocation, so its bytes join the
+                // numerator once. Every injection still adds the name: that
+                // string is materialized on the element, and it is what makes
+                // a long list of defaults expensive.
+                let mut charge = def.name.len() as u64;
+                if !def.value_charged {
+                    charge += value.len() as u64;
+                    def.value_charged = true;
+                }
+                (def.name.clone(), charge, value)
             };
-            attrs.push((owned_qname(&def.name), raw));
+            self.ratio_bytes += charge;
+            let position = self.err_pos();
+            self.check_expansion_ratio(position)?;
+            attrs.push((owned_qname(&name), RawStr::Shared(value)));
         }
+        Ok(())
     }
 
     fn normalize_typed_attr(
@@ -1383,7 +1458,7 @@ impl Engine {
 
         let elem_key = raw_qname_string(input, &qname);
         let mut attrs = attrs;
-        self.add_default_attributes(input, &elem_key, &mut attrs);
+        self.add_default_attributes(input, &elem_key, &mut attrs)?;
         if attrs.len() as u64 > self.config.max_attrs as u64 {
             return Err(self.limit(
                 LimitKind::Attributes,
@@ -1601,6 +1676,11 @@ impl Engine {
 
     fn parse_attr_value(&mut self, input: &[u8]) -> Result<RawStr> {
         let quote = self.require_quote(input)?;
+        if self.frames.is_empty() {
+            if let Some(raw) = self.try_plain_attr(input, quote)? {
+                return Ok(raw);
+            }
+        }
         let base_depth = self.frames.len();
         let start = self.pos;
         let mut buf = String::new();
@@ -1655,6 +1735,40 @@ impl Engine {
             self.check_len(buf.len(), LimitKind::AttrValueLength)?;
             Ok(RawStr::Owned(buf))
         }
+    }
+
+    /// ASCII attribute value with no references and no whitespace.
+    ///
+    /// Returns `None` without consuming when the value needs the normalizing
+    /// path. A hit advances over the value and its closing quote in one step
+    /// instead of one function call per byte.
+    fn try_plain_attr(&mut self, input: &[u8], quote: u8) -> Result<Option<RawStr>> {
+        if !self.frames.is_empty() || self.cr_pending {
+            return Ok(None);
+        }
+        let start = self.pos;
+        let bytes = &input[start..];
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let byte = bytes[i];
+            if byte == quote {
+                let len = i as u64;
+                self.column = self.column.saturating_add(len);
+                self.pos = start + i;
+                self.advance_one(input)?;
+                // Same as the slow path: the reported length is the finished
+                // value, not the first byte past the cap.
+                self.check_len(i, LimitKind::AttrValueLength)?;
+                return Ok(Some(RawStr::Range(start..start + i)));
+            }
+            // XML 1.0 Char excludes C0 controls and U+007F. Those, references,
+            // and '<' take the normalizing path (or its error).
+            if !(0x20..0x7F).contains(&byte) || byte == b'&' || byte == b'<' {
+                return Ok(None);
+            }
+            i += 1;
+        }
+        Ok(None)
     }
 
     fn parse_text(&mut self, input: &[u8]) -> Result<Option<RawStr>> {
@@ -2143,6 +2257,7 @@ impl Engine {
         }
         let repl_len = self.entities[idx].len() as u64;
         self.expanded_bytes += repl_len;
+        self.ratio_bytes += repl_len;
         if self.expanded_bytes > self.config.max_expanded_bytes {
             return Err(Error::new(
                 ErrorKind::SecurityLimit {
@@ -2154,24 +2269,7 @@ impl Engine {
                 "expanded byte cap exceeded",
             ));
         }
-        if self.expanded_bytes > EXPANSION_RATIO_FLOOR_BYTES {
-            let consumed = self.pos as u64;
-            let allowed = consumed.saturating_mul(self.config.max_expansion_ratio);
-            if self.expanded_bytes > allowed {
-                return Err(Error::new(
-                    ErrorKind::SecurityLimit {
-                        kind: LimitKind::ExpansionRatio,
-                        limit: allowed,
-                        actual: self.expanded_bytes,
-                    },
-                    origin,
-                    format!(
-                        "expansion ratio exceeded after consuming {consumed} input bytes (cap {})",
-                        self.config.max_expansion_ratio
-                    ),
-                ));
-            }
-        }
+        self.check_expansion_ratio(origin)?;
         self.entity_depth = new_depth;
         self.open_entities.push(idx);
         self.frames.push(Frame {
@@ -2181,6 +2279,28 @@ impl Engine {
             element_depth: self.stack.len(),
             markup_depth: self.markup_depth,
         });
+        Ok(())
+    }
+
+    fn check_expansion_ratio(&self, position: Position) -> Result<()> {
+        if self.ratio_bytes > EXPANSION_RATIO_FLOOR_BYTES {
+            let consumed = self.pos as u64;
+            let allowed = consumed.saturating_mul(self.config.max_expansion_ratio);
+            if self.ratio_bytes > allowed {
+                return Err(Error::new(
+                    ErrorKind::SecurityLimit {
+                        kind: LimitKind::ExpansionRatio,
+                        limit: allowed,
+                        actual: self.ratio_bytes,
+                    },
+                    position,
+                    format!(
+                        "expansion ratio exceeded after consuming {consumed} input bytes (cap {})",
+                        self.config.max_expansion_ratio
+                    ),
+                ));
+            }
+        }
         Ok(())
     }
 

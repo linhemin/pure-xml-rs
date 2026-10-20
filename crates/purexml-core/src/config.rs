@@ -26,12 +26,20 @@ pub const DEFAULT_MAX_ENTITY_EXPANSIONS: u64 = 10_000;
 /// Maximum cumulative replacement-text bytes produced by expansions.
 pub const DEFAULT_MAX_EXPANDED_BYTES: u64 = 1024 * 1024;
 
-/// `expanded_bytes` must not exceed `bytes_consumed * max_expansion_ratio`
-/// once [`EXPANSION_RATIO_FLOOR_BYTES`] is passed.
+/// The expansion-ratio numerator must not exceed
+/// `bytes_consumed * max_expansion_ratio` once
+/// [`EXPANSION_RATIO_FLOOR_BYTES`] is passed.
+///
+/// The numerator is cumulative general-entity replacement bytes, plus the
+/// name bytes of every injected default attribute, plus each shared default
+/// value's length the first time that default is injected. Later elements
+/// that reuse the same `Arc` do not add the value again. Injected defaults
+/// do not count toward [`DEFAULT_MAX_EXPANDED_BYTES`] or
+/// [`DEFAULT_MAX_ENTITY_EXPANSIONS`].
 pub const DEFAULT_MAX_EXPANSION_RATIO: u64 = 10;
 
-/// The expansion-ratio check is skipped while cumulative replacement bytes
-/// are less than or equal to this floor.
+/// The expansion-ratio check is skipped while the ratio numerator is less
+/// than or equal to this floor.
 pub const EXPANSION_RATIO_FLOOR_BYTES: u64 = 64 * 1024;
 
 /// Tunable limits for [`crate::Reader`].
@@ -57,9 +65,12 @@ pub struct ParserConfig {
     pub max_entity_depth: usize,
     /// How many general-entity expansions are allowed, counting repeats.
     pub max_entity_expansions: u64,
-    /// Cumulative replacement-text bytes allowed across all expansions.
+    /// Cumulative general-entity replacement bytes. Injected default
+    /// attributes do not count toward this cap.
     pub max_expanded_bytes: u64,
-    /// Streaming ratio cap. See [`DEFAULT_MAX_EXPANSION_RATIO`].
+    /// Streaming ratio cap. The numerator includes entity replacement bytes,
+    /// every injected default attribute's name, and each shared default
+    /// value once. See [`DEFAULT_MAX_EXPANSION_RATIO`].
     pub max_expansion_ratio: u64,
 }
 

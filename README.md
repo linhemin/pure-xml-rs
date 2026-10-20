@@ -93,14 +93,15 @@ assert_eq!(
 | `DEFAULT_MAX_ENTITY_EXPANSIONS` | 10_000 | `EntityExpansions`（同一个实体的重复引用也计数；10_000 次可以，10_001 次失败） |
 | `DEFAULT_MAX_EXPANDED_BYTES` | 1 MiB | `ExpandedBytes` |
 | `DEFAULT_MAX_EXPANSION_RATIO` | 10 | `ExpansionRatio` |
-| `EXPANSION_RATIO_FLOOR_BYTES` | 64 KiB | 累计替换文本不超过该值时不检查比率 |
+| `EXPANSION_RATIO_FLOOR_BYTES` | 64 KiB | 比率分子不超过该值时不检查比率 |
 
-展开比率按流式方式在**每一次**一般实体展开时计算：
+展开比率在**每一次**一般实体展开，以及**每一次**补上默认属性时计算：
 
-- 分子：到目前为止，所有展开产生的替换文本字节数（每次展开加上该实体的替换文本长度）
+- 分子：到目前为止，所有展开产生的替换文本字节数；每补上一个默认属性，再加上它的名字字节。每个默认值的长度只在第一次补上时加一次（值是一份共享的 `Arc<str>`，按元素重复累加会把单个大默认值判成比率超限）
+- 这些默认属性字节**不**计入 1 MiB 的 `ExpandedBytes`，也**不**计入实体展开次数
 - 分母：到目前为止已经消费的**原始输入**字节数（解析游标，不是整个缓冲区的长度，也不把替换文本算进分母）
 - 只有分子 **大于** 64 KiB 之后才比较
-- 若分子大于 `分母 * max_expansion_ratio`，错误为 `ExpansionRatio`。此时 `limit` 是当时允许的替换字节数（`已消费字节 * 比率`），`actual` 是累计替换字节数
+- 若分子大于 `分母 * max_expansion_ratio`，错误为 `ExpansionRatio`。此时 `limit` 是当时允许的字节数（`已消费字节 * 比率`），`actual` 是比率分子
 
 内部一般实体默认可用，但受上述上限约束。预定义实体（`lt` `gt` `amp` `apos` `quot`）和字符引用不计入展开次数。不存在任何开关可以打开外部实体或外部 DTD 加载。
 
@@ -114,8 +115,8 @@ assert_eq!(
 - 引用没有内部声明的一般实体是 `Syntax`（即使 DOCTYPE 指向了外部 DTD，因为那个 DTD 不会被加载）。`ATTLIST` 默认值里的一般实体也按这条检查，而且必须在使用前已经声明。
 - `ELEMENT` / `ATTLIST` / `NOTATION` 会做语法检查。`ATTLIST` 的默认值会补到元素上；非 `CDATA` 类型在普通属性规范化之后再折叠空白。属性值里经实体展开引入的字面 `<` 是 `Syntax`。
 - 字符引用只接受小写 `&#x`。位数不设上限，数值超出 XML `Char` 才拒绝。内容里的 `]]>` 只禁止三个字面字符连在一起；`]]&gt;` 是合法写法，解析结果是字符 `]]>`。
-- 实体替换文本的良构检查用堆上的元素栈，嵌套超过 `max_depth` 是 `SecurityLimit(ElementDepth)`，不会把线程栈打爆。`ELEMENT` 内容模型的括号嵌套同样受 `max_depth` 限制，并且不超过 1024 层。
-- `ATTLIST` 默认值若是输入里的一段原文，事件直接借用这段原文；需要规范化的默认值只分配一次，用 `Arc<str>` 共享。属性去重按驻留 URI 的指针比较，不按 URI 内容哈希。
+- 实体替换文本的良构检查用堆上的元素栈，嵌套超过 `max_depth` 是 `SecurityLimit(ElementDepth)`，不会把线程栈打爆。`ELEMENT` 内容模型也用堆上的显式栈，调用栈深度与嵌套层数无关；层数仍受 `max_depth` 限制，并且不超过 1024 层，超过是 `SecurityLimit(ElementDepth)`。
+- `ATTLIST` 默认值在声明处做一次 UTF-8 校验（非 `CDATA` 再折叠空白），结果放进一个 `Arc<str>`。之后每个元素只克隆这个 `Arc`，不再扫描原文。属性去重按驻留 URI 的指针比较，不按 URI 内容哈希。补上的默认属性的名字和值计入展开比率的分子。
 - 属性值和其他事件字符串都是 `XmlText`：字面量借用输入（`is_borrowed()`），共享默认值用 `Arc`。用 `as_str()` / `Deref` 取文本，用 `into_owned()` 或 `into_cow()` 拿走所有权。
 
 ## 工具链
@@ -125,6 +126,8 @@ assert_eq!(
 ## 留到 M2
 
 - **D11**：属性值只要走过实体展开或空白规范化，长度要等整个值读完才检查 `AttrValueLength`。临时缓冲仍受输入大小和 1 MiB 展开上限约束，安全套件里的 16 MiB+1 会报错。
+- **D23**：PI 目标、实体名、记法名里的冒号，以及 DOCTYPE 名是否必须是 QName。Reader 目前接受，Writer 拒绝其中一部分。
+- **D25**：`Namespace.prefix` 仍是声明时复制出来的字符串，不是输入切片。
 - DOM、XPath、校验和完整往返。`from_reader` 仍会把输入缓冲到 `max_total_input`。
 
 ### 编码

@@ -5,11 +5,12 @@
 //! URIs. Round-tripping a DOM is out of scope for 0.x.
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::io::Write;
 
 use crate::event::{
-    Attribute, Doctype, EmptyElement, EndElement, Event, Namespace, ProcessingInstruction,
-    StartElement, XmlDecl,
+    Attribute, Doctype, EmptyElement, EndElement, Event, Namespace, ProcessingInstruction, QName,
+    StartElement, XmlDecl, XMLNS_NAMESPACE, XML_NAMESPACE,
 };
 use crate::name::{is_ncname_char, is_ncname_start, is_pubid_char, is_xml_char};
 
@@ -193,6 +194,67 @@ fn check_ncname(name: &str) -> Result<(), WriteError> {
     Ok(())
 }
 
+/// Expanded name when a namespace URI is present, otherwise the lexical QName.
+fn attribute_identity<'a>(name: &'a QName<'a>) -> (Option<&'a str>, Option<&'a str>, &'a str) {
+    if name.namespace.is_some() {
+        (name.namespace.as_deref(), None, name.local.as_str())
+    } else {
+        (None, name.prefix.as_deref(), name.local.as_str())
+    }
+}
+
+fn check_distinct_attributes(attributes: &[Attribute<'_>]) -> Result<(), WriteError> {
+    let mut seen = HashSet::with_capacity(attributes.len());
+    for attr in attributes {
+        if !seen.insert(attribute_identity(&attr.name)) {
+            return Err(WriteError::Syntax(format!(
+                "duplicate attribute `{}`",
+                attr.name.local
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn check_namespace_decls(namespaces: &[Namespace<'_>]) -> Result<(), WriteError> {
+    let mut seen_prefix: HashSet<Option<&str>> = HashSet::with_capacity(namespaces.len());
+    for ns in namespaces {
+        let prefix = ns.prefix.as_deref();
+        let uri = ns.uri.as_str();
+        if !seen_prefix.insert(prefix) {
+            return Err(WriteError::Syntax(
+                "duplicate namespace declaration".to_string(),
+            ));
+        }
+        if prefix == Some("xmlns") {
+            return Err(WriteError::Syntax(
+                "the xmlns prefix must not be declared".to_string(),
+            ));
+        }
+        if prefix == Some("xml") && uri != XML_NAMESPACE {
+            return Err(WriteError::Syntax(
+                "the xml prefix is bound to the XML namespace".to_string(),
+            ));
+        }
+        if prefix.is_some() && uri.is_empty() {
+            return Err(WriteError::Syntax(
+                "a prefixed namespace declaration must not have an empty URI".to_string(),
+            ));
+        }
+        if uri == XML_NAMESPACE && prefix != Some("xml") {
+            return Err(WriteError::Syntax(
+                "the XML namespace must not be bound to another prefix".to_string(),
+            ));
+        }
+        if uri == XMLNS_NAMESPACE {
+            return Err(WriteError::Syntax(
+                "the xmlns namespace must not be declared".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Writes events or individual nodes to any [`Write`] sink.
 pub struct Writer<W> {
     sink: W,
@@ -327,6 +389,7 @@ impl<W: Write> Writer<W> {
     }
 
     fn write_end_element(&mut self, el: &EndElement<'_>) -> Result<(), WriteError> {
+        check_qname(&el.name)?;
         self.sink.write_all(b"</")?;
         self.write_qname(&el.name)?;
         self.sink.write_all(b">")?;
@@ -362,6 +425,11 @@ impl<W: Write> Writer<W> {
 
     fn write_doctype(&mut self, dtd: &Doctype<'_>) -> Result<(), WriteError> {
         check_name(&dtd.name)?;
+        if dtd.public_id.is_some() && dtd.system_id.is_none() {
+            return Err(WriteError::Syntax(
+                "PUBLIC identifier requires a system identifier".to_string(),
+            ));
+        }
         if let Some(public_id) = &dtd.public_id {
             check_pubid(public_id)?;
         }
@@ -407,6 +475,8 @@ impl<W: Write> Writer<W> {
             check_qname(&attr.name)?;
             check_chars(&attr.value, "attribute value")?;
         }
+        check_distinct_attributes(attributes)?;
+        check_namespace_decls(namespaces)?;
         self.sink.write_all(b"<")?;
         self.write_qname(name)?;
         for ns in namespaces {
@@ -456,9 +526,13 @@ impl<W: Write> Writer<W> {
         empty: bool,
     ) -> Result<(), WriteError> {
         check_name(name)?;
+        let mut seen = HashSet::with_capacity(attrs.len());
         for (attr, value) in attrs {
             check_name(attr)?;
             check_chars(value, "attribute value")?;
+            if !seen.insert(*attr) {
+                return Err(WriteError::Syntax(format!("duplicate attribute `{attr}`")));
+            }
         }
         self.sink.write_all(b"<")?;
         self.sink.write_all(name.as_bytes())?;

@@ -51,12 +51,17 @@ pub enum LimitKind {
     ExpandedBytes,
     /// Streaming expansion ratio.
     ///
-    /// Checked on every expansion once cumulative replacement bytes exceed
-    /// [`crate::EXPANSION_RATIO_FLOOR_BYTES`]. `limit` is
-    /// `bytes_consumed_so_far * max_expansion_ratio` and `actual` is the
-    /// cumulative replacement-text byte count. The denominator is original
-    /// input bytes the parser has consumed, not the full buffer length and not
-    /// bytes inside a replacement text.
+    /// Checked when a general entity is expanded and when a default attribute
+    /// is injected, once the numerator exceeds
+    /// [`crate::EXPANSION_RATIO_FLOOR_BYTES`]. The numerator is cumulative
+    /// replacement-text bytes, plus the name bytes of every injected default,
+    /// plus each shared default value's length the first time it is injected.
+    /// Those default bytes are not part of [`LimitKind::ExpandedBytes`] and
+    /// do not increment the expansion count.
+    /// `limit` is `bytes_consumed_so_far * max_expansion_ratio` and `actual`
+    /// is the numerator. The denominator is original input bytes the parser
+    /// has consumed, not the full buffer length and not bytes inside a
+    /// replacement text.
     ExpansionRatio,
     /// Element nesting depth.
     ElementDepth,
@@ -102,9 +107,9 @@ pub enum ErrorKind {
         kind: LimitKind,
         /// Configured maximum, in the units described by `kind`.
         ///
-        /// For [`LimitKind::ExpansionRatio`] this is the allowed replacement-byte
-        /// budget at the current input cursor (`consumed * max_expansion_ratio`),
-        /// not the bare ratio constant.
+        /// For [`LimitKind::ExpansionRatio`] this is the allowed numerator at
+        /// the current input cursor (`consumed * max_expansion_ratio`), not
+        /// the bare ratio constant.
         /// For [`LimitKind::AttrValueLength`] this is `max_text_len`.
         limit: u64,
         /// The measured value that exceeded `limit`.

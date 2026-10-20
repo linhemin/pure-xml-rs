@@ -41,7 +41,7 @@ pub struct QName<'a> {
 /// of the input — a normalized attribute, expanded text, or a shared DTD
 /// default — is one [`Arc`]. Equality, ordering of the bytes, and hashing
 /// follow the string contents, not which variant holds them.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct XmlText<'a> {
     inner: XmlTextInner<'a>,
 }
@@ -161,9 +161,15 @@ impl AsRef<str> for XmlText<'_> {
     }
 }
 
+impl fmt::Debug for XmlText<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_str(), formatter)
+    }
+}
+
 impl fmt::Display for XmlText<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
+        formatter.pad(self.as_str())
     }
 }
 

@@ -682,6 +682,39 @@ fn expansion_ratio_is_streaming_and_respects_the_floor() {
 }
 
 #[test]
+fn injected_defaults_use_the_expansion_ratio_not_the_byte_cap() {
+    let once = format!(
+        "<!DOCTYPE r [<!ATTLIST e a CDATA \"{}\">]><r><e/></r>",
+        "v".repeat(1_500_000)
+    );
+    assert!(
+        parse(&once).is_ok(),
+        "one injected default stays under the ratio and does not use the 1 MiB entity cap"
+    );
+
+    let repeated = format!(
+        "<!DOCTYPE r [<!ATTLIST e a CDATA \"{}\">]><r>{}</r>",
+        "v".repeat(80 * 1024),
+        "<e/>".repeat(20)
+    );
+    assert!(
+        parse(&repeated).is_ok(),
+        "repeating one shared default value does not multiply its bytes in the ratio"
+    );
+
+    let name = "n".repeat(400);
+    let mut decls = String::from("<!DOCTYPE r [");
+    for i in 0..200 {
+        decls.push_str(&format!("<!ATTLIST e {name}{i:04} CDATA \"\">"));
+    }
+    decls.push_str("]>");
+    let many = format!("{decls}<r>{}</r>", "<e/>".repeat(30));
+    let err = must_err(&many);
+    let (kind, _, _) = limit_of(&err);
+    assert_eq!(kind, LimitKind::ExpansionRatio);
+}
+
+#[test]
 fn expanded_bytes_attribute_text_name_depth_and_input_limits() {
     let err = parse_with(
         r#"<!DOCTYPE r [<!ENTITY a "0123456789ABCDEFGHIJ">]><r>&a;</r>"#,
