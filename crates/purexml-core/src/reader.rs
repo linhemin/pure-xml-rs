@@ -1156,10 +1156,7 @@ impl Engine {
             return Err(self.syntax(format!("invalid nmtoken start U+{:04X}", u32::from(first))));
         }
         let mut token = String::new();
-        loop {
-            let Some(ch) = self.peek_char(input)? else {
-                break;
-            };
+        while let Some(ch) = self.peek_char(input)? {
             if !is_name_char(ch) {
                 break;
             }
@@ -1617,20 +1614,29 @@ impl Engine {
         let mut buf = String::new();
         let mut brackets = 0u8;
         loop {
+            let depth = self.frames.len();
             self.pop_finished();
+            // `]]>` is forbidden only as three literal CharData characters.
+            // A reference ends that run, so `]]&gt;` is the well-formed spelling
+            // of the characters `]]>` and must not be rejected.
+            if self.frames.len() != depth {
+                brackets = 0;
+            }
             let Some(b) = self.peek_byte(input) else {
                 if self.frames.is_empty() {
                     break;
                 }
                 self.force_pop_frame();
+                brackets = 0;
                 continue;
             };
             if b == b'<' {
                 break;
             }
             if b == b'&' {
+                brackets = 0;
                 match self.expand_ref(input)? {
-                    RefOut::Char(ch) => self.push_text(&mut buf, &mut brackets, ch)?,
+                    RefOut::Char(ch) => self.push_limited(&mut buf, ch, LimitKind::TextLength)?,
                     RefOut::Pushed => {
                         self.pop_finished();
                         if self.peek_byte(input) == Some(b'<') {
@@ -1943,10 +1949,7 @@ impl Engine {
         let mut owned = String::new();
         self.consume_char(input)?;
         owned.push(first);
-        loop {
-            let Some(ch) = self.peek_char(input)? else {
-                break;
-            };
+        while let Some(ch) = self.peek_char(input)? {
             let ok = if ncname {
                 is_ncname_char(ch)
             } else {
@@ -2338,10 +2341,7 @@ impl Engine {
         if self.halt {
             return;
         }
-        loop {
-            let Some(frame) = self.frames.last() else {
-                break;
-            };
+        while let Some(frame) = self.frames.last() {
             let len = self
                 .entities
                 .get(frame.entity_idx)

@@ -110,17 +110,19 @@ assert_eq!(
 - 内部子集里的一般实体声明会记录并允许在文档中展开。替换文本必须本身是良构的 `content`：标签、注释、CDATA、处理指令不能跨过实体边界。
 - 带 `SYSTEM` 或 `PUBLIC` 的**实体声明**（包括外部参数实体）是 `ExternalEntityForbidden`。记法声明上的 SYSTEM/PUBLIC 只是标识符，会做语法检查，不会去加载。
 - 内部参数实体声明（`<!ENTITY % name "...">`）允许，只记录、永不使用。
-- 任何参数实体引用 `%name;` 都是 `ExternalEntityForbidden`。
-- 引用没有内部声明的一般实体是 `Syntax`（即使 DOCTYPE 指向了外部 DTD，因为那个 DTD 不会被加载）。
+- 任何参数实体引用 `%name;` 都是 `ExternalEntityForbidden`。属性默认值引号里的 `%` 是普通字符，不是参数实体引用。
+- 引用没有内部声明的一般实体是 `Syntax`（即使 DOCTYPE 指向了外部 DTD，因为那个 DTD 不会被加载）。`ATTLIST` 默认值里的一般实体也按这条检查，而且必须在使用前已经声明。
 - `ELEMENT` / `ATTLIST` / `NOTATION` 会做语法检查。`ATTLIST` 的默认值会补到元素上；非 `CDATA` 类型在普通属性规范化之后再折叠空白。属性值里经实体展开引入的字面 `<` 是 `Syntax`。
+- 字符引用只接受小写 `&#x`。位数不设上限，数值超出 XML `Char` 才拒绝。内容里的 `]]>` 只禁止三个字面字符连在一起；`]]&gt;` 是合法写法，解析结果是字符 `]]>`。
 
 ## 工具链
 
-库的 MSRV 是 1.70。测试或对照 `quick-xml` 0.42 时可能需要 Rust 1.86（不要使用有安全通告的 0.39）。见 `CONTRIBUTING.md`。
+库的 MSRV 是 1.70，没有运行时依赖。`cargo test` 会编译 dev-dependencies：`quick-xml` 0.42 要求 Rust 1.86，测试代码里的 `Option::is_none_or` 要求 1.82。本仓库本地用 stable 1.99.1 跑测试、clippy 和 fmt。不要把 `quick-xml` 降到 0.39（有安全通告）。见 `CONTRIBUTING.md`。
 
 ## 留到 M2
 
-D4、D6、D8、D9、D11 这次不修。本次工作区没有收到测试报告正文，所以这里不能复述这五项的具体症状；PR 说明里按测试员的编号列为已知问题。DOM、XPath、校验和完整往返同样属于后续里程碑。`from_reader` 仍会把输入缓冲到 `max_total_input`。
+- **D11**：属性值只要走过实体或空白规范化，长度要等整个值读完才检查。临时缓冲仍受输入大小和 1 MiB 展开上限约束，安全套件里的 16 MiB+1 用例会报错。
+- DOM、XPath、校验和完整往返。`from_reader` 仍会把输入缓冲到 `max_total_input`。
 
 ### 编码
 
