@@ -1,0 +1,13 @@
+[package]
+name = "purexml-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT OR Apache-2.0"
+description = "Security-first streaming XML pull parser and writer"
+readme = "../../README.md"
+repository = "https://github.com/linhemin/pure-xml-rs"
+keywords = ["xml", "parser", "security"]
+categories = ["parser-implementations"]
+
+[dependencies]

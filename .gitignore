@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+.DS_Store
+tests/w3c/xmlconf/
+tests/w3c/*.zip
+tests/w3c/out/

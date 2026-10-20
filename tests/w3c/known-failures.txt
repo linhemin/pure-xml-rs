@@ -1,0 +1,18 @@
+# W3C xmltest M1 已知失败（自动生成：PUREXML_W3C_UPDATE=1）
+# 格式：ID<TAB>类别<TAB>说明；policy-eef = 按 M1 安全策略拒绝（外部实体/参数实体）；policy-utf16 = M1 不支持 UTF-16；policy-ns = 违反命名空间约束；policy-5e = 第 5 版名字规则下合法；defect-* = 人工判定的缺陷
+not-wf-sa-140	policy-5e	ENTITIES=none Character '&amp;#x309a;' is a CombiningChar, not a Letter, and so may not begin a name.
+not-wf-sa-141	policy-5e	ENTITIES=none Character #x0E5C is not legal in XML names.
+valid-sa-012	policy-ns	ENTITIES=none Uses a legal XML 1.0 name consisting of a single colon character (disallowed by the latest XML Namespaces draft).
+valid-sa-049	policy-utf16	ENTITIES=none Test demonstrates that characters outside of normal ascii range can be used as element content.
+valid-sa-050	policy-utf16	ENTITIES=none Test demonstrates that characters outside of normal ascii range can be used as element content.
+valid-sa-051	policy-utf16	ENTITIES=none The document is encoded in UTF-16 and uses some name characters well outside of the normal ASCII range.
+valid-sa-070	policy-eef	ENTITIES=parameter Verifies that internal parameter entities are correctly expanded within the internal subset.
+valid-sa-082	policy-eef	ENTITIES=none Tests that an external PE may be defined (but not referenced).
+valid-sa-083	policy-eef	ENTITIES=none Tests that an external PE may be defined (but not referenced).
+valid-sa-091	policy-eef	ENTITIES=none Verifies that an XML parser will parse an ENTITY attribute; the output phase of this test ensures that the notation is reported to the application, and for validating parsers it further tests that the entity is so reported.
+valid-sa-097	policy-eef	ENTITIES=parameter Basically an output test, this tests whether an externally defined attribute declaration (with a default) takes proper precedence over a subsequent internal declaration.
+valid-sa-100	policy-eef	ENTITIES=none Makes sure that PUBLIC identifiers may have some strange characters. <EM>NOTE: The XML editors have said that the XML specification errata will specify that parameter entity expansion does not occur in PUBLIC identifiers, so that the '%' character will not flag a malformed parameter entity reference.</EM>
+valid-not-sa-011	policy-eef	ENTITIES=both Test demonstrates a parameter entity declaration whose parameter entity definition is an ExternalID.
+valid-not-sa-012	policy-eef	ENTITIES=both Test demonstrates an enternal parsed entity that begins with a text declaration.
+valid-not-sa-026	policy-eef	ENTITIES=both Test demonstrates that when more that one definition is provided for the same attribute of a given element type only the first declaration is binding.
+valid-not-sa-031	policy-ext-dtd-entity	ENTITIES=both Expands a general entity which contains a CDATA section with what looks like a markup declaration (but is just text since it's in a CDATA section).

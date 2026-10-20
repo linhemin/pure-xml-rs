@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<!DOCTYPE r [
+<!ENTITY e1 "&e2;">
+<!ENTITY e2 "&e3;">
+<!ENTITY e3 "&e4;">
+<!ENTITY e4 "&e5;">
+<!ENTITY e5 "&e6;">
+<!ENTITY e6 "&e7;">
+<!ENTITY e7 "&e8;">
+<!ENTITY e8 "leaf">
+]>
+<r>&e1;</r>

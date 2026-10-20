@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<!DOCTYPE r [
+<!ENTITY x PUBLIC "-//EVIL//X" "file:///etc/hostname">
+]>
+<r>&x;</r>

@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<!DOCTYPE r [
+<!ENTITY % q "'pwn'">
+<!ENTITY e %q;>
+]>
+<r>&e;</r>

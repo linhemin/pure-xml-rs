@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<!DOCTYPE r [
+<!NOTATION n SYSTEM "x">
+<!ENTITY x SYSTEM "file:///etc/passwd" NDATA n>
+]>
+<r/>

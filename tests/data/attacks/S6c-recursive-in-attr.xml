@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<!DOCTYPE r [
+<!ENTITY a "&b;">
+<!ENTITY b "&a;">
+]>
+<r x="&a;"/>
