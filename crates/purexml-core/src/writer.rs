@@ -11,7 +11,7 @@ use crate::event::{
     Attribute, Doctype, EmptyElement, EndElement, Event, Namespace, ProcessingInstruction,
     StartElement, XmlDecl,
 };
-use crate::name::{is_ncname_char, is_ncname_start, is_xml_char};
+use crate::name::{is_ncname_char, is_ncname_start, is_pubid_char, is_xml_char};
 
 /// Failure while writing XML.
 #[derive(Debug)]
@@ -107,6 +107,62 @@ fn check_chars(text: &str, what: &str) -> Result<(), WriteError> {
                 u32::from(ch)
             )));
         }
+    }
+    Ok(())
+}
+
+fn check_qname(name: &crate::event::QName<'_>) -> Result<(), WriteError> {
+    if let Some(prefix) = &name.prefix {
+        check_ncname(prefix)?;
+    }
+    check_ncname(&name.local)
+}
+
+fn check_version(version: &str) -> Result<(), WriteError> {
+    let Some(digits) = version.strip_prefix("1.") else {
+        return Err(WriteError::Syntax(format!(
+            "invalid XML version `{version}`"
+        )));
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(WriteError::Syntax(format!(
+            "invalid XML version `{version}`"
+        )));
+    }
+    Ok(())
+}
+
+fn check_encoding(encoding: &str) -> Result<(), WriteError> {
+    let mut chars = encoding.chars();
+    let Some(first) = chars.next() else {
+        return Err(WriteError::Syntax("empty encoding name".to_string()));
+    };
+    if !first.is_ascii_alphabetic()
+        || !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        return Err(WriteError::Syntax(format!(
+            "invalid encoding name `{encoding}`"
+        )));
+    }
+    Ok(())
+}
+
+fn check_pubid(value: &str) -> Result<(), WriteError> {
+    if value.chars().all(is_pubid_char) {
+        Ok(())
+    } else {
+        Err(WriteError::Syntax(
+            "public id contains a character outside PubidChar".to_string(),
+        ))
+    }
+}
+
+fn check_system_literal(value: &str) -> Result<(), WriteError> {
+    check_chars(value, "system identifier")?;
+    if value.contains('"') && value.contains('\'') {
+        return Err(WriteError::Syntax(
+            "system identifier contains both quote characters".to_string(),
+        ));
     }
     Ok(())
 }
@@ -282,13 +338,16 @@ impl<W: Write> Writer<W> {
     }
 
     fn write_xml_decl(&mut self, decl: &XmlDecl<'_>) -> Result<(), WriteError> {
+        check_version(&decl.version)?;
+        if let Some(enc) = &decl.encoding {
+            check_encoding(enc)?;
+        }
         self.sink.write_all(b"<?xml version=\"")?;
-        self.sink
-            .write_all(escape_attribute(&decl.version).as_bytes())?;
+        self.sink.write_all(decl.version.as_bytes())?;
         self.sink.write_all(b"\"")?;
         if let Some(enc) = &decl.encoding {
             self.sink.write_all(b" encoding=\"")?;
-            self.sink.write_all(escape_attribute(enc).as_bytes())?;
+            self.sink.write_all(enc.as_bytes())?;
             self.sink.write_all(b"\"")?;
         }
         if let Some(standalone) = decl.standalone {
@@ -302,8 +361,14 @@ impl<W: Write> Writer<W> {
     }
 
     fn write_doctype(&mut self, dtd: &Doctype<'_>) -> Result<(), WriteError> {
-        self.sink.write_all(b"<!DOCTYPE ")?;
         check_name(&dtd.name)?;
+        if let Some(public_id) = &dtd.public_id {
+            check_pubid(public_id)?;
+        }
+        if let Some(system_id) = &dtd.system_id {
+            check_system_literal(system_id)?;
+        }
+        self.sink.write_all(b"<!DOCTYPE ")?;
         self.sink.write_all(dtd.name.as_bytes())?;
         if let Some(public_id) = &dtd.public_id {
             self.sink.write_all(b" PUBLIC ")?;
@@ -327,24 +392,33 @@ impl<W: Write> Writer<W> {
         attributes: &[Attribute<'_>],
         empty: bool,
     ) -> Result<(), WriteError> {
-        self.sink.write_all(b"<")?;
         check_chars(name.local.as_ref(), "name")?;
         if let Some(prefix) = &name.prefix {
             check_chars(prefix.as_ref(), "name")?;
         }
+        check_qname(name)?;
+        for ns in namespaces {
+            if let Some(prefix) = &ns.prefix {
+                check_ncname(prefix)?;
+            }
+            check_chars(&ns.uri, "namespace URI")?;
+        }
+        for attr in attributes {
+            check_qname(&attr.name)?;
+            check_chars(&attr.value, "attribute value")?;
+        }
+        self.sink.write_all(b"<")?;
         self.write_qname(name)?;
         for ns in namespaces {
             self.sink.write_all(b" ")?;
             match &ns.prefix {
                 Some(prefix) => {
-                    check_ncname(prefix)?;
                     self.sink.write_all(b"xmlns:")?;
                     self.sink.write_all(prefix.as_bytes())?;
                 }
                 None => self.sink.write_all(b"xmlns")?,
             }
             self.sink.write_all(b"=\"")?;
-            check_chars(&ns.uri, "namespace URI")?;
             self.sink.write_all(escape_attribute(&ns.uri).as_bytes())?;
             self.sink.write_all(b"\"")?;
         }
@@ -352,7 +426,6 @@ impl<W: Write> Writer<W> {
             self.sink.write_all(b" ")?;
             self.write_qname(&attr.name)?;
             self.sink.write_all(b"=\"")?;
-            check_chars(&attr.value, "attribute value")?;
             self.sink
                 .write_all(escape_attribute(&attr.value).as_bytes())?;
             self.sink.write_all(b"\"")?;
@@ -383,11 +456,13 @@ impl<W: Write> Writer<W> {
         empty: bool,
     ) -> Result<(), WriteError> {
         check_name(name)?;
-        self.sink.write_all(b"<")?;
-        self.sink.write_all(name.as_bytes())?;
         for (attr, value) in attrs {
             check_name(attr)?;
             check_chars(value, "attribute value")?;
+        }
+        self.sink.write_all(b"<")?;
+        self.sink.write_all(name.as_bytes())?;
+        for (attr, value) in attrs {
             self.sink.write_all(b" ")?;
             self.sink.write_all(attr.as_bytes())?;
             self.sink.write_all(b"=\"")?;

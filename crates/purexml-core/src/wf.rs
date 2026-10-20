@@ -7,11 +7,28 @@
 
 use crate::name::{is_name_char, is_name_start, is_xml_char};
 
-pub(crate) fn check_replacement_content(text: &str) -> Result<(), String> {
+pub(crate) enum WfFail {
+    Syntax(String),
+    /// Nested elements in the replacement exceed `max_depth`.
+    TooDeep {
+        limit: u64,
+        actual: u64,
+    },
+}
+
+impl From<String> for WfFail {
+    fn from(message: String) -> Self {
+        Self::Syntax(message)
+    }
+}
+
+pub(crate) fn check_replacement_content(text: &str, max_depth: usize) -> Result<(), WfFail> {
     let mut cursor = Cursor { text, index: 0 };
-    cursor.content()?;
+    cursor.scan(max_depth)?;
     if cursor.index != text.len() {
-        return Err("entity replacement text is not well-formed content".to_string());
+        return Err(WfFail::Syntax(
+            "entity replacement text is not well-formed content".to_string(),
+        ));
     }
     Ok(())
 }
@@ -43,40 +60,75 @@ struct Cursor<'a> {
 }
 
 impl Cursor<'_> {
-    fn content(&mut self) -> Result<(), String> {
+    /// Walk `content` with an explicit element stack.
+    ///
+    /// Nesting is attacker-controlled. Recursing `markup` into `element` overflows
+    /// a 2 MiB thread stack at about ten thousand tags, before `max_depth` can
+    /// run. The stack here is on the heap and stops at `max_depth`.
+    fn scan(&mut self, max_depth: usize) -> Result<(), WfFail> {
+        let mut open: Vec<String> = Vec::new();
         loop {
             self.char_data()?;
+            if self.starts_with("</") {
+                let Some(name) = open.pop() else {
+                    return Err(WfFail::Syntax(
+                        "end tag in entity replacement text has no matching start tag".to_string(),
+                    ));
+                };
+                self.index += 2;
+                let end = self.read_name()?;
+                if end != name {
+                    return Err(WfFail::Syntax(format!(
+                        "mismatched end tag in entity replacement text: expected `{name}`, found `{end}`"
+                    )));
+                }
+                self.skip_space();
+                self.expect_char('>')?;
+                continue;
+            }
             if self.eof() {
+                if let Some(name) = open.last() {
+                    return Err(WfFail::Syntax(format!(
+                        "entity replacement text ends inside element `{name}`"
+                    )));
+                }
                 return Ok(());
             }
             match self.peek_char() {
-                Some('<') => self.markup()?,
+                Some('<') => self.markup(&mut open, max_depth)?,
                 Some('&') => self.reference()?,
                 Some(_) => {
-                    return Err("entity replacement text is not well-formed content".to_string());
+                    return Err(WfFail::Syntax(
+                        "entity replacement text is not well-formed content".to_string(),
+                    ));
                 }
-                None => return Ok(()),
+                None => {
+                    if let Some(name) = open.last() {
+                        return Err(WfFail::Syntax(format!(
+                            "entity replacement text ends inside element `{name}`"
+                        )));
+                    }
+                    return Ok(());
+                }
             }
         }
     }
 
-    fn markup(&mut self) -> Result<(), String> {
+    fn markup(&mut self, open: &mut Vec<String>, max_depth: usize) -> Result<(), WfFail> {
         if self.starts_with("<!--") {
-            return self.comment();
+            return Ok(self.comment()?);
         }
         if self.starts_with("<![CDATA[") {
-            return self.cdata();
+            return Ok(self.cdata()?);
         }
         if self.starts_with("<?") {
-            return self.pi();
+            return Ok(self.pi()?);
         }
         if self.starts_with("</") {
-            return Err("end tag in entity replacement text has no matching start tag".to_string());
+            return Err(WfFail::Syntax(
+                "end tag in entity replacement text has no matching start tag".to_string(),
+            ));
         }
-        self.element()
-    }
-
-    fn element(&mut self) -> Result<(), String> {
         self.bump();
         let name = self.read_name()?;
         loop {
@@ -92,42 +144,21 @@ impl Cursor<'_> {
                     break;
                 }
                 Some(_) => self.attribute()?,
-                None => return Err("unterminated start tag in entity replacement text".to_string()),
-            }
-        }
-        loop {
-            self.char_data()?;
-            if self.starts_with("</") {
-                self.bump();
-                self.bump();
-                let end = self.read_name()?;
-                if end != name {
-                    return Err(format!(
-                        "mismatched end tag in entity replacement text: expected `{name}`, found `{end}`"
-                    ));
-                }
-                self.skip_space();
-                self.expect_char('>')?;
-                return Ok(());
-            }
-            if self.eof() {
-                return Err(format!(
-                    "entity replacement text ends inside element `{name}`"
-                ));
-            }
-            match self.peek_char() {
-                Some('<') => self.markup()?,
-                Some('&') => self.reference()?,
-                Some(_) => {
-                    return Err("entity replacement text is not well-formed content".to_string());
-                }
                 None => {
-                    return Err(format!(
-                        "entity replacement text ends inside element `{name}`"
+                    return Err(WfFail::Syntax(
+                        "unterminated start tag in entity replacement text".to_string(),
                     ));
                 }
             }
         }
+        if open.len() >= max_depth {
+            return Err(WfFail::TooDeep {
+                limit: max_depth as u64,
+                actual: (open.len() + 1) as u64,
+            });
+        }
+        open.push(name);
+        Ok(())
     }
 
     fn attribute(&mut self) -> Result<(), String> {
@@ -379,26 +410,43 @@ impl Cursor<'_> {
 mod tests {
     use super::*;
 
+    fn check(text: &str) -> Result<(), WfFail> {
+        check_replacement_content(text, 64)
+    }
+
     #[test]
     fn accepts_balanced_markup_and_references() {
-        assert!(check_replacement_content("").is_ok());
-        assert!(check_replacement_content("hello").is_ok());
-        assert!(check_replacement_content("&amp;").is_ok());
-        assert!(check_replacement_content("<a b='v'>t</a>").is_ok());
-        assert!(check_replacement_content("<a/>").is_ok());
-        assert!(check_replacement_content("<!-- ok -->").is_ok());
-        assert!(check_replacement_content("<![CDATA[x]]>").is_ok());
-        assert!(check_replacement_content("<?pi data?>").is_ok());
-        assert!(check_replacement_content("<a>&inner;</a>").is_ok());
+        assert!(check("").is_ok());
+        assert!(check("hello").is_ok());
+        assert!(check("&amp;").is_ok());
+        assert!(check("<a b='v'>t</a>").is_ok());
+        assert!(check("<a/>").is_ok());
+        assert!(check("<!-- ok -->").is_ok());
+        assert!(check("<![CDATA[x]]>").is_ok());
+        assert!(check("<?pi data?>").is_ok());
+        assert!(check("<a>&inner;</a>").is_ok());
+        assert!(check("<a><b></b></a>").is_ok());
     }
 
     #[test]
     fn rejects_markup_that_crosses_the_boundary() {
-        assert!(check_replacement_content("<a>").is_err());
-        assert!(check_replacement_content("</a>").is_err());
-        assert!(check_replacement_content("<!--").is_err());
-        assert!(check_replacement_content("<a></b>").is_err());
-        assert!(check_replacement_content("]]>").is_err());
+        assert!(check("<a>").is_err());
+        assert!(check("</a>").is_err());
+        assert!(check("<!--").is_err());
+        assert!(check("<a></b>").is_err());
+        assert!(check("]]>").is_err());
+    }
+
+    #[test]
+    fn nesting_stops_at_the_depth_limit() {
+        let err = check_replacement_content("<a><a><a></a></a></a>", 2).unwrap_err();
+        assert!(matches!(
+            err,
+            WfFail::TooDeep {
+                limit: 2,
+                actual: 3
+            }
+        ));
     }
 
     #[test]

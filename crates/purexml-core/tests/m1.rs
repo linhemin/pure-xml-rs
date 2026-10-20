@@ -63,7 +63,7 @@ fn own(event: Event<'_>) -> Owned {
                     (
                         attr.name.local.clone().into_owned(),
                         attr.name.namespace.as_deref().map(str::to_owned),
-                        attr.value.clone().into_owned(),
+                        attr.value.as_str().to_owned(),
                     )
                 })
                 .collect(),
@@ -93,7 +93,7 @@ fn own(event: Event<'_>) -> Owned {
                     (
                         attr.name.local.clone().into_owned(),
                         attr.name.namespace.as_deref().map(str::to_owned),
-                        attr.value.clone().into_owned(),
+                        attr.value.as_str().to_owned(),
                     )
                 })
                 .collect(),
@@ -234,7 +234,8 @@ fn parses_elements_text_and_borrows_plain_text() {
             assert!(el.name.namespace.is_none());
             let attr = el.attributes().next().unwrap();
             assert_eq!(attr.name.local.as_ref(), "id");
-            assert!(matches!(attr.value, Cow::Borrowed("1")));
+            assert!(attr.value.is_borrowed());
+            assert_eq!(attr.value.as_str(), "1");
             assert!(el.attribute("id").is_some());
         }
         other => panic!("{other:?}"),

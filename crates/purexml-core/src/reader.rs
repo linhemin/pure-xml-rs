@@ -26,6 +26,12 @@ use crate::name::{
     is_whitespace, is_xml_char,
 };
 
+/// Deepest ELEMENT content-model nesting walked recursively.
+///
+/// `max_depth` still applies when it is smaller. The ceiling keeps a caller who
+/// raises `max_depth` from overflowing a 2 MiB thread stack.
+const MODEL_DEPTH_CEILING: usize = 1024;
+
 /// Streaming XML reader.
 ///
 /// Construct with [`Reader::from_bytes`], [`Reader::from_str`], or
@@ -205,13 +211,30 @@ struct AttDef {
     name: String,
     cdata: bool,
     /// `None` for `#REQUIRED` and `#IMPLIED`.
-    default_value: Option<String>,
+    ///
+    /// A literal default stays a range into the input. A normalized one is
+    /// interned once and shared, so applying it does not copy the bytes.
+    default_value: Option<StoredDefault>,
+}
+
+enum StoredDefault {
+    Range(Range<usize>),
+    Shared(Rc<str>),
+}
+
+#[derive(Default)]
+struct AttList {
+    /// Declaration order. The first declaration of a name wins.
+    order: Vec<AttDef>,
+    index: HashMap<String, usize>,
 }
 
 #[derive(Clone)]
 enum RawStr {
     Range(Range<usize>),
     Owned(String),
+    /// DTD default shared across every element that inherits it.
+    Shared(Rc<str>),
 }
 
 impl RawStr {
@@ -219,6 +242,7 @@ impl RawStr {
         match self {
             Self::Range(range) => assume_utf8(&input[range.start..range.end]),
             Self::Owned(text) => text.as_str(),
+            Self::Shared(text) => text.as_ref(),
         }
     }
 
@@ -226,6 +250,7 @@ impl RawStr {
         match self {
             Self::Range(range) => range.end.saturating_sub(range.start),
             Self::Owned(text) => text.len(),
+            Self::Shared(text) => text.len(),
         }
     }
 
@@ -233,6 +258,17 @@ impl RawStr {
         match self {
             Self::Range(range) => assume_utf8(&input[range.start..range.end]).to_string(),
             Self::Owned(text) => text,
+            Self::Shared(text) => text.to_string(),
+        }
+    }
+
+    fn into_text(self, input: &[u8]) -> crate::event::XmlText<'_> {
+        match self {
+            Self::Range(range) => {
+                crate::event::XmlText::borrowed(assume_utf8(&input[range.start..range.end]))
+            }
+            Self::Owned(text) => crate::event::XmlText::shared(Rc::from(text)),
+            Self::Shared(text) => crate::event::XmlText::shared(text),
         }
     }
 
@@ -240,6 +276,7 @@ impl RawStr {
         match self {
             Self::Range(range) => Cow::Borrowed(assume_utf8(&input[range.start..range.end])),
             Self::Owned(text) => Cow::Owned(text),
+            Self::Shared(text) => Cow::Owned(text.to_string()),
         }
     }
 }
@@ -315,7 +352,7 @@ struct Engine {
     prefix_ns: HashMap<Rc<str>, Vec<Rc<str>>>,
     ns_decls: Vec<NsDecl>,
     interner: HashSet<Rc<str>>,
-    attlists: HashMap<String, Vec<AttDef>>,
+    attlists: HashMap<String, AttList>,
     markup_depth: u32,
     boundary_error: Option<Error>,
     halt: bool,
@@ -897,10 +934,17 @@ impl Engine {
             self.advance_n(input, "ANY".len())?;
             return Ok(());
         }
-        self.parse_content_group(input, true)
+        self.parse_content_group(input, true, 1)
     }
 
-    fn parse_content_group(&mut self, input: &[u8], allow_mixed: bool) -> Result<()> {
+    /// Content-model parentheses are attacker-controlled. Recursion is capped
+    /// by `max_depth` and by [`MODEL_DEPTH_CEILING`], so raising `max_depth`
+    /// cannot overflow a 2 MiB thread stack.
+    fn parse_content_group(&mut self, input: &[u8], allow_mixed: bool, depth: usize) -> Result<()> {
+        let limit = self.config.max_depth.min(MODEL_DEPTH_CEILING);
+        if depth > limit {
+            return Err(self.limit(LimitKind::ElementDepth, limit as u64, depth as u64));
+        }
         self.expect_byte(input, b'(')?;
         self.skip_ws(input)?;
         self.reject_dtd_pe(input)?;
@@ -912,7 +956,7 @@ impl Engine {
             }
             return self.parse_mixed(input);
         }
-        self.parse_cp(input)?;
+        self.parse_cp(input, depth)?;
         self.skip_ws(input)?;
         self.reject_dtd_pe(input)?;
         if matches!(self.peek_byte(input), Some(b'|' | b',')) {
@@ -923,7 +967,7 @@ impl Engine {
                 self.advance_one(input)?;
                 self.skip_ws(input)?;
                 self.reject_dtd_pe(input)?;
-                self.parse_cp(input)?;
+                self.parse_cp(input, depth)?;
                 self.skip_ws(input)?;
                 self.reject_dtd_pe(input)?;
             }
@@ -935,10 +979,10 @@ impl Engine {
         self.skip_occurrence(input)
     }
 
-    fn parse_cp(&mut self, input: &[u8]) -> Result<()> {
+    fn parse_cp(&mut self, input: &[u8], depth: usize) -> Result<()> {
         self.reject_dtd_pe(input)?;
         if self.peek_byte(input) == Some(b'(') {
-            self.parse_content_group(input, false)
+            self.parse_content_group(input, false, depth + 1)
         } else {
             let _name = self.read_name(input, false)?;
             self.skip_occurrence(input)
@@ -1013,18 +1057,22 @@ impl Engine {
     }
 
     fn parse_att_def(&mut self, input: &[u8], element: &str) -> Result<()> {
-        let name = self.read_name_string(input, false)?;
+        // Attribute names in the document are QNames. A default such as `a:`
+        // must fail here, not only when someone writes the attribute explicitly.
+        let qname = self.read_qname(input)?;
+        let name = raw_qname_string(input, &qname);
         self.expect_ws(input)?;
         self.reject_dtd_pe(input)?;
         let cdata = self.parse_att_type(input)?;
         self.expect_ws(input)?;
         self.reject_dtd_pe(input)?;
         let default_value = self.parse_default_decl(input, cdata)?;
-        let defs = self.attlists.entry(element.to_string()).or_default();
-        if defs.iter().any(|def| def.name == name) {
+        let list = self.attlists.entry(element.to_string()).or_default();
+        if list.index.contains_key(&name) {
             return Ok(());
         }
-        defs.push(AttDef {
+        list.index.insert(name.clone(), list.order.len());
+        list.order.push(AttDef {
             name,
             cdata,
             default_value,
@@ -1089,7 +1137,7 @@ impl Engine {
         Err(self.syntax("invalid attribute type"))
     }
 
-    fn parse_default_decl(&mut self, input: &[u8], cdata: bool) -> Result<Option<String>> {
+    fn parse_default_decl(&mut self, input: &[u8], cdata: bool) -> Result<Option<StoredDefault>> {
         if self.starts_with_token(input, b"#REQUIRED") {
             self.advance_n(input, "#REQUIRED".len())?;
             return Ok(None);
@@ -1104,11 +1152,18 @@ impl Engine {
             self.reject_dtd_pe(input)?;
         }
         let raw = self.parse_attr_value(input)?;
-        let mut text = raw.into_string(input);
-        if !cdata {
-            text = crate::wf::collapse_spaces(&text);
+        if cdata {
+            if let RawStr::Range(range) = raw {
+                return Ok(Some(StoredDefault::Range(range)));
+            }
         }
-        Ok(Some(text))
+        let text = raw.into_string(input);
+        let text = if cdata {
+            text
+        } else {
+            crate::wf::collapse_spaces(&text)
+        };
+        Ok(Some(StoredDefault::Shared(Rc::from(text))))
     }
 
     fn parse_notation_decl(&mut self, input: &[u8]) -> Result<()> {
@@ -1172,25 +1227,25 @@ impl Engine {
         element: &str,
         attrs: &mut Vec<(RawQName, RawStr)>,
     ) {
-        let Some(defs) = self.attlists.get(element) else {
+        let Some(list) = self.attlists.get(element) else {
             return;
         };
-        let defaults: Vec<(String, String)> = defs
-            .iter()
-            .filter_map(|def| {
-                def.default_value
-                    .as_ref()
-                    .map(|value| (def.name.clone(), value.clone()))
-            })
-            .collect();
-        for (name, value) in defaults {
-            let present = attrs
-                .iter()
-                .any(|(qname, _)| raw_qname_string(input, qname) == name);
-            if present {
+        let mut explicit = HashSet::with_capacity(attrs.len());
+        for (qname, _) in attrs.iter() {
+            explicit.insert(raw_qname_string(input, qname));
+        }
+        for def in &list.order {
+            let Some(value) = &def.default_value else {
+                continue;
+            };
+            if explicit.contains(&def.name) {
                 continue;
             }
-            attrs.push((owned_qname(&name), RawStr::Owned(value)));
+            let raw = match value {
+                StoredDefault::Range(range) => RawStr::Range(range.clone()),
+                StoredDefault::Shared(text) => RawStr::Shared(Rc::clone(text)),
+            };
+            attrs.push((owned_qname(&def.name), raw));
         }
     }
 
@@ -1201,12 +1256,14 @@ impl Engine {
         value: RawStr,
         input: &[u8],
     ) -> RawStr {
-        let cdata = self
-            .attlists
-            .get(element)
-            .and_then(|defs| defs.iter().find(|def| def.name == attribute))
-            .map(|def| def.cdata)
-            .unwrap_or(true);
+        let cdata = if let Some(list) = self.attlists.get(element) {
+            list.index
+                .get(attribute)
+                .map(|&index| list.order[index].cdata)
+                .unwrap_or(true)
+        } else {
+            true
+        };
         if cdata {
             return value;
         }
@@ -1229,6 +1286,7 @@ impl Engine {
         }
         self.expect_byte(input, b'<')?;
         let qname = self.read_qname(input)?;
+        let elem_key = raw_qname_string(input, &qname);
         let mut attrs: Vec<(RawQName, RawStr)> = Vec::new();
         let mut seen_raw: HashSet<(Option<String>, String)> = HashSet::new();
         loop {
@@ -1270,7 +1328,6 @@ impl Engine {
                     self.skip_ws(input)?;
                     let value = self.parse_attr_value(input)?;
                     let attr_key = raw_qname_string(input, &name);
-                    let elem_key = raw_qname_string(input, &qname);
                     let value = self.normalize_typed_attr(&elem_key, &attr_key, value, input);
                     attrs.push((name, value));
                 }
@@ -1378,12 +1435,14 @@ impl Engine {
         }
 
         let resolved_name = self.resolve_name(input, qname, true)?;
-        let mut seen_exp: HashSet<(Option<Rc<str>>, String)> = HashSet::new();
+        // Hash the interned allocation, not the URI bytes. `Rc<str>` hashes
+        // by content, which makes a long namespace URI cost O(URI) per attribute.
+        let mut seen_exp: HashSet<(usize, String)> = HashSet::new();
         let mut resolved_attrs = Vec::with_capacity(regular.len());
         for (name, value) in regular {
             let resolved = self.resolve_name(input, name, false)?;
             let key = (
-                resolved.namespace.clone(),
+                ns_ptr(&resolved.namespace),
                 resolved.local.as_str(input).to_string(),
             );
             if !seen_exp.insert(key) {
@@ -2073,10 +2132,23 @@ impl Engine {
         }
         if !self.entity_wf[idx] {
             let replacement = self.entities[idx].clone();
-            if let Err(message) = crate::wf::check_replacement_content(&replacement) {
-                return Err(Error::new(ErrorKind::Syntax, origin, message));
+            match crate::wf::check_replacement_content(&replacement, self.config.max_depth) {
+                Ok(()) => self.entity_wf[idx] = true,
+                Err(crate::wf::WfFail::Syntax(message)) => {
+                    return Err(Error::new(ErrorKind::Syntax, origin, message));
+                }
+                Err(crate::wf::WfFail::TooDeep { limit, actual }) => {
+                    return Err(Error::new(
+                        ErrorKind::SecurityLimit {
+                            kind: LimitKind::ElementDepth,
+                            limit,
+                            actual,
+                        },
+                        origin,
+                        "element nesting in entity replacement text exceeded",
+                    ));
+                }
             }
-            self.entity_wf[idx] = true;
         }
         let repl_len = self.entities[idx].len() as u64;
         self.expanded_bytes += repl_len;
@@ -2523,8 +2595,15 @@ fn materialize_name(input: &[u8], name: ResolvedName) -> QName<'_> {
 fn materialize_attr(input: &[u8], attr: ResolvedAttr) -> Attribute<'_> {
     Attribute {
         name: materialize_name(input, attr.name),
-        value: attr.value.into_cow(input),
+        value: attr.value.into_text(input),
     }
+}
+
+fn ns_ptr(namespace: &Option<Rc<str>>) -> usize {
+    namespace
+        .as_ref()
+        .map(|uri| Rc::as_ptr(uri) as *const u8 as usize)
+        .unwrap_or(0)
 }
 
 fn materialize_ns(input: &[u8], ns: RawNs) -> Namespace<'_> {

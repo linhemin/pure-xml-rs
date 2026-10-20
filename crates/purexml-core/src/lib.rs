@@ -30,7 +30,7 @@ pub use config::{
 pub use error::{Error, ErrorKind, LimitKind, Position, Result};
 pub use event::{
     Attribute, Doctype, EmptyElement, EndElement, Event, Namespace, ProcessingInstruction, QName,
-    StartElement, XmlDecl, XMLNS_NAMESPACE, XML_NAMESPACE,
+    StartElement, XmlDecl, XmlText, XMLNS_NAMESPACE, XML_NAMESPACE,
 };
 pub use reader::Reader;
 pub use writer::{escape_attribute, escape_text, WriteError, Writer};

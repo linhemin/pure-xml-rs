@@ -2,6 +2,8 @@
 //! normalization or entity expansion.
 
 use std::borrow::Cow;
+use std::fmt;
+use std::ops::Deref;
 use std::rc::Rc;
 
 /// XML namespace URI bound to the `xml` prefix.
@@ -27,13 +29,82 @@ pub struct QName<'a> {
     pub namespace: Option<Rc<str>>,
 }
 
+/// Attribute or DTD-default text.
+///
+/// Literals borrow the input. A default that is not a slice of the input is
+/// one [`Rc`] shared by every element that inherits it.
+#[derive(Clone, Debug)]
+pub struct XmlText<'a> {
+    inner: XmlTextInner<'a>,
+}
+
+#[derive(Clone, Debug)]
+enum XmlTextInner<'a> {
+    Borrowed(&'a str),
+    Shared(Rc<str>),
+}
+
+impl<'a> XmlText<'a> {
+    pub fn borrowed(text: &'a str) -> Self {
+        Self {
+            inner: XmlTextInner::Borrowed(text),
+        }
+    }
+
+    pub fn shared(text: Rc<str>) -> Self {
+        Self {
+            inner: XmlTextInner::Shared(text),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match &self.inner {
+            XmlTextInner::Borrowed(text) => text,
+            XmlTextInner::Shared(text) => text.as_ref(),
+        }
+    }
+
+    /// True when the bytes are a slice of the caller's input.
+    pub fn is_borrowed(&self) -> bool {
+        matches!(self.inner, XmlTextInner::Borrowed(_))
+    }
+}
+
+impl PartialEq for XmlText<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for XmlText<'_> {}
+
+impl Deref for XmlText<'_> {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for XmlText<'_> {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for XmlText<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// One attribute. Namespace declarations are reported separately.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attribute<'a> {
     /// Attribute name. Unprefixed attributes have `namespace: None`.
     pub name: QName<'a>,
     /// Value after attribute-value normalization and entity expansion.
-    pub value: Cow<'a, str>,
+    pub value: XmlText<'a>,
 }
 
 /// A namespace declaration on a start or empty element.
