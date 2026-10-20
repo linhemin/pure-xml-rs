@@ -1,22 +1,63 @@
-# xmltest standalone slice still mishandled by this parser.
-# Scored set: xmltest/not-wf/sa (must fail) and xmltest/valid/sa (must parse).
-# 294/306 = 96.08% as of the M1 fix pass.
-#
-# 140.xml, 141.xml: 5th-edition NameStartChar (U+309A, U+0E5C). The legacy
-# not-wf cases predate that edition; this parser follows the 5th edition.
-# 012.xml: a single colon is an XML 1.0 Name but not a namespace QName.
-# 049.xml, 050.xml, 051.xml: UTF-16 input. 0.x reports Encoding and does not transcode.
-# 070.xml, 097.xml: parameter-entity references are ExternalEntityForbidden.
-# 082.xml, 083.xml, 091.xml, 100.xml: external entity declarations are forbidden.
-xmltest/not-wf/sa/140.xml
-xmltest/not-wf/sa/141.xml
-xmltest/valid/sa/012.xml
-xmltest/valid/sa/049.xml
-xmltest/valid/sa/050.xml
-xmltest/valid/sa/051.xml
-xmltest/valid/sa/070.xml
-xmltest/valid/sa/082.xml
-xmltest/valid/sa/083.xml
-xmltest/valid/sa/091.xml
-xmltest/valid/sa/097.xml
-xmltest/valid/sa/100.xml
+# W3C xmltest M1 已知失败（自动生成：PUREXML_W3C_UPDATE=1）
+# 格式：ID<TAB>类别<TAB>说明；policy-eef = 按 M1 安全策略拒绝（外部实体/参数实体）；policy-utf16 = M1 不支持 UTF-16；policy-ns = 违反命名空间约束；policy-5e = 第 5 版名字规则下合法；defect-* = 人工判定的缺陷
+not-wf-sa-058	false-accept	ENTITIES=none Invalid character , in ATTLIST enumeration
+not-wf-sa-059	false-accept	ENTITIES=none String literal must be in quotes.
+not-wf-sa-060	false-accept	ENTITIES=none Invalid type NAME defined in ATTLIST.
+not-wf-sa-064	false-accept	ENTITIES=none Space is required between attribute type and default values in &lt;!ATTLIST...&gt; declarations.
+not-wf-sa-065	false-accept	ENTITIES=none Space is required between attribute name and type in &lt;!ATTLIST...&gt; declarations.
+not-wf-sa-066	false-accept	ENTITIES=none Required whitespace is missing.
+not-wf-sa-067	false-accept	ENTITIES=none Space is required between attribute type and default values in &lt;!ATTLIST...&gt; declarations.
+not-wf-sa-068	false-accept	ENTITIES=none Space is required between NOTATION keyword and list of enumerated choices in &lt;!ATTLIST...&gt; declarations.
+not-wf-sa-074	false-accept	ENTITIES=none Internal general parsed entities are only well formed if they match the "content" production.
+not-wf-sa-078	false-accept	ENTITIES=none Undefined ENTITY foo.
+not-wf-sa-079	false-accept	ENTITIES=none ENTITY can't reference itself directly or indirectly.
+not-wf-sa-080	false-accept	ENTITIES=none ENTITY can't reference itself directly or indirectly.
+not-wf-sa-087	false-accept	ENTITIES=none Public IDs may not contain "[".
+not-wf-sa-093	false-accept	ENTITIES=none Hexadecimal character references may not use the uppercase 'X'.
+not-wf-sa-104	false-accept	ENTITIES=none Internal general parsed entities are only well formed if they match the "content" production.
+not-wf-sa-116	false-accept	ENTITIES=none Internal general parsed entities are only well formed if they match the "content" production. This is a partial character reference, not a full one.
+not-wf-sa-117	false-accept	ENTITIES=none Internal general parsed entities are only well formed if they match the "content" production. This is a partial character reference, not a full one.
+not-wf-sa-119	false-accept	ENTITIES=none Internal general parsed entities are only well formed if they match the "content" production. This is a partial character reference, not a full one.
+not-wf-sa-122	false-accept	ENTITIES=none Invalid syntax mixed connectors are used.
+not-wf-sa-123	false-accept	ENTITIES=none Invalid syntax mismatched parenthesis.
+not-wf-sa-124	false-accept	ENTITIES=none Invalid format of Mixed-content declaration.
+not-wf-sa-125	false-accept	ENTITIES=none Invalid syntax extra set of parenthesis not necessary.
+not-wf-sa-126	false-accept	ENTITIES=none Invalid syntax Mixed-content must be defined as zero or more.
+not-wf-sa-127	false-accept	ENTITIES=none Invalid syntax Mixed-content must be defined as zero or more.
+not-wf-sa-128	false-accept	ENTITIES=none Invalid CDATA syntax.
+not-wf-sa-129	false-accept	ENTITIES=none Invalid syntax for Element Type Declaration.
+not-wf-sa-130	false-accept	ENTITIES=none Invalid syntax for Element Type Declaration.
+not-wf-sa-131	false-accept	ENTITIES=none Invalid syntax for Element Type Declaration.
+not-wf-sa-132	false-accept	ENTITIES=none Invalid syntax mixed connectors used.
+not-wf-sa-133	false-accept	ENTITIES=none Illegal whitespace before optional character causes syntax error.
+not-wf-sa-134	false-accept	ENTITIES=none Illegal whitespace before optional character causes syntax error.
+not-wf-sa-135	false-accept	ENTITIES=none Invalid character used as connector.
+not-wf-sa-136	false-accept	ENTITIES=none Tag omission is invalid in XML.
+not-wf-sa-137	false-accept	ENTITIES=none Space is required before a content model.
+not-wf-sa-138	false-accept	ENTITIES=none Invalid syntax for content particle.
+not-wf-sa-139	false-accept	ENTITIES=none The element-content model should not be empty.
+not-wf-sa-140	policy-5e	ENTITIES=none Character '&amp;#x309a;' is a CombiningChar, not a Letter, and so may not begin a name.
+not-wf-sa-141	policy-5e	ENTITIES=none Character #x0E5C is not legal in XML names.
+not-wf-sa-158	false-accept	ENTITIES=none SGML-ism: "#NOTATION gif" can't have attributes.
+not-wf-sa-180	false-accept	ENTITIES=none The <EM>Entity Declared</EM> WFC requires entities to be declared before they are used in an attribute list declaration.
+not-wf-sa-181	false-accept	ENTITIES=none Internal parsed entities must match the <EM>content</EM> production to be well formed.
+not-wf-sa-182	false-accept	ENTITIES=none Internal parsed entities must match the <EM>content</EM> production to be well formed.
+not-wf-sa-183	false-accept	ENTITIES=none Mixed content declarations may not include content particles.
+not-wf-sa-184	false-accept	ENTITIES=none In mixed content models, element names must not be parenthesized.
+valid-sa-012	policy-ns	ENTITIES=none Uses a legal XML 1.0 name consisting of a single colon character (disallowed by the latest XML Namespaces draft).
+valid-sa-042	false-reject:Syntax	ENTITIES=none Test demonstrates an Attribute List declaration that uses a StringType as the AttType and also expands the CDATA attribute with a character reference. The test also shows that the leading zeros in the character reference are ignored.
+valid-sa-049	policy-utf16	ENTITIES=none Test demonstrates that characters outside of normal ascii range can be used as element content.
+valid-sa-050	policy-utf16	ENTITIES=none Test demonstrates that characters outside of normal ascii range can be used as element content.
+valid-sa-051	policy-utf16	ENTITIES=none The document is encoded in UTF-16 and uses some name characters well outside of the normal ASCII range.
+valid-sa-056	false-reject:Syntax	ENTITIES=none Test demonstrates an Attribute List declaration that uses a StringType as the AttType and also expands the CDATA attribute with a character reference. The test also shows that the leading zeros in the character reference are ignored.
+valid-sa-070	policy-eef	ENTITIES=parameter Verifies that internal parameter entities are correctly expanded within the internal subset.
+valid-sa-082	policy-eef	ENTITIES=none Tests that an external PE may be defined (but not referenced).
+valid-sa-083	policy-eef	ENTITIES=none Tests that an external PE may be defined (but not referenced).
+valid-sa-091	policy-eef	ENTITIES=none Verifies that an XML parser will parse an ENTITY attribute; the output phase of this test ensures that the notation is reported to the application, and for validating parsers it further tests that the entity is so reported.
+valid-sa-094	defect-attlist-percent-eef	ENTITIES=none Attribute defaults with a DTD have special parsing rules, different from other strings. That means that characters found there may look like an undefined parameter entity reference "within a markup declaration", but they aren't ... so they can't be violating the <EM>PEs in Internal Subset</EM> WFC.
+valid-sa-097	policy-eef	ENTITIES=parameter Basically an output test, this tests whether an externally defined attribute declaration (with a default) takes proper precedence over a subsequent internal declaration.
+valid-sa-100	policy-eef	ENTITIES=none Makes sure that PUBLIC identifiers may have some strange characters. <EM>NOTE: The XML editors have said that the XML specification errata will specify that parameter entity expansion does not occur in PUBLIC identifiers, so that the '%' character will not flag a malformed parameter entity reference.</EM>
+valid-not-sa-011	policy-eef	ENTITIES=both Test demonstrates a parameter entity declaration whose parameter entity definition is an ExternalID.
+valid-not-sa-012	policy-eef	ENTITIES=both Test demonstrates an enternal parsed entity that begins with a text declaration.
+valid-not-sa-026	policy-eef	ENTITIES=both Test demonstrates that when more that one definition is provided for the same attribute of a given element type only the first declaration is binding.
+valid-not-sa-031	policy-ext-dtd-entity	ENTITIES=both Expands a general entity which contains a CDATA section with what looks like a markup declaration (but is just text since it's in a CDATA section).

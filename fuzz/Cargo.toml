@@ -1,0 +1,32 @@
+# cargo-fuzz 布局（需要 nightly）：放到 crate 根目录下的 fuzz/。
+# 独立 workspace，不会被根 workspace 收进去，也不影响 stable 构建。
+[package]
+name = "purexml-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# 指向仓库根的 facade crate `purexml`
+purexml = { path = ".." }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reader"
+path = "fuzz_targets/reader.rs"
+test = false
+doc = false
+bench = false
