@@ -34,3 +34,20 @@ pub use event::{
 };
 pub use reader::Reader;
 pub use writer::{escape_attribute, escape_text, WriteError, Writer};
+
+/// Public event and error types are shareable across threads.
+const _: fn() = || {
+    fn assert<T: Send + Sync>() {}
+    assert::<Event<'static>>();
+    assert::<XmlText<'static>>();
+    assert::<QName<'static>>();
+    assert::<Attribute<'static>>();
+    assert::<Error>();
+    assert::<StartElement<'static>>();
+    assert::<EndElement<'static>>();
+    assert::<EmptyElement<'static>>();
+    assert::<Namespace<'static>>();
+    assert::<ProcessingInstruction<'static>>();
+    assert::<XmlDecl<'static>>();
+    assert::<Doctype<'static>>();
+};

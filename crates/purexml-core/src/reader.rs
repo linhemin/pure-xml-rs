@@ -9,11 +9,10 @@
 //! bytes consumed so far. The ratio is checked on every expansion once the
 //! numerator exceeds [`EXPANSION_RATIO_FLOOR_BYTES`].
 
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::ops::Range;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::config::{ParserConfig, EXPANSION_RATIO_FLOOR_BYTES};
 use crate::error::{observe_byte, position_at, Error, ErrorKind, LimitKind, Position, Result};
@@ -169,7 +168,7 @@ impl<S: AsRef<[u8]>> Reader<S> {
     ///
     /// `Ok(None)` is a clean end of input after the root element.
     /// The returned event borrows `self`; drop it before the next call, or
-    /// take ownership with [`Cow::into_owned`].
+    /// take ownership with [`crate::event::XmlText::into_owned`].
     pub fn read_event(&mut self) -> Result<Option<Event<'_>>> {
         let raw = self.engine.next_raw(self.input.as_ref())?;
         Ok(raw.map(|raw| materialize(self.input.as_ref(), raw)))
@@ -197,14 +196,14 @@ struct Frame {
 struct OpenElement {
     prefix: Option<String>,
     local: String,
-    namespace: Option<Rc<str>>,
+    namespace: Option<Arc<str>>,
     depth: usize,
 }
 
 struct NsDecl {
     depth: usize,
     /// `None` is the default namespace.
-    prefix: Option<Rc<str>>,
+    prefix: Option<Arc<str>>,
 }
 
 struct AttDef {
@@ -219,7 +218,7 @@ struct AttDef {
 
 enum StoredDefault {
     Range(Range<usize>),
-    Shared(Rc<str>),
+    Shared(Arc<str>),
 }
 
 #[derive(Default)]
@@ -234,7 +233,7 @@ enum RawStr {
     Range(Range<usize>),
     Owned(String),
     /// DTD default shared across every element that inherits it.
-    Shared(Rc<str>),
+    Shared(Arc<str>),
 }
 
 impl RawStr {
@@ -267,16 +266,8 @@ impl RawStr {
             Self::Range(range) => {
                 crate::event::XmlText::borrowed(assume_utf8(&input[range.start..range.end]))
             }
-            Self::Owned(text) => crate::event::XmlText::shared(Rc::from(text)),
+            Self::Owned(text) => crate::event::XmlText::shared(Arc::from(text)),
             Self::Shared(text) => crate::event::XmlText::shared(text),
-        }
-    }
-
-    fn into_cow(self, input: &[u8]) -> Cow<'_, str> {
-        match self {
-            Self::Range(range) => Cow::Borrowed(assume_utf8(&input[range.start..range.end])),
-            Self::Owned(text) => Cow::Owned(text),
-            Self::Shared(text) => Cow::Owned(text.to_string()),
         }
     }
 }
@@ -289,7 +280,7 @@ struct RawQName {
 struct ResolvedName {
     prefix: Option<RawStr>,
     local: RawStr,
-    namespace: Option<Rc<str>>,
+    namespace: Option<Arc<str>>,
 }
 
 struct ResolvedAttr {
@@ -348,10 +339,10 @@ struct Engine {
     seen_doctype: bool,
     phase: Phase,
     stack: Vec<OpenElement>,
-    default_ns: Vec<Rc<str>>,
-    prefix_ns: HashMap<Rc<str>, Vec<Rc<str>>>,
+    default_ns: Vec<Arc<str>>,
+    prefix_ns: HashMap<Arc<str>, Vec<Arc<str>>>,
     ns_decls: Vec<NsDecl>,
-    interner: HashSet<Rc<str>>,
+    interner: HashSet<Arc<str>>,
     attlists: HashMap<String, AttList>,
     markup_depth: u32,
     boundary_error: Option<Error>,
@@ -408,7 +399,7 @@ impl Engine {
         let prefix = self.intern("xml");
         let uri = self.intern(XML_NAMESPACE);
         self.prefix_ns
-            .insert(Rc::clone(&prefix), vec![Rc::clone(&uri)]);
+            .insert(Arc::clone(&prefix), vec![Arc::clone(&uri)]);
         self.ns_decls.push(NsDecl {
             depth: 0,
             prefix: Some(prefix),
@@ -417,12 +408,12 @@ impl Engine {
         self
     }
 
-    fn intern(&mut self, text: &str) -> Rc<str> {
+    fn intern(&mut self, text: &str) -> Arc<str> {
         if let Some(existing) = self.interner.get(text) {
-            return Rc::clone(existing);
+            return Arc::clone(existing);
         }
-        let interned: Rc<str> = Rc::from(text);
-        self.interner.insert(Rc::clone(&interned));
+        let interned: Arc<str> = Arc::from(text);
+        self.interner.insert(Arc::clone(&interned));
         interned
     }
 
@@ -1163,7 +1154,7 @@ impl Engine {
         } else {
             crate::wf::collapse_spaces(&text)
         };
-        Ok(Some(StoredDefault::Shared(Rc::from(text))))
+        Ok(Some(StoredDefault::Shared(Arc::from(text))))
     }
 
     fn parse_notation_decl(&mut self, input: &[u8]) -> Result<()> {
@@ -1243,7 +1234,7 @@ impl Engine {
             }
             let raw = match value {
                 StoredDefault::Range(range) => RawStr::Range(range.clone()),
-                StoredDefault::Shared(text) => RawStr::Shared(Rc::clone(text)),
+                StoredDefault::Shared(text) => RawStr::Shared(Arc::clone(text)),
             };
             attrs.push((owned_qname(&def.name), raw));
         }
@@ -1435,8 +1426,8 @@ impl Engine {
         }
 
         let resolved_name = self.resolve_name(input, qname, true)?;
-        // Hash the interned allocation, not the URI bytes. `Rc<str>` hashes
-        // by content, which makes a long namespace URI cost O(URI) per attribute.
+        // Hash the interned allocation's address, not the URI bytes. `Arc<str>`
+        // hashes by content, which makes a long namespace URI cost O(URI) per attribute.
         let mut seen_exp: HashSet<(usize, String)> = HashSet::new();
         let mut resolved_attrs = Vec::with_capacity(regular.len());
         for (name, value) in regular {
@@ -1541,7 +1532,7 @@ impl Engine {
         })
     }
 
-    fn lookup_ns(&self, prefix: Option<&str>) -> Option<Rc<str>> {
+    fn lookup_ns(&self, prefix: Option<&str>) -> Option<Arc<str>> {
         let uri = match prefix {
             None => self.default_ns.last().cloned(),
             Some(prefix) => self
@@ -1555,12 +1546,12 @@ impl Engine {
         }
     }
 
-    fn push_ns(&mut self, prefix: Option<Rc<str>>, uri: Rc<str>, depth: usize) {
+    fn push_ns(&mut self, prefix: Option<Arc<str>>, uri: Arc<str>, depth: usize) {
         match &prefix {
             None => self.default_ns.push(uri),
             Some(prefix) => {
                 self.prefix_ns
-                    .entry(Rc::clone(prefix))
+                    .entry(Arc::clone(prefix))
                     .or_default()
                     .push(uri);
             }
@@ -2522,20 +2513,20 @@ fn materialize(input: &[u8], raw: RawEvent) -> Event<'_> {
         RawEvent::End(name) => Event::EndElement(EndElement {
             name: materialize_name(input, name),
         }),
-        RawEvent::Text(text) => Event::Text(text.into_cow(input)),
-        RawEvent::CData(text) => Event::CData(text.into_cow(input)),
-        RawEvent::Comment(text) => Event::Comment(text.into_cow(input)),
+        RawEvent::Text(text) => Event::Text(text.into_text(input)),
+        RawEvent::CData(text) => Event::CData(text.into_text(input)),
+        RawEvent::Comment(text) => Event::Comment(text.into_text(input)),
         RawEvent::PI { target, data } => Event::PI(ProcessingInstruction {
-            target: target.into_cow(input),
-            data: data.map(|data| data.into_cow(input)),
+            target: target.into_text(input),
+            data: data.map(|data| data.into_text(input)),
         }),
         RawEvent::XmlDecl {
             version,
             encoding,
             standalone,
         } => Event::XmlDecl(XmlDecl {
-            version: version.into_cow(input),
-            encoding: encoding.map(|encoding| encoding.into_cow(input)),
+            version: version.into_text(input),
+            encoding: encoding.map(|encoding| encoding.into_text(input)),
             standalone,
         }),
         RawEvent::Doctype {
@@ -2544,9 +2535,9 @@ fn materialize(input: &[u8], raw: RawEvent) -> Event<'_> {
             public_id,
             has_internal_subset,
         } => Event::Doctype(Doctype {
-            name: name.into_cow(input),
-            system_id: system_id.map(|value| value.into_cow(input)),
-            public_id: public_id.map(|value| value.into_cow(input)),
+            name: name.into_text(input),
+            system_id: system_id.map(|value| value.into_text(input)),
+            public_id: public_id.map(|value| value.into_text(input)),
             has_internal_subset,
         }),
     }
@@ -2586,8 +2577,8 @@ fn materialize_empty(input: &[u8], element: RawElement) -> EmptyElement<'_> {
 
 fn materialize_name(input: &[u8], name: ResolvedName) -> QName<'_> {
     QName {
-        prefix: name.prefix.map(|prefix| prefix.into_cow(input)),
-        local: name.local.into_cow(input),
+        prefix: name.prefix.map(|prefix| prefix.into_text(input)),
+        local: name.local.into_text(input),
         namespace: name.namespace,
     }
 }
@@ -2599,16 +2590,16 @@ fn materialize_attr(input: &[u8], attr: ResolvedAttr) -> Attribute<'_> {
     }
 }
 
-fn ns_ptr(namespace: &Option<Rc<str>>) -> usize {
+fn ns_ptr(namespace: &Option<Arc<str>>) -> usize {
     namespace
         .as_ref()
-        .map(|uri| Rc::as_ptr(uri) as *const u8 as usize)
+        .map(|uri| Arc::as_ptr(uri) as *const u8 as usize)
         .unwrap_or(0)
 }
 
 fn materialize_ns(input: &[u8], ns: RawNs) -> Namespace<'_> {
     Namespace {
-        prefix: ns.prefix.map(|prefix| prefix.into_cow(input)),
-        uri: ns.uri.into_cow(input),
+        prefix: ns.prefix.map(|prefix| prefix.into_text(input)),
+        uri: ns.uri.into_text(input),
     }
 }

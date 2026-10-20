@@ -5,7 +5,7 @@
 //! attribute, namespace restore, interned URIs, and literal `]]>` versus
 //! `]]&gt;`.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use purexml::{ErrorKind, Event, Reader};
 
@@ -35,11 +35,11 @@ fn must_err(xml: &str) -> String {
 enum Owned {
     Start {
         local: String,
-        ns: Option<Rc<str>>,
+        ns: Option<Arc<str>>,
     },
     Empty {
         local: String,
-        ns: Option<Rc<str>>,
+        ns: Option<Arc<str>>,
         attrs: Vec<(String, String)>,
     },
     Text(String),
@@ -135,7 +135,7 @@ fn namespace_uris_are_interned() {
         }
     }
     assert_eq!(uris.len(), 2);
-    assert!(Rc::ptr_eq(&uris[0], &uris[1]));
+    assert!(Arc::ptr_eq(&uris[0], &uris[1]));
 }
 
 #[test]

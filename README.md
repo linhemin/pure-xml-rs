@@ -38,9 +38,9 @@ assert!(matches!(
 assert!(reader.read_event().unwrap().is_none());
 ```
 
-`read_event` 返回 `Result<Option<Event>>`。`Ok(None)` 表示根元素之后的输入已经结束。事件里的字符串在不需要换行规范化或实体展开时借用输入（`Cow::Borrowed`），否则为 `Cow::Owned`。下一次 `read_event` 之前必须放下当前事件。
+`read_event` 返回 `Result<Option<Event>>`。`Ok(None)` 表示根元素之后的输入已经结束。元素名的前缀和本地名、文本、CDATA、注释、处理指令、XML 声明和 `Doctype` 的字符串字段都是 `XmlText`：不需要换行规范化或实体展开时借用输入（`is_borrowed()`），否则是共享的 `Arc<str>`。下一次 `read_event` 之前必须放下当前事件；要留下副本就调用 `into_owned()`（或 `into_cow()`）。`Event`、`XmlText`、`QName`、`Attribute` 和 `Error` 都是 `Send + Sync`。
 
-`QName::namespace` 是 `Option<Rc<str>>`，同一绑定上的元素和带前缀属性共享这一份 URI。用 `as_deref()` 当成 `&str` 比较。
+`QName::namespace` 是驻留后的 `Option<Arc<str>>`，同一绑定上的元素和带前缀属性共享这一份 URI。用 `as_deref()` 当成 `&str` 比较。`Namespace` 声明里的前缀和 URI 则是 `XmlText`。
 
 未声明的一般实体是语法错误：
 
@@ -115,8 +115,8 @@ assert_eq!(
 - `ELEMENT` / `ATTLIST` / `NOTATION` 会做语法检查。`ATTLIST` 的默认值会补到元素上；非 `CDATA` 类型在普通属性规范化之后再折叠空白。属性值里经实体展开引入的字面 `<` 是 `Syntax`。
 - 字符引用只接受小写 `&#x`。位数不设上限，数值超出 XML `Char` 才拒绝。内容里的 `]]>` 只禁止三个字面字符连在一起；`]]&gt;` 是合法写法，解析结果是字符 `]]>`。
 - 实体替换文本的良构检查用堆上的元素栈，嵌套超过 `max_depth` 是 `SecurityLimit(ElementDepth)`，不会把线程栈打爆。`ELEMENT` 内容模型的括号嵌套同样受 `max_depth` 限制，并且不超过 1024 层。
-- `ATTLIST` 默认值若是输入里的一段原文，事件直接借用这段原文；需要规范化的默认值只分配一次，用 `Rc` 共享。属性去重按驻留 URI 的指针比较，不按 URI 内容哈希。
-- 属性值的类型是 `XmlText`：字面量借用输入（`is_borrowed()`），共享默认值用 `Rc`。用 `as_str()` / `Deref` 取文本。
+- `ATTLIST` 默认值若是输入里的一段原文，事件直接借用这段原文；需要规范化的默认值只分配一次，用 `Arc<str>` 共享。属性去重按驻留 URI 的指针比较，不按 URI 内容哈希。
+- 属性值和其他事件字符串都是 `XmlText`：字面量借用输入（`is_borrowed()`），共享默认值用 `Arc`。用 `as_str()` / `Deref` 取文本，用 `into_owned()` 或 `into_cow()` 拿走所有权。
 
 ## 工具链
 

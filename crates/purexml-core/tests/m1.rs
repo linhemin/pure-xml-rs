@@ -1,11 +1,10 @@
 //! Behavioral tests for the M1 pull parser. Security samples are inline so the
 //! suite does not depend on files outside the repository.
 
-use std::borrow::Cow;
 use std::io::Cursor;
 
 use purexml_core::{
-    Error, ErrorKind, Event, LimitKind, ParserConfig, Reader, Writer, DEFAULT_MAX_ATTRS,
+    Error, ErrorKind, Event, LimitKind, ParserConfig, Reader, Writer, XmlText, DEFAULT_MAX_ATTRS,
     DEFAULT_MAX_DEPTH, DEFAULT_MAX_ENTITY_DEPTH, DEFAULT_MAX_ENTITY_EXPANSIONS,
     DEFAULT_MAX_EXPANDED_BYTES, DEFAULT_MAX_EXPANSION_RATIO, DEFAULT_MAX_NAME_LEN,
     DEFAULT_MAX_TEXT_LEN, DEFAULT_MAX_TOTAL_INPUT, EXPANSION_RATIO_FLOOR_BYTES, XML_NAMESPACE,
@@ -72,12 +71,12 @@ fn own(event: Event<'_>) -> Owned {
                 .iter()
                 .map(|ns| {
                     (
-                        ns.prefix.clone().map(Cow::into_owned),
+                        ns.prefix.clone().map(XmlText::into_owned),
                         ns.uri.clone().into_owned(),
                     )
                 })
                 .collect(),
-            prefix: el.name.prefix.map(Cow::into_owned),
+            prefix: el.name.prefix.map(XmlText::into_owned),
         },
         Event::EndElement(el) => Owned::End {
             local: el.name.local.into_owned(),
@@ -102,29 +101,29 @@ fn own(event: Event<'_>) -> Owned {
                 .iter()
                 .map(|ns| {
                     (
-                        ns.prefix.clone().map(Cow::into_owned),
+                        ns.prefix.clone().map(XmlText::into_owned),
                         ns.uri.clone().into_owned(),
                     )
                 })
                 .collect(),
-            prefix: el.name.prefix.map(Cow::into_owned),
+            prefix: el.name.prefix.map(XmlText::into_owned),
         },
         Event::Text(text) => Owned::Text(text.into_owned()),
         Event::CData(text) => Owned::CData(text.into_owned()),
         Event::Comment(text) => Owned::Comment(text.into_owned()),
         Event::PI(pi) => Owned::Pi {
             target: pi.target.into_owned(),
-            data: pi.data.map(Cow::into_owned),
+            data: pi.data.map(XmlText::into_owned),
         },
         Event::XmlDecl(decl) => Owned::Decl {
             version: decl.version.into_owned(),
-            encoding: decl.encoding.map(Cow::into_owned),
+            encoding: decl.encoding.map(XmlText::into_owned),
             standalone: decl.standalone,
         },
         Event::Doctype(dtd) => Owned::Doctype {
             name: dtd.name.into_owned(),
-            system_id: dtd.system_id.map(Cow::into_owned),
-            public_id: dtd.public_id.map(Cow::into_owned),
+            system_id: dtd.system_id.map(XmlText::into_owned),
+            public_id: dtd.public_id.map(XmlText::into_owned),
             internal: dtd.has_internal_subset,
         },
     }
@@ -230,7 +229,8 @@ fn parses_elements_text_and_borrows_plain_text() {
     let mut reader = Reader::from_str(xml);
     match reader.read_event().unwrap().unwrap() {
         Event::StartElement(el) => {
-            assert!(matches!(el.name.local, Cow::Borrowed("root")));
+            assert!(el.name.local.is_borrowed());
+            assert_eq!(el.name.local.as_str(), "root");
             assert!(el.name.namespace.is_none());
             let attr = el.attributes().next().unwrap();
             assert_eq!(attr.name.local.as_ref(), "id");
@@ -242,7 +242,8 @@ fn parses_elements_text_and_borrows_plain_text() {
     }
     match reader.read_event().unwrap().unwrap() {
         Event::Text(text) => {
-            assert!(matches!(text, Cow::Borrowed("hello")));
+            assert!(text.is_borrowed());
+            assert_eq!(text.as_str(), "hello");
         }
         other => panic!("{other:?}"),
     }
@@ -340,7 +341,7 @@ fn crlf_in_text_becomes_lf_and_is_owned() {
     let mut reader = Reader::from_str(xml);
     let _ = reader.read_event().unwrap().unwrap();
     match reader.read_event().unwrap().unwrap() {
-        Event::Text(Cow::Owned(text)) => assert_eq!(text, "A\nB"),
+        Event::Text(text) if !text.is_borrowed() && text.as_str() == "A\nB" => {}
         other => panic!("{other:?}"),
     }
 }
