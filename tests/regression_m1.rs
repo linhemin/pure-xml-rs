@@ -688,6 +688,66 @@ fn d21_shared_large_default_counts_every_injection() {
     assert_eq!(f.limit.as_deref(), Some("ExpansionRatio"), "{f:?}");
 }
 
+/// ratio = 0 和 ratio = u64::MAX 的语义（38078b4 文档化的行为），覆盖默认值注入与实体展开两条路径。
+/// m1.rs 的 `expansion_ratio_zero_rejects_past_the_floor_and_max_disables_the_check` 只测了实体路径。
+/// - 0：分子 ≤ 64 KiB 照常通过；越过地板的那一次注入即报 ExpansionRatio（limit 0）
+/// - u64::MAX：比例检查关闭（2000 × 1 MiB 共享默认值通过）；实体展开仍受 1 MiB ExpandedBytes 约束
+#[test]
+fn d21_ratio_zero_and_max_semantics() {
+    let run = |s: String, ratio: u64| -> Result<(), String> {
+        let cfg = purexml::ParserConfig::default().with_max_expansion_ratio(ratio);
+        let mut r = purexml::Reader::from_bytes(s.as_bytes()).with_config(cfg);
+        loop {
+            match r.read_event() {
+                Ok(Some(_)) => {}
+                Ok(None) => return Ok(()),
+                Err(e) => return Err(format!("{:?}", e.kind)),
+            }
+        }
+    };
+    let defaults = |n: usize, v: usize| {
+        format!(
+            "<!DOCTYPE r [<!ATTLIST e a CDATA \"{}\">]><r>{}</r>",
+            "v".repeat(v),
+            "<e/>".repeat(n)
+        )
+    };
+    // ratio = 0
+    assert_eq!(
+        run(defaults(600, 100), 0),
+        Ok(()),
+        "60 600 字节 ≤ 64 KiB，ratio 0 仍通过"
+    );
+    let e = run(defaults(700, 100), 0).unwrap_err();
+    assert!(
+        e.contains("ExpansionRatio") && e.contains("limit: 0"),
+        "越过地板后 ratio 0 应报 ExpansionRatio(limit 0)：{e}"
+    );
+    // 越过地板的就是那一次：65 536 / 101 = 648.9，第 649 次注入时分子 65 549 > 65 536
+    let e = run(defaults(649, 100), 0).unwrap_err();
+    assert!(e.contains("ExpansionRatio"), "{e}");
+    assert_eq!(
+        run(defaults(648, 100), 0),
+        Ok(()),
+        "648 × 101 = 65 448 ≤ 64 KiB"
+    );
+    // ratio = u64::MAX
+    assert_eq!(
+        run(defaults(2000, 1 << 20), u64::MAX),
+        Ok(()),
+        "u64::MAX 关闭比例检查"
+    );
+    let ent = format!(
+        "<!DOCTYPE r [<!ENTITY x \"{}\">]><r>&x;&x;</r>",
+        "y".repeat(1 << 20)
+    );
+    let e = run(ent, u64::MAX).unwrap_err();
+    assert!(
+        e.contains("ExpandedBytes"),
+        "ratio 关闭后实体展开仍受 1 MiB 绝对上限约束：{e}"
+    );
+}
+
 /// 绝对上限不误杀：正常的大文档，大量普通文本配一个 100 字节的默认属性。
 /// 2 万个 `<e>` 各带 100 字节文本，注入总量约 2 MB（超过 1 MiB 绝对上限），但比例约 1 倍，必须通过。
 #[test]
