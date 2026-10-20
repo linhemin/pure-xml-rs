@@ -374,11 +374,10 @@ fn d16_writer_error_leaves_no_partial_output() {
 
 #[test]
 fn d16_writer_validates_xmldecl_and_doctype() {
-    use purexml::{Doctype, Event, Writer, XmlDecl};
-    use std::borrow::Cow;
+    use purexml::{Doctype, Event, Writer, XmlDecl, XmlText};
     let mut w = Writer::new(Vec::new());
     let decl = XmlDecl {
-        version: Cow::Borrowed("1.0\"?><evil/>"),
+        version: XmlText::borrowed("1.0\"?><evil/>"),
         encoding: None,
         standalone: None,
     };
@@ -388,9 +387,9 @@ fn d16_writer_validates_xmldecl_and_doctype() {
     );
     let mut w = Writer::new(Vec::new());
     let dt = Doctype {
-        name: Cow::Borrowed("r"),
-        system_id: Some(Cow::Borrowed("s")),
-        public_id: Some(Cow::Borrowed("<bad>")),
+        name: XmlText::borrowed("r"),
+        system_id: Some(XmlText::borrowed("s")),
+        public_id: Some(XmlText::borrowed("<bad>")),
         has_internal_subset: false,
     };
     assert!(

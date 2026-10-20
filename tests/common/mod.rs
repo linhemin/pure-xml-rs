@@ -5,13 +5,12 @@
 #![allow(dead_code)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::borrow::Cow;
 use std::cell::Cell;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use purexml::{ErrorKind, Event, ParserConfig, Reader};
+use purexml::{ErrorKind, Event, ParserConfig, Reader, XmlText};
 
 // ───────────────────────────── 测试侧统一模型 ─────────────────────────────
 
@@ -155,8 +154,8 @@ pub fn parse_with(input: &[u8], limits: Limits) -> Result<Summary, Failure> {
             Event::Doctype(d) => {
                 s.doctype = Some((
                     d.name.into_owned(),
-                    d.public_id.map(Cow::into_owned),
-                    d.system_id.map(Cow::into_owned),
+                    d.public_id.map(XmlText::into_owned),
+                    d.system_id.map(XmlText::into_owned),
                 ));
             }
             _ => {}
