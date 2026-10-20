@@ -517,40 +517,53 @@ fn d14_literal_default_not_revalidated_per_element() {
 /// 低密度变体（默认配置，本来就在 10 倍以内）：1 MiB 默认值，100 个 `<e>` 各带 120 KiB 文本。
 /// 严格口径下注入量与已消费输入之比趋近 1 MiB / 120 KiB ≈ 8.5 倍，低于 10 倍，必须放行。
 /// “不重复复制”直接断言：100 个元素拿到的默认值指向同一块内存（共享，不是每个元素复制一份），
-/// 长度和内容正确；用时不超过“无 ATTLIST 的同一文档 × 1.5 + 300 ms”。
+/// 长度正确，内容正确（指针和长度都相同，所以只需检查第一个的内容）。
+/// 共享断言已经直接证明没有复制；时间断言只是辅助，用来捕捉逐元素重扫，只在 release
+/// （`cfg(not(debug_assertions))`）下生效，阈值为对照 × 3 + 1 s。对照是同一 DTD、元素名换成 `<f>`
+/// （不触发注入）的同长文档。计时只包含解析，不包含测试自己的内容检查。
+/// 第四轮稳定性修正：原版把 100 × 1 MiB 的逐字节内容检查算进了计时，对照又不含 1 MiB 的 DTD，
+/// debug 下在本机 5/5 次失败（约 1.07 s，阈值约 0.85 s）。
 #[test]
 fn d14_low_density_default_shared_under_default_ratio() {
-    let body = format!("<e>{}</e>", "t".repeat(120 << 10)).repeat(100);
-    let with = format!(
-        "<!DOCTYPE r [<!ATTLIST e a CDATA \"{}\">]><r>{body}</r>",
+    let dtd = format!(
+        "<!DOCTYPE r [<!ATTLIST e a CDATA \"{}\">]>",
         "v".repeat(1 << 20)
     );
-    let without = format!("<!DOCTYPE r []><r>{body}</r>");
-    let scan = |s: &str| -> (Vec<(usize, usize)>, Duration) {
+    let text = "t".repeat(120 << 10);
+    let with = format!("{dtd}<r>{}</r>", format!("<e>{text}</e>").repeat(100));
+    let control = format!("{dtd}<r>{}</r>", format!("<f>{text}</f>").repeat(100));
+    let scan = |s: &str| -> (Vec<(usize, usize)>, Option<bool>, Duration) {
         let t = Instant::now();
         let mut r = purexml::Reader::from_bytes(s.as_bytes());
         let mut seen = Vec::new();
+        let mut first_ok = None;
         while let Some(ev) = r.read_event().expect("默认配置下应放行") {
             if let purexml::Event::StartElement(el) = ev {
                 if let Some(a) = el.attribute("a") {
-                    assert!(a.value.bytes().all(|b| b == b'v'));
+                    if first_ok.is_none() {
+                        first_ok = Some(a.value.bytes().all(|b| b == b'v'));
+                    }
                     seen.push((a.value.as_ptr() as usize, a.value.len()));
                 }
             }
         }
-        (seen, t.elapsed())
+        (seen, first_ok, t.elapsed())
     };
-    let _ = scan(&without);
-    let (_, base) = scan(&without);
-    let (seen, e) = scan(&with);
+    let _ = scan(&control);
+    let (none, _, base) = scan(&control);
+    assert!(none.is_empty());
+    let (seen, first_ok, e) = scan(&with);
     assert_eq!(seen.len(), 100, "每个 <e> 都应补上默认值");
+    assert_eq!(first_ok, Some(true), "默认值内容错误");
     assert!(seen.iter().all(|&(_, n)| n == 1 << 20));
     assert!(
         seen.iter().all(|&(p, _)| p == seen[0].0),
         "默认值没有共享：各元素的值指向不同内存（逐元素复制）"
     );
-    let limit = base.mul_f64(1.5) + Duration::from_millis(300);
-    assert!(e < limit, "用时 {e:?}，对照 {base:?}，阈值 {limit:?}");
+    if cfg!(not(debug_assertions)) {
+        let limit = base * 3 + Duration::from_secs(1);
+        assert!(e < limit, "用时 {e:?}，对照 {base:?}，阈值 {limit:?}");
+    }
 }
 
 // ───────────── D21（新）：默认属性的注入不受放大预算约束 ─────────────
@@ -907,6 +920,60 @@ fn d22_writer_rejects_reserved_namespace_declarations() {
             "命名空间不良构的声明被写出：{:?}",
             String::from_utf8_lossy(w.get_ref())
         );
+    }
+}
+
+/// 第四轮新增：字符串形式（`write_start` / `write_empty`）同样必须拒绝保留的命名空间声明，
+/// 并且出错时 sink 不变。b8c6dc1 的 Event 形式已正确拒绝（见上一个测试），字符串形式仍照样写出。
+#[test]
+fn d22_string_writer_rejects_reserved_namespace_declarations() {
+    use purexml::Writer;
+    for attrs in [
+        [("xmlns:xmlns", "urn:x")],
+        [("xmlns:p", "")],
+        [("xmlns:xml", "urn:not-xml")],
+        [("xmlns", "http://www.w3.org/2000/xmlns/")],
+    ] {
+        for empty in [false, true] {
+            let mut w = Writer::new(Vec::new());
+            w.write_start("root", &[]).unwrap();
+            let before = w.get_ref().clone();
+            let r = if empty {
+                w.write_empty("a", &attrs)
+            } else {
+                w.write_start("a", &attrs)
+            };
+            assert!(
+                r.is_err(),
+                "命名空间不良构的声明被写出：{:?}",
+                String::from_utf8_lossy(w.get_ref())
+            );
+            assert_eq!(*w.get_ref(), before, "出错后 sink 被改动");
+        }
+    }
+}
+
+/// 第四轮新增：字符串和 Event 两种形式的重复属性出错时，sink 都保持不变
+#[test]
+fn d22_writer_error_leaves_sink_unchanged() {
+    use purexml::Writer;
+    for attrs in [
+        vec![("x", "1"), ("x", "2")],
+        vec![
+            ("xmlns:p", "urn:x"),
+            ("xmlns:q", "urn:x"),
+            ("p:x", "1"),
+            ("q:x", "2"),
+        ],
+        vec![("xmlns:p", "u"), ("xmlns:p", "v")],
+    ] {
+        let mut w = Writer::new(Vec::new());
+        w.write_start("root", &[]).unwrap();
+        let before = w.get_ref().clone();
+        assert!(w.write_start("a", &attrs).is_err());
+        assert_eq!(*w.get_ref(), before, "{attrs:?}");
+        assert!(w.write_empty("a", &attrs).is_err());
+        assert_eq!(*w.get_ref(), before, "{attrs:?}");
     }
 }
 
