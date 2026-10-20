@@ -40,6 +40,8 @@ assert!(reader.read_event().unwrap().is_none());
 
 `read_event` 返回 `Result<Option<Event>>`。`Ok(None)` 表示根元素之后的输入已经结束。事件里的字符串在不需要换行规范化或实体展开时借用输入（`Cow::Borrowed`），否则为 `Cow::Owned`。下一次 `read_event` 之前必须放下当前事件。
 
+`QName::namespace` 是 `Option<Rc<str>>`，同一绑定上的元素和带前缀属性共享这一份 URI。用 `as_deref()` 当成 `&str` 比较。
+
 未声明的一般实体是语法错误：
 
 ```rust
@@ -105,11 +107,20 @@ assert_eq!(
 ### DTD 与实体
 
 - `<!DOCTYPE>` 上的 `SYSTEM` / `PUBLIC` **不是错误**。外部子集直接跳过、从不读取；`Doctype` 事件会带上 `system_id` 和 `public_id`。
-- 内部子集里的一般实体声明会记录并允许在文档中展开。
-- 带 `SYSTEM` 或 `PUBLIC` 的**实体声明**（包括外部参数实体）是 `ExternalEntityForbidden`。
+- 内部子集里的一般实体声明会记录并允许在文档中展开。替换文本必须本身是良构的 `content`：标签、注释、CDATA、处理指令不能跨过实体边界。
+- 带 `SYSTEM` 或 `PUBLIC` 的**实体声明**（包括外部参数实体）是 `ExternalEntityForbidden`。记法声明上的 SYSTEM/PUBLIC 只是标识符，会做语法检查，不会去加载。
 - 内部参数实体声明（`<!ENTITY % name "...">`）允许，只记录、永不使用。
 - 任何参数实体引用 `%name;` 都是 `ExternalEntityForbidden`。
 - 引用没有内部声明的一般实体是 `Syntax`（即使 DOCTYPE 指向了外部 DTD，因为那个 DTD 不会被加载）。
+- `ELEMENT` / `ATTLIST` / `NOTATION` 会做语法检查。`ATTLIST` 的默认值会补到元素上；非 `CDATA` 类型在普通属性规范化之后再折叠空白。属性值里经实体展开引入的字面 `<` 是 `Syntax`。
+
+## 工具链
+
+库的 MSRV 是 1.70。测试或对照 `quick-xml` 0.42 时可能需要 Rust 1.86（不要使用有安全通告的 0.39）。见 `CONTRIBUTING.md`。
+
+## 留到 M2
+
+D4、D6、D8、D9、D11 这次不修。本次工作区没有收到测试报告正文，所以这里不能复述这五项的具体症状；PR 说明里按测试员的编号列为已知问题。DOM、XPath、校验和完整往返同样属于后续里程碑。`from_reader` 仍会把输入缓冲到 `max_total_input`。
 
 ### 编码
 
@@ -138,7 +149,7 @@ LimitKind::EntityDepth | EntityExpansions | ExpandedBytes | ExpansionRatio
 ## 模块
 
 - `purexml`：门面，重新导出 core。
-- `purexml-core`：`config`（限制与 `ParserConfig`）、`error`、`event`、`reader`（拉取解析）、`writer`（转义写出）。名字字符类是私有实现细节。
+- `purexml-core`：`config`（限制与 `ParserConfig`）、`error`、`event`、`reader`（拉取解析）、`writer`（转义写出）。名字字符类和实体良构检查是私有实现细节。
 
 ## 许可证
 

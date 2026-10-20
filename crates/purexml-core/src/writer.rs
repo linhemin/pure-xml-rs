@@ -11,6 +11,7 @@ use crate::event::{
     Attribute, Doctype, EmptyElement, EndElement, Event, Namespace, ProcessingInstruction,
     StartElement, XmlDecl,
 };
+use crate::name::{is_ncname_char, is_ncname_start, is_xml_char};
 
 /// Failure while writing XML.
 #[derive(Debug)]
@@ -45,25 +46,40 @@ impl From<std::io::Error> for WriteError {
     }
 }
 
-/// Escape `&`, `<`, and `>` for character data.
+/// Escape `&`, `<`, `>`, and CR for character data.
+///
+/// CR is written as `&#13;` so a later parse does not turn it into a line feed.
+/// Every `>` is escaped, so `]]>` cannot close character data early.
 pub fn escape_text(input: &str) -> Cow<'_, str> {
-    if !input.bytes().any(|b| matches!(b, b'&' | b'<' | b'>')) {
+    if !needs_text_escape(input) {
         Cow::Borrowed(input)
     } else {
         Cow::Owned(escape_into(input, false))
     }
 }
 
-/// Escape `&`, `<`, `>`, and `"` for a double-quoted attribute value.
+/// Escape `&`, `<`, `>`, `"`, tab, LF, and CR for a double-quoted attribute.
+///
+/// Tab, LF, and CR become character references. A reparse then keeps them
+/// instead of normalizing them to spaces.
 pub fn escape_attribute(input: &str) -> Cow<'_, str> {
-    if !input
-        .bytes()
-        .any(|b| matches!(b, b'&' | b'<' | b'>' | b'"'))
-    {
+    if !needs_attr_escape(input) {
         Cow::Borrowed(input)
     } else {
         Cow::Owned(escape_into(input, true))
     }
+}
+
+fn needs_text_escape(input: &str) -> bool {
+    input
+        .bytes()
+        .any(|b| matches!(b, b'&' | b'<' | b'>' | b'\r'))
+}
+
+fn needs_attr_escape(input: &str) -> bool {
+    input
+        .bytes()
+        .any(|b| matches!(b, b'&' | b'<' | b'>' | b'"' | b'\t' | b'\n' | b'\r'))
 }
 
 fn escape_into(input: &str, attribute: bool) -> String {
@@ -74,10 +90,51 @@ fn escape_into(input: &str, attribute: bool) -> String {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' if attribute => out.push_str("&quot;"),
+            '\r' => out.push_str("&#13;"),
+            '\t' if attribute => out.push_str("&#9;"),
+            '\n' if attribute => out.push_str("&#10;"),
             other => out.push(other),
         }
     }
     out
+}
+
+fn check_chars(text: &str, what: &str) -> Result<(), WriteError> {
+    for ch in text.chars() {
+        if !is_xml_char(ch) {
+            return Err(WriteError::Syntax(format!(
+                "illegal XML character U+{:04X} in {what}",
+                u32::from(ch)
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn check_name(name: &str) -> Result<(), WriteError> {
+    let mut parts = name.split(':');
+    let Some(first) = parts.next().filter(|part| !part.is_empty()) else {
+        return Err(WriteError::Syntax("empty name".to_string()));
+    };
+    check_ncname(first)?;
+    if let Some(second) = parts.next() {
+        check_ncname(second)?;
+        if parts.next().is_some() {
+            return Err(WriteError::Syntax(format!("invalid name `{name}`")));
+        }
+    }
+    Ok(())
+}
+
+fn check_ncname(name: &str) -> Result<(), WriteError> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err(WriteError::Syntax("empty name".to_string()));
+    };
+    if !is_ncname_start(first) || !chars.all(is_ncname_char) {
+        return Err(WriteError::Syntax(format!("invalid name `{name}`")));
+    }
+    Ok(())
 }
 
 /// Writes events or individual nodes to any [`Write`] sink.
@@ -122,9 +179,7 @@ impl<W: Write> Writer<W> {
 
     /// Write `</name>`.
     pub fn write_end(&mut self, name: &str) -> Result<(), WriteError> {
-        if name.is_empty() {
-            return Err(WriteError::Syntax("empty end tag name".to_string()));
-        }
+        check_name(name)?;
         self.sink.write_all(b"</")?;
         self.sink.write_all(name.as_bytes())?;
         self.sink.write_all(b">")?;
@@ -133,6 +188,7 @@ impl<W: Write> Writer<W> {
 
     /// Write escaped character data.
     pub fn write_text(&mut self, text: &str) -> Result<(), WriteError> {
+        check_chars(text, "text")?;
         let escaped = escape_text(text);
         self.sink.write_all(escaped.as_bytes())?;
         Ok(())
@@ -140,21 +196,25 @@ impl<W: Write> Writer<W> {
 
     /// Write a CDATA section, splitting it if the body contains `]]>`.
     pub fn write_cdata(&mut self, text: &str) -> Result<(), WriteError> {
+        check_chars(text, "CDATA")?;
         self.sink.write_all(b"<![CDATA[")?;
-        let mut rest = text;
-        while let Some(idx) = rest.find("]]>") {
-            self.sink.write_all(rest[..idx].as_bytes())?;
+        let bytes = text.as_bytes();
+        let mut start = 0usize;
+        while let Some(rel) = text[start..].find("]]>") {
+            let idx = start + rel;
+            self.sink.write_all(&bytes[start..idx])?;
             // `]]>` cannot appear raw inside CDATA. Close and reopen around `>`.
             self.sink.write_all(b"]]]]><![CDATA[>")?;
-            rest = &rest[idx + 3..];
+            start = idx + 3;
         }
-        self.sink.write_all(rest.as_bytes())?;
+        self.sink.write_all(&bytes[start..])?;
         self.sink.write_all(b"]]>")?;
         Ok(())
     }
 
     /// Write a comment. `--` is rejected.
     pub fn write_comment(&mut self, text: &str) -> Result<(), WriteError> {
+        check_chars(text, "comment")?;
         if text.contains("--") || text.ends_with('-') {
             return Err(WriteError::Syntax(
                 "comment must not contain `--` or end with `-`".to_string(),
@@ -168,10 +228,14 @@ impl<W: Write> Writer<W> {
 
     /// Write a processing instruction.
     pub fn write_pi_str(&mut self, target: &str, data: Option<&str>) -> Result<(), WriteError> {
-        if target.is_empty() || target.eq_ignore_ascii_case("xml") {
+        check_name(target)?;
+        if target.eq_ignore_ascii_case("xml") {
             return Err(WriteError::Syntax(
                 "processing instruction target is reserved or empty".to_string(),
             ));
+        }
+        if let Some(data) = data {
+            check_chars(data, "processing instruction")?;
         }
         if data.is_some_and(|d| d.contains("?>")) {
             return Err(WriteError::Syntax(
@@ -239,6 +303,7 @@ impl<W: Write> Writer<W> {
 
     fn write_doctype(&mut self, dtd: &Doctype<'_>) -> Result<(), WriteError> {
         self.sink.write_all(b"<!DOCTYPE ")?;
+        check_name(&dtd.name)?;
         self.sink.write_all(dtd.name.as_bytes())?;
         if let Some(public_id) = &dtd.public_id {
             self.sink.write_all(b" PUBLIC ")?;
@@ -263,17 +328,23 @@ impl<W: Write> Writer<W> {
         empty: bool,
     ) -> Result<(), WriteError> {
         self.sink.write_all(b"<")?;
+        check_chars(name.local.as_ref(), "name")?;
+        if let Some(prefix) = &name.prefix {
+            check_chars(prefix.as_ref(), "name")?;
+        }
         self.write_qname(name)?;
         for ns in namespaces {
             self.sink.write_all(b" ")?;
             match &ns.prefix {
                 Some(prefix) => {
+                    check_ncname(prefix)?;
                     self.sink.write_all(b"xmlns:")?;
                     self.sink.write_all(prefix.as_bytes())?;
                 }
                 None => self.sink.write_all(b"xmlns")?,
             }
             self.sink.write_all(b"=\"")?;
+            check_chars(&ns.uri, "namespace URI")?;
             self.sink.write_all(escape_attribute(&ns.uri).as_bytes())?;
             self.sink.write_all(b"\"")?;
         }
@@ -281,6 +352,7 @@ impl<W: Write> Writer<W> {
             self.sink.write_all(b" ")?;
             self.write_qname(&attr.name)?;
             self.sink.write_all(b"=\"")?;
+            check_chars(&attr.value, "attribute value")?;
             self.sink
                 .write_all(escape_attribute(&attr.value).as_bytes())?;
             self.sink.write_all(b"\"")?;
@@ -295,9 +367,11 @@ impl<W: Write> Writer<W> {
 
     fn write_qname(&mut self, name: &crate::event::QName<'_>) -> Result<(), WriteError> {
         if let Some(prefix) = &name.prefix {
+            check_ncname(prefix)?;
             self.sink.write_all(prefix.as_bytes())?;
             self.sink.write_all(b":")?;
         }
+        check_ncname(&name.local)?;
         self.sink.write_all(name.local.as_bytes())?;
         Ok(())
     }
@@ -308,12 +382,12 @@ impl<W: Write> Writer<W> {
         attrs: &[(&str, &str)],
         empty: bool,
     ) -> Result<(), WriteError> {
-        if name.is_empty() {
-            return Err(WriteError::Syntax("empty element name".to_string()));
-        }
+        check_name(name)?;
         self.sink.write_all(b"<")?;
         self.sink.write_all(name.as_bytes())?;
         for (attr, value) in attrs {
+            check_name(attr)?;
+            check_chars(value, "attribute value")?;
             self.sink.write_all(b" ")?;
             self.sink.write_all(attr.as_bytes())?;
             self.sink.write_all(b"=\"")?;

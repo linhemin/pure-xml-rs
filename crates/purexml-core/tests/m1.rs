@@ -55,14 +55,14 @@ fn own(event: Event<'_>) -> Owned {
     match event {
         Event::StartElement(el) => Owned::Start {
             local: el.name.local.into_owned(),
-            ns: el.name.namespace.map(Cow::into_owned),
+            ns: el.name.namespace.as_deref().map(str::to_owned),
             attrs: el
                 .attributes
                 .iter()
                 .map(|attr| {
                     (
                         attr.name.local.clone().into_owned(),
-                        attr.name.namespace.clone().map(Cow::into_owned),
+                        attr.name.namespace.as_deref().map(str::to_owned),
                         attr.value.clone().into_owned(),
                     )
                 })
@@ -81,18 +81,18 @@ fn own(event: Event<'_>) -> Owned {
         },
         Event::EndElement(el) => Owned::End {
             local: el.name.local.into_owned(),
-            ns: el.name.namespace.map(Cow::into_owned),
+            ns: el.name.namespace.as_deref().map(str::to_owned),
         },
         Event::EmptyElement(el) => Owned::Empty {
             local: el.name.local.into_owned(),
-            ns: el.name.namespace.map(Cow::into_owned),
+            ns: el.name.namespace.as_deref().map(str::to_owned),
             attrs: el
                 .attributes
                 .iter()
                 .map(|attr| {
                     (
                         attr.name.local.clone().into_owned(),
-                        attr.name.namespace.clone().map(Cow::into_owned),
+                        attr.name.namespace.as_deref().map(str::to_owned),
                         attr.value.clone().into_owned(),
                     )
                 })
@@ -623,7 +623,11 @@ fn element_and_notation_declarations_are_skipped() {
         .iter()
         .any(|ev| matches!(ev, Owned::Text(text) if text == "z")));
     match events.iter().find(|ev| matches!(ev, Owned::Start { .. })) {
-        Some(Owned::Start { attrs, .. }) => assert!(attrs.is_empty()),
+        Some(Owned::Start { attrs, .. }) => {
+            assert_eq!(attrs.len(), 1, "ATTLIST default is applied");
+            assert_eq!(attrs[0].0, "a");
+            assert_eq!(attrs[0].2, "x");
+        }
         other => panic!("{other:?}"),
     }
 }

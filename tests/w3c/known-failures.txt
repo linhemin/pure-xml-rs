@@ -1,0 +1,22 @@
+# xmltest standalone slice still mishandled by this parser.
+# Scored set: xmltest/not-wf/sa (must fail) and xmltest/valid/sa (must parse).
+# 294/306 = 96.08% as of the M1 fix pass.
+#
+# 140.xml, 141.xml: 5th-edition NameStartChar (U+309A, U+0E5C). The legacy
+# not-wf cases predate that edition; this parser follows the 5th edition.
+# 012.xml: a single colon is an XML 1.0 Name but not a namespace QName.
+# 049.xml, 050.xml, 051.xml: UTF-16 input. 0.x reports Encoding and does not transcode.
+# 070.xml, 097.xml: parameter-entity references are ExternalEntityForbidden.
+# 082.xml, 083.xml, 091.xml, 100.xml: external entity declarations are forbidden.
+xmltest/not-wf/sa/140.xml
+xmltest/not-wf/sa/141.xml
+xmltest/valid/sa/012.xml
+xmltest/valid/sa/049.xml
+xmltest/valid/sa/050.xml
+xmltest/valid/sa/051.xml
+xmltest/valid/sa/070.xml
+xmltest/valid/sa/082.xml
+xmltest/valid/sa/083.xml
+xmltest/valid/sa/091.xml
+xmltest/valid/sa/097.xml
+xmltest/valid/sa/100.xml

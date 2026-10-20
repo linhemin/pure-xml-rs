@@ -13,6 +13,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::ops::Range;
+use std::rc::Rc;
 
 use crate::config::{ParserConfig, EXPANSION_RATIO_FLOOR_BYTES};
 use crate::error::{observe_byte, position_at, Error, ErrorKind, LimitKind, Position, Result};
@@ -181,19 +182,30 @@ struct Frame {
     entity_idx: usize,
     pos: usize,
     origin: Position,
+    /// Element stack depth when this entity was pushed.
+    element_depth: usize,
+    /// Markup-nesting counter when this entity was pushed.
+    markup_depth: u32,
 }
 
 struct OpenElement {
     prefix: Option<String>,
     local: String,
-    namespace: Option<String>,
+    namespace: Option<Rc<str>>,
     depth: usize,
 }
 
-struct NsBinding {
-    prefix: Option<String>,
-    uri: String,
+struct NsDecl {
     depth: usize,
+    /// `None` is the default namespace.
+    prefix: Option<Rc<str>>,
+}
+
+struct AttDef {
+    name: String,
+    cdata: bool,
+    /// `None` for `#REQUIRED` and `#IMPLIED`.
+    default_value: Option<String>,
 }
 
 #[derive(Clone)]
@@ -240,7 +252,7 @@ struct RawQName {
 struct ResolvedName {
     prefix: Option<RawStr>,
     local: RawStr,
-    namespace: Option<String>,
+    namespace: Option<Rc<str>>,
 }
 
 struct ResolvedAttr {
@@ -299,8 +311,17 @@ struct Engine {
     seen_doctype: bool,
     phase: Phase,
     stack: Vec<OpenElement>,
-    ns: Vec<NsBinding>,
+    default_ns: Vec<Rc<str>>,
+    prefix_ns: HashMap<Rc<str>, Vec<Rc<str>>>,
+    ns_decls: Vec<NsDecl>,
+    interner: HashSet<Rc<str>>,
+    attlists: HashMap<String, Vec<AttDef>>,
+    markup_depth: u32,
+    boundary_error: Option<Error>,
+    halt: bool,
     entities: Vec<String>,
+    /// Whether `entities[i]` has been checked against the `content` production.
+    entity_wf: Vec<bool>,
     entity_index: HashMap<String, usize>,
     /// Internal parameter entities are recorded and never expanded.
     #[allow(dead_code)]
@@ -325,12 +346,16 @@ impl Engine {
             seen_doctype: false,
             phase: Phase::Prolog,
             stack: Vec::new(),
-            ns: vec![NsBinding {
-                prefix: Some("xml".to_string()),
-                uri: XML_NAMESPACE.to_string(),
-                depth: 0,
-            }],
+            default_ns: Vec::new(),
+            prefix_ns: HashMap::new(),
+            ns_decls: Vec::new(),
+            interner: HashSet::new(),
+            attlists: HashMap::new(),
+            markup_depth: 0,
+            boundary_error: None,
+            halt: false,
             entities: Vec::new(),
+            entity_wf: Vec::new(),
             entity_index: HashMap::new(),
             param_entities: HashMap::new(),
             frames: Vec::new(),
@@ -339,6 +364,29 @@ impl Engine {
             expansion_count: 0,
             expanded_bytes: 0,
         }
+        .with_builtin_namespaces()
+    }
+
+    fn with_builtin_namespaces(mut self) -> Self {
+        let prefix = self.intern("xml");
+        let uri = self.intern(XML_NAMESPACE);
+        self.prefix_ns
+            .insert(Rc::clone(&prefix), vec![Rc::clone(&uri)]);
+        self.ns_decls.push(NsDecl {
+            depth: 0,
+            prefix: Some(prefix),
+        });
+        let _ = self.intern(XMLNS_NAMESPACE);
+        self
+    }
+
+    fn intern(&mut self, text: &str) -> Rc<str> {
+        if let Some(existing) = self.interner.get(text) {
+            return Rc::clone(existing);
+        }
+        let interned: Rc<str> = Rc::from(text);
+        self.interner.insert(Rc::clone(&interned));
+        interned
     }
 
     fn pos_now(&self) -> Position {
@@ -385,13 +433,20 @@ impl Engine {
     }
 
     fn next_raw(&mut self, input: &[u8]) -> Result<Option<RawEvent>> {
+        if let Some(err) = self.boundary_error.take() {
+            return Err(err);
+        }
         self.ensure_started(input)?;
-        match self.phase {
+        let result = match self.phase {
             Phase::Done => Ok(None),
             Phase::Prolog => self.next_prolog(input).map(Some),
             Phase::Content => self.next_content(input).map(Some),
             Phase::Epilog => self.next_epilog(input),
+        };
+        if let Some(err) = self.boundary_error.take() {
+            return Err(err);
         }
+        result
     }
 
     fn ensure_started(&mut self, input: &[u8]) -> Result<()> {
@@ -489,12 +544,21 @@ impl Engine {
             self.pop_finished();
             match self.peek_byte(input) {
                 None => {
+                    if self.halt || self.boundary_error.is_some() {
+                        return Err(self.boundary_error.take().unwrap_or_else(|| {
+                            self.syntax("entity replacement crosses a markup boundary")
+                        }));
+                    }
                     if self.frames.is_empty() {
                         return Err(self.syntax("unclosed element"));
                     }
                     self.force_pop_frame();
                 }
-                Some(b'<') => return self.parse_content_markup(input),
+                Some(b'<') => {
+                    let event = self.parse_content_markup(input)?;
+                    self.settle_entities()?;
+                    return Ok(event);
+                }
                 Some(_) => {
                     if let Some(text) = self.parse_text(input)? {
                         return Ok(RawEvent::Text(text));
@@ -684,11 +748,16 @@ impl Engine {
                 self.parse_entity_decl(input)?;
                 continue;
             }
-            if self.starts_with(input, b"<!ELEMENT")
-                || self.starts_with(input, b"<!ATTLIST")
-                || self.starts_with(input, b"<!NOTATION")
-            {
-                self.skip_markup_decl(input)?;
+            if self.starts_with(input, b"<!ELEMENT") {
+                self.parse_element_decl(input)?;
+                continue;
+            }
+            if self.starts_with(input, b"<!ATTLIST") {
+                self.parse_attlist_decl(input)?;
+                continue;
+            }
+            if self.starts_with(input, b"<!NOTATION") {
+                self.parse_notation_decl(input)?;
                 continue;
             }
             if self.starts_with(input, b"<![") {
@@ -736,8 +805,11 @@ impl Engine {
         if is_predefined_name(&name) || self.entity_index.contains_key(&name) {
             return Ok(());
         }
+        // An unused entity may contain text that cannot legally be expanded
+        // (for example a bare `<`). That check happens on use.
         let idx = self.entities.len();
         self.entities.push(value);
+        self.entity_wf.push(false);
         self.entity_index.insert(name, idx);
         Ok(())
     }
@@ -803,39 +875,358 @@ impl Engine {
         }
     }
 
-    fn skip_markup_decl(&mut self, input: &[u8]) -> Result<()> {
-        let mut quote: Option<u8> = None;
-        loop {
-            let Some(b) = self.peek_byte(input) else {
-                return Err(self.syntax("unterminated declaration"));
-            };
-            if let Some(q) = quote {
-                if b == q {
-                    quote = None;
-                    self.advance_one(input)?;
-                    continue;
-                }
-            } else if b == b'"' || b == b'\'' {
-                quote = Some(b);
-                self.advance_one(input)?;
-                continue;
-            } else if b == b'>' {
-                self.advance_one(input)?;
-                return Ok(());
-            } else if self.starts_with(input, b"<!--") {
-                let _ = self.parse_comment(input)?;
-                continue;
+    fn parse_element_decl(&mut self, input: &[u8]) -> Result<()> {
+        self.expect_bytes(input, b"<!ELEMENT")?;
+        self.expect_ws(input)?;
+        self.reject_dtd_pe(input)?;
+        let _name = self.read_name(input, false)?;
+        self.expect_ws(input)?;
+        self.reject_dtd_pe(input)?;
+        self.parse_contentspec(input)?;
+        self.skip_ws(input)?;
+        self.reject_dtd_pe(input)?;
+        self.expect_byte(input, b'>')
+    }
+
+    fn parse_contentspec(&mut self, input: &[u8]) -> Result<()> {
+        if self.starts_with_token(input, b"EMPTY") {
+            self.advance_n(input, "EMPTY".len())?;
+            return Ok(());
+        }
+        if self.starts_with_token(input, b"ANY") {
+            self.advance_n(input, "ANY".len())?;
+            return Ok(());
+        }
+        self.parse_content_group(input, true)
+    }
+
+    fn parse_content_group(&mut self, input: &[u8], allow_mixed: bool) -> Result<()> {
+        self.expect_byte(input, b'(')?;
+        self.skip_ws(input)?;
+        self.reject_dtd_pe(input)?;
+        if self.starts_with(input, b"#PCDATA") {
+            if !allow_mixed {
+                return Err(self.syntax(
+                    "mixed content is only allowed as the top-level content specification",
+                ));
             }
-            if b == b'%' && self.percent_starts_name(input)? {
-                return Err(
-                    self.external_at(self.err_pos(), "parameter-entity references are forbidden")
-                );
+            return self.parse_mixed(input);
+        }
+        self.parse_cp(input)?;
+        self.skip_ws(input)?;
+        self.reject_dtd_pe(input)?;
+        if matches!(self.peek_byte(input), Some(b'|' | b',')) {
+            let sep = self.peek_byte(input).unwrap_or(b'|');
+            let mut separated = false;
+            while self.peek_byte(input) == Some(sep) {
+                separated = true;
+                self.advance_one(input)?;
+                self.skip_ws(input)?;
+                self.reject_dtd_pe(input)?;
+                self.parse_cp(input)?;
+                self.skip_ws(input)?;
+                self.reject_dtd_pe(input)?;
+            }
+            if sep == b'|' && !separated {
+                return Err(self.syntax("choice list is missing an alternative"));
+            }
+        }
+        self.expect_byte(input, b')')?;
+        self.skip_occurrence(input)
+    }
+
+    fn parse_cp(&mut self, input: &[u8]) -> Result<()> {
+        self.reject_dtd_pe(input)?;
+        if self.peek_byte(input) == Some(b'(') {
+            self.parse_content_group(input, false)
+        } else {
+            let _name = self.read_name(input, false)?;
+            self.skip_occurrence(input)
+        }
+    }
+
+    fn parse_mixed(&mut self, input: &[u8]) -> Result<()> {
+        self.expect_bytes(input, b"#PCDATA")?;
+        self.skip_ws(input)?;
+        self.reject_dtd_pe(input)?;
+        if self.peek_byte(input) == Some(b')') {
+            self.advance_one(input)?;
+            return self.expect_mixed_closer(input, false);
+        }
+        loop {
+            self.expect_byte(input, b'|')?;
+            self.skip_ws(input)?;
+            self.reject_dtd_pe(input)?;
+            let _name = self.read_name(input, false)?;
+            self.skip_ws(input)?;
+            self.reject_dtd_pe(input)?;
+            if self.peek_byte(input) == Some(b')') {
+                self.advance_one(input)?;
+                return self.expect_mixed_closer(input, true);
+            }
+        }
+    }
+
+    fn expect_mixed_closer(&mut self, input: &[u8], names: bool) -> Result<()> {
+        match self.peek_byte(input) {
+            Some(b'*') => {
+                self.advance_one(input)?;
+                Ok(())
+            }
+            Some(b'?' | b'+') => Err(self.syntax("mixed content must be closed by `)` or `)*`")),
+            _ if names => Err(self.syntax("mixed content with element names must end in `)*`")),
+            _ => Ok(()),
+        }
+    }
+
+    fn skip_occurrence(&mut self, input: &[u8]) -> Result<()> {
+        if matches!(self.peek_byte(input), Some(b'?' | b'*' | b'+')) {
+            self.advance_one(input)?;
+        }
+        Ok(())
+    }
+
+    fn parse_attlist_decl(&mut self, input: &[u8]) -> Result<()> {
+        self.expect_bytes(input, b"<!ATTLIST")?;
+        self.expect_ws(input)?;
+        self.reject_dtd_pe(input)?;
+        let element = self.read_name_string(input, false)?;
+        loop {
+            let ws = self.skip_ws(input)?;
+            self.reject_dtd_pe(input)?;
+            match self.peek_byte(input) {
+                Some(b'>') => {
+                    self.advance_one(input)?;
+                    return Ok(());
+                }
+                None => return Err(self.syntax("unterminated attribute-list declaration")),
+                Some(_) => {
+                    if ws == 0 {
+                        return Err(
+                            self.syntax("expected whitespace before an attribute definition")
+                        );
+                    }
+                    self.parse_att_def(input, &element)?;
+                }
+            }
+        }
+    }
+
+    fn parse_att_def(&mut self, input: &[u8], element: &str) -> Result<()> {
+        let name = self.read_name_string(input, false)?;
+        self.expect_ws(input)?;
+        self.reject_dtd_pe(input)?;
+        let cdata = self.parse_att_type(input)?;
+        self.expect_ws(input)?;
+        self.reject_dtd_pe(input)?;
+        let default_value = self.parse_default_decl(input, cdata)?;
+        let defs = self.attlists.entry(element.to_string()).or_default();
+        if defs.iter().any(|def| def.name == name) {
+            return Ok(());
+        }
+        defs.push(AttDef {
+            name,
+            cdata,
+            default_value,
+        });
+        Ok(())
+    }
+
+    fn parse_att_type(&mut self, input: &[u8]) -> Result<bool> {
+        if self.starts_with_token(input, b"CDATA") {
+            self.advance_n(input, "CDATA".len())?;
+            return Ok(true);
+        }
+        for token in [
+            "ID", "IDREF", "IDREFS", "ENTITY", "ENTITIES", "NMTOKEN", "NMTOKENS",
+        ] {
+            if self.starts_with_token(input, token.as_bytes()) {
+                self.advance_n(input, token.len())?;
+                return Ok(false);
+            }
+        }
+        if self.starts_with_token(input, b"NOTATION") {
+            self.advance_n(input, "NOTATION".len())?;
+            self.expect_ws(input)?;
+            self.reject_dtd_pe(input)?;
+            self.expect_byte(input, b'(')?;
+            self.skip_ws(input)?;
+            self.reject_dtd_pe(input)?;
+            let _name = self.read_name(input, false)?;
+            loop {
+                self.skip_ws(input)?;
+                self.reject_dtd_pe(input)?;
+                if self.peek_byte(input) != Some(b'|') {
+                    break;
+                }
+                self.advance_one(input)?;
+                self.skip_ws(input)?;
+                self.reject_dtd_pe(input)?;
+                let _name = self.read_name(input, false)?;
+            }
+            self.expect_byte(input, b')')?;
+            return Ok(false);
+        }
+        if self.peek_byte(input) == Some(b'(') {
+            self.advance_one(input)?;
+            self.skip_ws(input)?;
+            self.reject_dtd_pe(input)?;
+            let _token = self.read_nmtoken(input)?;
+            loop {
+                self.skip_ws(input)?;
+                self.reject_dtd_pe(input)?;
+                if self.peek_byte(input) != Some(b'|') {
+                    break;
+                }
+                self.advance_one(input)?;
+                self.skip_ws(input)?;
+                self.reject_dtd_pe(input)?;
+                let _token = self.read_nmtoken(input)?;
+            }
+            self.expect_byte(input, b')')?;
+            return Ok(false);
+        }
+        Err(self.syntax("invalid attribute type"))
+    }
+
+    fn parse_default_decl(&mut self, input: &[u8], cdata: bool) -> Result<Option<String>> {
+        if self.starts_with_token(input, b"#REQUIRED") {
+            self.advance_n(input, "#REQUIRED".len())?;
+            return Ok(None);
+        }
+        if self.starts_with_token(input, b"#IMPLIED") {
+            self.advance_n(input, "#IMPLIED".len())?;
+            return Ok(None);
+        }
+        if self.starts_with_token(input, b"#FIXED") {
+            self.advance_n(input, "#FIXED".len())?;
+            self.expect_ws(input)?;
+            self.reject_dtd_pe(input)?;
+        }
+        let raw = self.parse_attr_value(input)?;
+        let mut text = raw.into_string(input);
+        if !cdata {
+            text = crate::wf::collapse_spaces(&text);
+        }
+        Ok(Some(text))
+    }
+
+    fn parse_notation_decl(&mut self, input: &[u8]) -> Result<()> {
+        self.expect_bytes(input, b"<!NOTATION")?;
+        self.expect_ws(input)?;
+        self.reject_dtd_pe(input)?;
+        let _name = self.read_name(input, false)?;
+        self.expect_ws(input)?;
+        self.reject_dtd_pe(input)?;
+        if self.starts_with_token(input, b"SYSTEM") {
+            self.advance_n(input, "SYSTEM".len())?;
+            self.expect_ws(input)?;
+            self.reject_dtd_pe(input)?;
+            let _system = self.read_quoted_plain(input)?;
+        } else if self.starts_with_token(input, b"PUBLIC") {
+            self.advance_n(input, "PUBLIC".len())?;
+            self.expect_ws(input)?;
+            self.reject_dtd_pe(input)?;
+            let _public = self.read_pubid_literal(input)?;
+            self.skip_ws(input)?;
+            self.reject_dtd_pe(input)?;
+            if matches!(self.peek_byte(input), Some(b'"' | b'\'')) {
+                let _system = self.read_quoted_plain(input)?;
+            }
+        } else {
+            return Err(self.syntax("notation declaration requires SYSTEM or PUBLIC"));
+        }
+        self.skip_ws(input)?;
+        self.reject_dtd_pe(input)?;
+        self.expect_byte(input, b'>')
+    }
+
+    fn reject_dtd_pe(&mut self, input: &[u8]) -> Result<()> {
+        if self.peek_byte(input) == Some(b'%') {
+            self.reject_parameter_reference(input)?;
+        }
+        Ok(())
+    }
+
+    fn read_nmtoken(&mut self, input: &[u8]) -> Result<String> {
+        let Some(first) = self.peek_char(input)? else {
+            return Err(self.syntax("expected an nmtoken"));
+        };
+        if !is_name_char(first) {
+            return Err(self.syntax(format!("invalid nmtoken start U+{:04X}", u32::from(first))));
+        }
+        let mut token = String::new();
+        loop {
+            let Some(ch) = self.peek_char(input)? else {
+                break;
+            };
+            if !is_name_char(ch) {
+                break;
             }
             self.consume_char(input)?;
+            token.push(ch);
+        }
+        Ok(token)
+    }
+
+    fn add_default_attributes(
+        &mut self,
+        input: &[u8],
+        element: &str,
+        attrs: &mut Vec<(RawQName, RawStr)>,
+    ) {
+        let Some(defs) = self.attlists.get(element) else {
+            return;
+        };
+        let defaults: Vec<(String, String)> = defs
+            .iter()
+            .filter_map(|def| {
+                def.default_value
+                    .as_ref()
+                    .map(|value| (def.name.clone(), value.clone()))
+            })
+            .collect();
+        for (name, value) in defaults {
+            let present = attrs
+                .iter()
+                .any(|(qname, _)| raw_qname_string(input, qname) == name);
+            if present {
+                continue;
+            }
+            attrs.push((owned_qname(&name), RawStr::Owned(value)));
+        }
+    }
+
+    fn normalize_typed_attr(
+        &self,
+        element: &str,
+        attribute: &str,
+        value: RawStr,
+        input: &[u8],
+    ) -> RawStr {
+        let cdata = self
+            .attlists
+            .get(element)
+            .and_then(|defs| defs.iter().find(|def| def.name == attribute))
+            .map(|def| def.cdata)
+            .unwrap_or(true);
+        if cdata {
+            return value;
+        }
+        let text = value.as_str(input);
+        let collapsed = crate::wf::collapse_spaces(text);
+        if collapsed == text {
+            value
+        } else {
+            RawStr::Owned(collapsed)
         }
     }
 
     fn parse_start_tag(&mut self, input: &[u8]) -> Result<RawEvent> {
+        self.in_markup(|this| this.parse_start_tag_inner(input))
+    }
+
+    fn parse_start_tag_inner(&mut self, input: &[u8]) -> Result<RawEvent> {
         if self.phase == Phase::Epilog {
             return Err(self.syntax("content after the root element"));
         }
@@ -881,6 +1272,9 @@ impl Engine {
                     self.expect_byte(input, b'=')?;
                     self.skip_ws(input)?;
                     let value = self.parse_attr_value(input)?;
+                    let attr_key = raw_qname_string(input, &name);
+                    let elem_key = raw_qname_string(input, &qname);
+                    let value = self.normalize_typed_attr(&elem_key, &attr_key, value, input);
                     attrs.push((name, value));
                 }
                 None => return Err(self.syntax("unterminated start tag")),
@@ -889,6 +1283,10 @@ impl Engine {
     }
 
     fn parse_end_tag(&mut self, input: &[u8]) -> Result<RawEvent> {
+        self.in_markup(|this| this.parse_end_tag_inner(input))
+    }
+
+    fn parse_end_tag_inner(&mut self, input: &[u8]) -> Result<RawEvent> {
         let at = self.err_pos();
         self.expect_bytes(input, b"</")?;
         let qname = self.read_qname(input)?;
@@ -938,6 +1336,17 @@ impl Engine {
             ));
         }
 
+        let elem_key = raw_qname_string(input, &qname);
+        let mut attrs = attrs;
+        self.add_default_attributes(input, &elem_key, &mut attrs);
+        if attrs.len() as u64 > self.config.max_attrs as u64 {
+            return Err(self.limit(
+                LimitKind::Attributes,
+                self.config.max_attrs as u64,
+                attrs.len() as u64,
+            ));
+        }
+
         let mut nss = Vec::new();
         let mut regular = Vec::new();
         for (name, value) in attrs {
@@ -966,15 +1375,13 @@ impl Engine {
             prepared.push((decl_prefix, uri));
         }
         for (prefix, uri) in prepared {
-            self.ns.push(NsBinding {
-                prefix,
-                uri,
-                depth: new_depth,
-            });
+            let prefix = prefix.map(|prefix| self.intern(&prefix));
+            let uri = self.intern(&uri);
+            self.push_ns(prefix, uri, new_depth);
         }
 
         let resolved_name = self.resolve_name(input, qname, true)?;
-        let mut seen_exp: HashSet<(Option<String>, String)> = HashSet::new();
+        let mut seen_exp: HashSet<(Option<Rc<str>>, String)> = HashSet::new();
         let mut resolved_attrs = Vec::with_capacity(regular.len());
         for (name, value) in regular {
             let resolved = self.resolve_name(input, name, false)?;
@@ -1061,13 +1468,13 @@ impl Engine {
                 return Err(self.syntax("the xmlns prefix is reserved for namespace declarations"));
             }
             match self.lookup_ns(Some(prefix_text)) {
-                Some(uri) => Some(uri.to_string()),
+                Some(uri) => Some(uri),
                 None => {
                     return Err(self.syntax(format!("unbound namespace prefix `{prefix_text}`")));
                 }
             }
         } else if element {
-            self.lookup_ns(None).map(str::to_string)
+            self.lookup_ns(None)
         } else {
             None
         };
@@ -1078,21 +1485,70 @@ impl Engine {
         })
     }
 
-    fn lookup_ns(&self, prefix: Option<&str>) -> Option<&str> {
-        for binding in self.ns.iter().rev() {
-            if binding.prefix.as_deref() == prefix {
-                if binding.uri.is_empty() {
-                    return None;
-                }
-                return Some(binding.uri.as_str());
+    fn lookup_ns(&self, prefix: Option<&str>) -> Option<Rc<str>> {
+        let uri = match prefix {
+            None => self.default_ns.last().cloned(),
+            Some(prefix) => self
+                .prefix_ns
+                .get(prefix)
+                .and_then(|stack| stack.last().cloned()),
+        };
+        match uri {
+            Some(uri) if uri.is_empty() => None,
+            other => other,
+        }
+    }
+
+    fn push_ns(&mut self, prefix: Option<Rc<str>>, uri: Rc<str>, depth: usize) {
+        match &prefix {
+            None => self.default_ns.push(uri),
+            Some(prefix) => {
+                self.prefix_ns
+                    .entry(Rc::clone(prefix))
+                    .or_default()
+                    .push(uri);
             }
         }
-        None
+        self.ns_decls.push(NsDecl { depth, prefix });
     }
 
     fn pop_ns(&mut self, depth: usize) {
-        while self.ns.last().is_some_and(|binding| binding.depth == depth) {
-            self.ns.pop();
+        while self.ns_decls.last().is_some_and(|decl| decl.depth == depth) {
+            let decl = self.ns_decls.pop().expect("namespace declaration");
+            match decl.prefix {
+                None => {
+                    self.default_ns.pop();
+                }
+                Some(prefix) => {
+                    let empty = self
+                        .prefix_ns
+                        .get_mut(&prefix)
+                        .map(|stack| {
+                            stack.pop();
+                            stack.is_empty()
+                        })
+                        .unwrap_or(false);
+                    if empty {
+                        self.prefix_ns.remove(&prefix);
+                    }
+                }
+            }
+        }
+    }
+
+    fn in_markup<T>(&mut self, body: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.markup_depth += 1;
+        let result = body(self);
+        self.markup_depth -= 1;
+        result
+    }
+
+    fn settle_entities(&mut self) -> Result<()> {
+        self.pop_finished();
+        if let Some(err) = self.boundary_error.take() {
+            Err(err)
+        } else {
+            Ok(())
         }
     }
 
@@ -1119,7 +1575,7 @@ impl Engine {
                 self.advance_one(input)?;
                 break;
             }
-            if at_base && b == b'<' {
+            if b == b'<' {
                 return Err(self.syntax("`<` is not allowed in an attribute value"));
             }
             if b == b'&' {
@@ -1279,6 +1735,10 @@ impl Engine {
     }
 
     fn parse_comment(&mut self, input: &[u8]) -> Result<RawStr> {
+        self.in_markup(|this| this.parse_comment_inner(input))
+    }
+
+    fn parse_comment_inner(&mut self, input: &[u8]) -> Result<RawStr> {
         self.expect_bytes(input, b"<!--")?;
         let body = self.read_terminated(input, b"-->", true, "unterminated comment")?;
         self.expect_bytes(input, b"-->")?;
@@ -1286,6 +1746,10 @@ impl Engine {
     }
 
     fn parse_cdata(&mut self, input: &[u8]) -> Result<RawStr> {
+        self.in_markup(|this| this.parse_cdata_inner(input))
+    }
+
+    fn parse_cdata_inner(&mut self, input: &[u8]) -> Result<RawStr> {
         self.expect_bytes(input, b"<![CDATA[")?;
         let body = self.read_terminated(input, b"]]>", false, "unterminated CDATA section")?;
         self.expect_bytes(input, b"]]>")?;
@@ -1293,6 +1757,10 @@ impl Engine {
     }
 
     fn parse_pi(&mut self, input: &[u8]) -> Result<RawEvent> {
+        self.in_markup(|this| this.parse_pi_inner(input))
+    }
+
+    fn parse_pi_inner(&mut self, input: &[u8]) -> Result<RawEvent> {
         self.expect_bytes(input, b"<?")?;
         let target = self.read_name(input, false)?;
         if target.as_str(input).eq_ignore_ascii_case("xml") {
@@ -1520,9 +1988,14 @@ impl Engine {
 
     fn parse_char_ref(&mut self, input: &[u8]) -> Result<char> {
         let hex = match self.peek_byte(input) {
-            Some(b'x' | b'X') => {
+            Some(b'x') => {
                 self.advance_one(input)?;
                 true
+            }
+            Some(b'X') => {
+                return Err(
+                    self.syntax("hexadecimal character references must use a lowercase 'x'")
+                );
             }
             _ => false,
         };
@@ -1537,9 +2010,6 @@ impl Engine {
                 break;
             };
             digits += 1;
-            if digits > 16 {
-                return Err(self.syntax("character reference is too long"));
-            }
             if value > (0x10_FFFF - digit) / base {
                 return Err(self.syntax("invalid code point in character reference"));
             }
@@ -1598,6 +2068,13 @@ impl Engine {
                 "entity expansion count exceeded",
             ));
         }
+        if !self.entity_wf[idx] {
+            let replacement = self.entities[idx].clone();
+            if let Err(message) = crate::wf::check_replacement_content(&replacement) {
+                return Err(Error::new(ErrorKind::Syntax, origin, message));
+            }
+            self.entity_wf[idx] = true;
+        }
         let repl_len = self.entities[idx].len() as u64;
         self.expanded_bytes += repl_len;
         if self.expanded_bytes > self.config.max_expanded_bytes {
@@ -1635,6 +2112,8 @@ impl Engine {
             entity_idx: idx,
             pos: 0,
             origin,
+            element_depth: self.stack.len(),
+            markup_depth: self.markup_depth,
         });
         Ok(())
     }
@@ -1805,7 +2284,13 @@ impl Engine {
     }
 
     fn peek_byte(&mut self, input: &[u8]) -> Option<u8> {
+        if self.halt {
+            return None;
+        }
         self.pop_finished();
+        if self.halt {
+            return None;
+        }
         self.current_bytes(input).first().copied()
     }
 
@@ -1850,19 +2335,36 @@ impl Engine {
     }
 
     fn pop_finished(&mut self) {
-        while let Some(frame) = self.frames.last() {
+        if self.halt {
+            return;
+        }
+        loop {
+            let Some(frame) = self.frames.last() else {
+                break;
+            };
             let len = self
                 .entities
                 .get(frame.entity_idx)
                 .map(String::len)
                 .unwrap_or(0);
-            if frame.pos >= len {
-                self.frames.pop();
-                self.entity_depth = self.entity_depth.saturating_sub(1);
-                self.open_entities.pop();
-            } else {
+            if frame.pos < len {
                 break;
             }
+            let element_depth = frame.element_depth;
+            let markup_depth = frame.markup_depth;
+            if self.markup_depth > markup_depth || self.stack.len() != element_depth {
+                let position = frame.origin;
+                self.halt = true;
+                self.boundary_error = Some(Error::new(
+                    ErrorKind::Syntax,
+                    position,
+                    "entity replacement crosses a markup boundary",
+                ));
+                return;
+            }
+            self.frames.pop();
+            self.entity_depth = self.entity_depth.saturating_sub(1);
+            self.open_entities.pop();
         }
     }
 
@@ -1871,6 +2373,28 @@ impl Engine {
             self.entity_depth = self.entity_depth.saturating_sub(1);
             self.open_entities.pop();
         }
+    }
+}
+
+fn raw_qname_string(input: &[u8], name: &RawQName) -> String {
+    match &name.prefix {
+        Some(prefix) => format!("{}:{}", prefix.as_str(input), name.local.as_str(input)),
+        None => name.local.as_str(input).to_string(),
+    }
+}
+
+fn owned_qname(name: &str) -> RawQName {
+    if let Some((prefix, local)) = name.split_once(':') {
+        if !prefix.is_empty() && !local.is_empty() && !local.contains(':') {
+            return RawQName {
+                prefix: Some(RawStr::Owned(prefix.to_string())),
+                local: RawStr::Owned(local.to_string()),
+            };
+        }
+    }
+    RawQName {
+        prefix: None,
+        local: RawStr::Owned(name.to_string()),
     }
 }
 
@@ -1992,7 +2516,7 @@ fn materialize_name(input: &[u8], name: ResolvedName) -> QName<'_> {
     QName {
         prefix: name.prefix.map(|prefix| prefix.into_cow(input)),
         local: name.local.into_cow(input),
-        namespace: name.namespace.map(Cow::Owned),
+        namespace: name.namespace,
     }
 }
 

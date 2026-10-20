@@ -18,6 +18,7 @@ mod error;
 mod event;
 mod name;
 mod reader;
+mod wf;
 mod writer;
 
 pub use config::{

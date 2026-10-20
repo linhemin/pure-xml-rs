@@ -2,6 +2,7 @@
 //! normalization or entity expansion.
 
 use std::borrow::Cow;
+use std::rc::Rc;
 
 /// XML namespace URI bound to the `xml` prefix.
 pub const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
@@ -20,7 +21,10 @@ pub struct QName<'a> {
     /// Local part.
     pub local: Cow<'a, str>,
     /// Resolved namespace URI.
-    pub namespace: Option<Cow<'a, str>>,
+    ///
+    /// Interned with [`Rc`] so every element and prefixed attribute that shares
+    /// a binding shares one allocation. Compare with [`Option::as_deref`].
+    pub namespace: Option<Rc<str>>,
 }
 
 /// One attribute. Namespace declarations are reported separately.
