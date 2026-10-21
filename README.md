@@ -89,8 +89,8 @@ assert_eq!(
 | `DEFAULT_MAX_TEXT_LEN` | 16 MiB | `TextLength`（单个文本节点） |
 | `DEFAULT_MAX_TEXT_LEN` | 16 MiB | `AttrValueLength`（规范化并展开之后的单个属性值；写入时逐字符检查，`actual` 是第一次超过上限时的长度，`limit` 就是 `max_text_len`） |
 | `DEFAULT_MAX_TOTAL_INPUT` | 1 GiB | `TotalInput`（`actual` 恒为 `limit + 1`，位置在越界的那个字节） |
-| `DEFAULT_MAX_TOKEN_LEN` | 32 MiB | `TokenLength`（一个顶层 token 的原始字节，含前导空白和终止符，不含前瞻；`actual` 恒为 `limit + 1`，位置是 token 起点。切片和流式都检查） |
-| `DEFAULT_MAX_INTERNAL_SUBSET_LEN` | 16 MiB | `InternalSubsetLength`（内部子集 `[` 与 `]` 之间的原始字节；`actual` 是第一次超过时的长度） |
+| `DEFAULT_MAX_TOKEN_LEN` | 32 MiB | `TokenLength`（一个顶层 token 的原始字节，含前导空白和终止符，不含前瞻；`actual` 恒为 `limit + 1`，位置是越界的那个字节。切片和流式都检查） |
+| `DEFAULT_MAX_INTERNAL_SUBSET_LEN` | 16 MiB | `InternalSubsetLength`（内部子集 `[` 与 `]` 之间的原始字节；`actual` 是第一次超过时的长度，位置是越界的那个字节） |
 | `DEFAULT_MAX_ENTITY_DEPTH` | 8 | `EntityDepth`（文档中的引用算第 1 层，第 9 层失败） |
 | `DEFAULT_MAX_ENTITY_EXPANSIONS` | 10_000 | `EntityExpansions`（同一个实体的重复引用也计数；10_000 次可以，10_001 次失败） |
 | `DEFAULT_MAX_EXPANDED_BYTES` | 1 MiB | `ExpandedBytes` |
@@ -170,7 +170,7 @@ LimitKind::EntityDepth | EntityExpansions | ExpandedBytes | ExpansionRatio
         | TotalInput | AttrValueLength | TokenLength | InternalSubsetLength
 ```
 
-列按 Unicode 标量值计数。展开过程中的错误位置指向原文档里最外层 `&`。
+列按 Unicode 标量值计数。按字节计数的 `TokenLength`、`TotalInput`、`InternalSubsetLength`，位置是越界字节本身。按字符计数的 `TextLength`、`AttrValueLength`、`NameLength`，位置是越过上限的那个字符之后的游标。展开过程中的错误位置指向原文档里最外层 `&`。
 
 ## 模块
 

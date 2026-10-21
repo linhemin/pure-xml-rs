@@ -442,19 +442,32 @@ fn token_text_and_subset_limits_match_and_use_limit_plus_one() {
         } => {
             assert_eq!(limit, 6);
             assert_eq!(actual, 7);
-            assert_eq!(err.offset, 0);
+            // `<root/>`: the 7th byte, `>`, is the offending byte.
+            assert_eq!(err.offset, 6);
+            assert_eq!(err.line, 1);
+            assert_eq!(err.column, 7);
         }
         other => panic!("{other:?}"),
     }
-    // F-1: actual stays limit + 1 on every chunk size.
+    // F-1: actual stays limit + 1 on every chunk size, and the position stays
+    // on that same byte.
     for chunk in [1usize, 2, 3, 6, 7, 64] {
         let streamed = snap_chunks(xml, chunk, token.clone());
+        let slice = snap_bytes(xml, token.clone());
         assert_eq!(
             streamed.err.as_ref().map(|err| &err.kind),
-            snap_bytes(xml, token.clone())
+            slice.err.as_ref().map(|err| &err.kind),
+            "chunk {chunk}"
+        );
+        assert_eq!(
+            streamed
                 .err
                 .as_ref()
-                .map(|err| &err.kind),
+                .map(|err| (err.line, err.column, err.offset)),
+            slice
+                .err
+                .as_ref()
+                .map(|err| (err.line, err.column, err.offset)),
             "chunk {chunk}"
         );
     }
@@ -488,7 +501,8 @@ fn token_text_and_subset_limits_match_and_use_limit_plus_one() {
     };
     let doc = b"<!DOCTYPE r [<!ENTITY e \"ab\">]><r/>";
     assert_equivalent("subset", doc, 3, subset.clone());
-    match snap_bytes(doc, subset).err.unwrap().kind {
+    let subset_err = snap_bytes(doc, subset).err.unwrap();
+    match subset_err.kind {
         ErrorKind::SecurityLimit {
             kind: LimitKind::InternalSubsetLength,
             limit,
@@ -499,6 +513,10 @@ fn token_text_and_subset_limits_match_and_use_limit_plus_one() {
         }
         other => panic!("{other:?}"),
     }
+    // `<!DOCTYPE r [` is 13 bytes. The 5th subset byte is `T` in `<!ENTITY`.
+    assert_eq!(subset_err.offset, 17);
+    assert_eq!(subset_err.line, 1);
+    assert_eq!(subset_err.column, 18);
     assert!(snap_bytes(
         b"<!DOCTYPE r []><r/>",
         ParserConfig {
@@ -508,6 +526,58 @@ fn token_text_and_subset_limits_match_and_use_limit_plus_one() {
     )
     .err
     .is_none());
+}
+
+#[test]
+fn name_length_points_just_after_the_offending_character() {
+    // `é` is two bytes. `<a` is already one name byte, so the cap of 1 fails
+    // on `é` and the cursor sits after that character.
+    let xml = "<aé/>";
+    let config = ParserConfig {
+        max_name_len: 1,
+        ..ParserConfig::default()
+    };
+    let err = snap_bytes(xml.as_bytes(), config.clone()).err.unwrap();
+    match &err.kind {
+        ErrorKind::SecurityLimit {
+            kind: LimitKind::NameLength,
+            limit,
+            actual,
+        } => {
+            assert_eq!(*limit, 1);
+            assert_eq!(*actual, 3);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!((err.line, err.column, err.offset), (1, 4, 4));
+    let streamed = snap_chunks(xml.as_bytes(), 1, config);
+    assert_eq!(streamed.err.as_ref().map(|e| &e.kind), Some(&err.kind));
+    assert_eq!(
+        streamed.err.as_ref().map(|e| (e.line, e.column, e.offset)),
+        Some((err.line, err.column, err.offset))
+    );
+
+    // A leading newline is part of the token. Cap 1 fails on `<`, line 2.
+    let broken = b"\n<root/>";
+    let token = ParserConfig {
+        max_token_len: 1,
+        ..ParserConfig::default()
+    };
+    let err = snap_bytes(broken, token.clone()).err.unwrap();
+    assert!(matches!(
+        err.kind,
+        ErrorKind::SecurityLimit {
+            kind: LimitKind::TokenLength,
+            limit: 1,
+            actual: 2,
+        }
+    ));
+    assert_eq!((err.line, err.column, err.offset), (2, 1, 1));
+    let streamed = snap_chunks(broken, 1, token);
+    assert_eq!(
+        streamed.err.as_ref().map(|e| (e.line, e.column, e.offset)),
+        Some((2, 1, 1))
+    );
 }
 
 #[test]

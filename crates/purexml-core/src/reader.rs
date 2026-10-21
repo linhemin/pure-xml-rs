@@ -212,7 +212,7 @@ impl<R: BufRead> Reader<IoInput<R>> {
                     self.input.saw_eof(),
                 );
                 if parked == Some(sig) {
-                    return Err(self.engine.token_limit());
+                    return Err(self.engine.token_limit(self.input.window()));
                 }
                 parked = Some(sig);
                 continue;
@@ -221,7 +221,7 @@ impl<R: BufRead> Reader<IoInput<R>> {
             if probing && self.engine.frames.is_empty() {
                 let consumed = self.engine.pos.saturating_sub(start_pos) as u64;
                 if consumed > self.engine.config.max_token_len {
-                    return Err(self.engine.token_limit());
+                    return Err(self.engine.token_limit(self.input.window()));
                 }
             }
             return Ok(raw);
@@ -332,7 +332,7 @@ impl<S: AsRef<[u8]>> Reader<S> {
         if probe.is_some() && self.engine.frames.is_empty() {
             let consumed = self.engine.pos.saturating_sub(start_pos) as u64;
             if consumed > self.engine.config.max_token_len {
-                return Err(self.engine.token_limit());
+                return Err(self.engine.token_limit(input));
             }
         }
         Ok((probe, raw))
@@ -507,6 +507,8 @@ struct Engine {
     subset_start: Option<usize>,
     /// Position of the top-level token currently being parsed.
     token_origin: Position,
+    /// `cr_pending` at `token_origin`, so a later byte position can be scanned.
+    token_cr: bool,
     /// Main-input index where the current `next_raw` started parsing.
     frame_anchor: usize,
     /// The engine finished one main-input token and the next one is not framed.
@@ -557,6 +559,7 @@ impl Engine {
             end_is_eof: true,
             subset_start: None,
             token_origin: Position::start(),
+            token_cr: false,
             frame_anchor: 0,
             need_frame: false,
             line: 1,
@@ -619,14 +622,33 @@ impl Engine {
         }
     }
 
-    fn token_limit(&self) -> Error {
+    fn token_limit(&self, input: &[u8]) -> Error {
         let limit = self.config.max_token_len;
         self.limit_at(
             LimitKind::TokenLength,
             limit,
             limit.saturating_add(1),
-            self.token_origin,
+            self.position_on_token_byte(input, limit),
         )
+    }
+
+    /// Cursor sitting on the byte `index` bytes after `token_origin`.
+    ///
+    /// Index 0 is the first byte of the token. Scanning `index` bytes leaves
+    /// the position on the next byte, which is the one that makes a raw-byte
+    /// cap `index` overflow.
+    fn position_on_token_byte(&self, input: &[u8], index: u64) -> Position {
+        let start = self.token_origin.offset.saturating_sub(self.base) as usize;
+        if start > input.len() {
+            return self.token_origin;
+        }
+        let mut pos = self.token_origin;
+        let mut cr = self.token_cr;
+        let take = (index as usize).min(input.len().saturating_sub(start));
+        for &byte in &input[start..start + take] {
+            observe_byte(&mut pos, &mut cr, byte);
+        }
+        pos
     }
 
     /// End of the main window on a probe or an unfinished stream token.
@@ -636,7 +658,7 @@ impl Engine {
 
     fn end_input(&self, input: &[u8], message: &str) -> Error {
         if self.at_window_end(input) {
-            self.token_limit()
+            self.token_limit(input)
         } else {
             self.syntax(message)
         }
@@ -684,6 +706,7 @@ impl Engine {
     fn next_raw(&mut self, input: &[u8]) -> Result<Option<RawEvent>> {
         if self.frames.is_empty() {
             self.token_origin = self.pos_now();
+            self.token_cr = self.cr_pending;
         }
         if let Some(err) = self.boundary_error.take() {
             return Err(err);
@@ -773,7 +796,7 @@ impl Engine {
         self.skip_ws(input)?;
         if self.peek_byte(input).is_none() && self.frames.is_empty() {
             if !self.end_is_eof {
-                return Err(self.token_limit());
+                return Err(self.token_limit(input));
             }
             self.phase = Phase::Done;
             return Ok(None);
@@ -2072,7 +2095,7 @@ impl Engine {
             let Some(b) = self.peek_byte(input) else {
                 if self.frames.is_empty() {
                     if !self.end_is_eof {
-                        return Err(self.token_limit());
+                        return Err(self.token_limit(input));
                     }
                     break;
                 }
@@ -2163,7 +2186,7 @@ impl Engine {
                     }
                     Err(()) => {
                         if self.cut_utf8(&bytes[i..]) {
-                            return Err(self.token_limit());
+                            return Err(self.token_limit(input));
                         }
                         self.advance_n(input, i)?;
                         return Err(self.encoding("malformed UTF-8"));
@@ -2180,7 +2203,7 @@ impl Engine {
             if i == 0 {
                 return Ok(None);
             }
-            return Err(self.token_limit());
+            return Err(self.token_limit(input));
         }
         if i == 0 {
             return Ok(None);
@@ -2443,11 +2466,11 @@ impl Engine {
             return Err(self.syntax(format!("invalid name start U+{:04X}", u32::from(first))));
         }
         let mut total = first.len_utf8();
+        self.consume_char(input)?;
         if total > max {
             return Err(self.limit(LimitKind::NameLength, max as u64, total as u64));
         }
         let mut owned = String::new();
-        self.consume_char(input)?;
         owned.push(first);
         while let Some(ch) = self.peek_char(input)? {
             let ok = if ncname {
@@ -2459,10 +2482,10 @@ impl Engine {
                 break;
             }
             let next = total + ch.len_utf8();
+            self.consume_char(input)?;
             if next > max {
                 return Err(self.limit(LimitKind::NameLength, max as u64, next as u64));
             }
-            self.consume_char(input)?;
             owned.push(ch);
             total = next;
         }
@@ -2721,7 +2744,7 @@ impl Engine {
             Some(Err(())) => {
                 let slice = self.current_bytes(input);
                 if self.cut_utf8(slice) {
-                    Err(self.token_limit())
+                    Err(self.token_limit(input))
                 } else {
                     Err(self.encoding("malformed UTF-8"))
                 }
@@ -2745,7 +2768,7 @@ impl Engine {
             Some(Err(())) => {
                 let slice = self.current_bytes(input);
                 if self.cut_utf8(slice) {
-                    Err(self.token_limit())
+                    Err(self.token_limit(input))
                 } else {
                     Err(self.encoding("malformed UTF-8"))
                 }
@@ -2866,15 +2889,17 @@ impl Engine {
                 .get(self.pos)
                 .copied()
                 .ok_or_else(|| self.end_input(input, "unexpected end of input"))?;
+            let at_byte = self.pos_now();
             self.observe(b);
             self.pos += 1;
             if let Some(start) = self.subset_start {
                 let len = (self.pos - start) as u64;
                 if len > self.config.max_internal_subset_len {
-                    return Err(self.limit(
+                    return Err(self.limit_at(
                         LimitKind::InternalSubsetLength,
                         self.config.max_internal_subset_len,
                         len,
+                        at_byte,
                     ));
                 }
             }
