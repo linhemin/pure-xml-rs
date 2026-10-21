@@ -74,6 +74,71 @@ fn pure(input: &[u8]) -> Result<Vec<Node>, String> {
     common::structure(input).map_err(|f| format!("{:?}: {}", f.class, f.detail))
 }
 
+/// M2：同一份字节走 from_bytes、from_vec、from_reader（逐字节、7 字节块、8 KiB 默认），
+/// 事件序列和错误（kind、position）必须完全相同。TotalInput 只比最终错误（计划 §0.1）。
+macro_rules! snap_events {
+    ($reader:expr) => {{
+        let reader = &mut $reader;
+        let mut ev = Vec::new();
+        let end = loop {
+            match reader.read_event() {
+                Ok(Some(e)) => ev.push(format!("{e:?}")),
+                Ok(None) => break Ok(()),
+                Err(e) => break Err((e.kind.clone(), e.position)),
+            }
+        };
+        (ev, end)
+    }};
+}
+
+struct Chunks<'a>(&'a [u8], usize);
+impl std::io::Read for Chunks<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.1.min(buf.len()).min(self.0.len());
+        buf[..n].copy_from_slice(&self.0[..n]);
+        self.0 = &self.0[n..];
+        Ok(n)
+    }
+}
+
+/// 返回不一致的路径名（空 = 一致）。
+fn path_mismatches(input: &[u8]) -> Vec<String> {
+    let mut r = purexml::Reader::from_bytes(input);
+    let base = snap_events!(r);
+    let total = matches!(
+        &base.1,
+        Err((
+            purexml::ErrorKind::SecurityLimit {
+                kind: purexml::LimitKind::TotalInput,
+                ..
+            },
+            _
+        ))
+    );
+    let same = |label: &str,
+                got: (
+        Vec<String>,
+        Result<(), (purexml::ErrorKind, purexml::Position)>,
+    )| {
+        let ok = if total { got.1 == base.1 } else { got == base };
+        (!ok).then(|| label.to_string())
+    };
+    let mut out = Vec::new();
+    let mut v = purexml::Reader::from_vec(input.to_vec());
+    out.extend(same("from_vec", snap_events!(v)));
+    for (label, n) in [
+        ("from_reader(1)", 1usize),
+        ("from_reader(7)", 7),
+        ("from_reader(8K)", 8192),
+    ] {
+        let mut r =
+            purexml::Reader::from_reader(std::io::BufReader::with_capacity(1, Chunks(input, n)))
+                .expect("from_reader");
+        out.extend(same(label, snap_events!(r)));
+    }
+    out
+}
+
 struct Case {
     id: String,
     expect_wf: Option<bool>,
@@ -184,8 +249,13 @@ fn differential_body() {
     let mut struct_mismatch_gated = Vec::new();
     let (mut agree, mut total, mut quick_only) = (0usize, 0usize, 0usize);
     let mut canon = (0usize, 0usize, Vec::new());
+    let mut path_bad = Vec::new();
     for c in &cases {
         total += 1;
+        let bad = path_mismatches(&c.bytes);
+        if !bad.is_empty() {
+            path_bad.push(format!("{}：{}", c.id, bad.join("、")));
+        }
         let p = pure(&c.bytes);
         let x = rox_structure(&c.bytes);
         let q = quick_ok(&c.bytes);
@@ -283,12 +353,15 @@ fn differential_body() {
     let report = format!(
         "差分测试：共 {total} 例（W3C {w3c_n}，自建 {}），一致 {agree}，\
          purexml↔roxmltree 分歧 {}，仅 quick-xml 不同（其宽松接受）{quick_only}；\
-         purexml 对照 W3C 规范输出 {}/{} 一致，不一致：{:?}\n{}\n",
+         purexml 对照 W3C 规范输出 {}/{} 一致，不一致：{:?}；\
+         from_bytes/from_vec/from_reader(1、7、8K) 四条路径不一致 {} 例：{:?}\n{}\n",
         total - w3c_n,
         lines.len(),
         canon.1,
         canon.0,
         canon.2,
+        path_bad.len(),
+        path_bad,
         lines.join("\n")
     );
     let out = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/differential-report.txt");
@@ -296,6 +369,10 @@ fn differential_body() {
     std::fs::write(&out, &report).unwrap();
     println!("{}", report.lines().take(21).collect::<Vec<_>>().join("\n"));
     println!("完整报告：{}", out.display());
+    assert!(
+        path_bad.is_empty(),
+        "from_bytes、from_vec、from_reader 结果不一致：{path_bad:?}"
+    );
     assert!(
         struct_mismatch_gated.is_empty(),
         "W3C valid/sa 中三方都接受、但结构序列不一致：{struct_mismatch_gated:?}"
