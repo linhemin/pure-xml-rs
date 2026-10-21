@@ -936,6 +936,13 @@ impl Engine {
                         return Err(self.syntax(format!("invalid standalone value '{other}'")));
                     }
                 });
+            } else if self.cut_keyword(input, b"encoding")
+                || self.cut_keyword(input, b"standalone")
+                || self.cut_keyword(input, b"?>")
+            {
+                // The probe ended inside the next keyword. That is the token
+                // cap, not an unknown attribute name.
+                return Err(self.token_limit(input));
             } else {
                 return Err(self.syntax("unknown XML declaration attribute"));
             }
@@ -2817,6 +2824,8 @@ impl Engine {
     fn expect_bytes(&mut self, input: &[u8], pattern: &[u8]) -> Result<()> {
         if self.starts_with(input, pattern) {
             self.advance_n(input, pattern.len())
+        } else if self.cut_keyword(input, pattern) {
+            Err(self.token_limit(input))
         } else {
             Err(self.syntax(format!("expected {}", String::from_utf8_lossy(pattern))))
         }
@@ -2825,9 +2834,21 @@ impl Engine {
     fn expect_token(&mut self, input: &[u8], token: &[u8]) -> Result<()> {
         if self.starts_with_token(input, token) {
             self.advance_n(input, token.len())
+        } else if self.cut_keyword(input, token) {
+            Err(self.token_limit(input))
         } else {
             Err(self.syntax(format!("expected {}", String::from_utf8_lossy(token))))
         }
+    }
+
+    /// The window ends on a proper prefix of `token`. A streaming probe cut
+    /// the token at `max_token_len` before the keyword was complete.
+    fn cut_keyword(&self, input: &[u8], token: &[u8]) -> bool {
+        if self.end_is_eof || !self.frames.is_empty() {
+            return false;
+        }
+        let rest = self.current_bytes(input);
+        !rest.is_empty() && rest.len() < token.len() && token.starts_with(rest)
     }
 
     fn expect_ws(&mut self, input: &[u8]) -> Result<()> {
