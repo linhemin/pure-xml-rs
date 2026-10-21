@@ -10,6 +10,9 @@
 //!
 //! UTF-8 is the only accepted encoding. A UTF-16 BOM or a UTF-16 encoding
 //! declaration is an [`ErrorKind::Encoding`] error. This crate does not transcode.
+//!
+//! An entity-reference name is an NCName. `&a:b;` is [`ErrorKind::Syntax`]
+//! because the name contains a colon. It is not reported as an undefined entity.
 
 #![forbid(unsafe_code)]
 

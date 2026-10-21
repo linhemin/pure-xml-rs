@@ -1,10 +1,12 @@
 //! Name and namespace-binding rules shared by the reader and the writer.
 //!
 //! Namespaces in XML 1.0: a processing-instruction target, an entity name, and
-//! a notation name are NCNames (no colon). A document-type name, an element
-//! name, and an attribute name are QNames: an NCName, or two NCNames joined by
-//! one colon. The DOM will call the same functions so a name the reader
-//! accepts is a name the writer can emit.
+//! a notation name are NCNames (no colon). A general-entity reference uses
+//! that same NCName rule, so `&a:b;` is a name error
+//! ([`crate::ErrorKind::Syntax`]), not an undefined entity. A document-type
+//! name, an element name, and an attribute name are QNames: an NCName, or two
+//! NCNames joined by one colon. The DOM will call the same functions so a
+//! name the reader accepts is a name the writer can emit.
 
 use crate::event::{XMLNS_NAMESPACE, XML_NAMESPACE};
 use crate::name::{is_ncname_char, is_ncname_start};

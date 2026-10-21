@@ -351,7 +351,8 @@ impl Cursor<'_> {
         Ok(())
     }
 
-    /// PI targets and entity-reference names are NCNames.
+    /// PI targets and entity-reference names are NCNames. A colon, as in
+    /// `&a:b;`, is a name error rather than an undefined entity.
     fn read_ncname(&mut self) -> Result<String, String> {
         let Some(first) = self.bump() else {
             return Err("expected a name".to_string());

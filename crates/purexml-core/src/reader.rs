@@ -11,6 +11,9 @@
 //! checked on every expansion and every default injection once the numerator
 //! exceeds [`EXPANSION_RATIO_FLOOR_BYTES`]. Repeating a large default may
 //! require a higher `max_expansion_ratio`.
+//!
+//! An entity-reference name is an NCName. `&a:b;` is [`ErrorKind::Syntax`]
+//! at the colon, not an undefined-entity error.
 
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
@@ -43,6 +46,11 @@ const MODEL_DEPTH_CEILING: usize = 1024;
 /// `S` is the input holder: `&[u8]` for borrowed bytes, `Vec<u8>` after a
 /// buffered read. Events borrow from that input when no normalization or
 /// entity expansion was required.
+///
+/// Entity-reference names are NCNames. `&a:b;` fails with
+/// [`ErrorKind::Syntax`] because of the colon. A well-formed name with no
+/// internal declaration, such as `&missing;`, is also [`ErrorKind::Syntax`],
+/// and that message says `undefined entity`.
 ///
 /// The 0.x API is unstable.
 pub struct Reader<S> {
@@ -2217,6 +2225,11 @@ impl Engine {
         }
     }
 
+    /// Read one general-entity or character reference.
+    ///
+    /// The entity name is an NCName, so `&a:b;` fails at the colon with
+    /// [`ErrorKind::Syntax`]. The name is not looked up, and the error is not
+    /// an undefined entity.
     fn expand_ref(&mut self, input: &[u8]) -> Result<RefOut> {
         let origin = self.err_pos();
         self.advance_one(input)?;

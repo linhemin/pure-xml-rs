@@ -133,6 +133,10 @@ pub enum ErrorKind {
     ExternalEntityForbidden,
     /// The document is not well-formed, a name is unbound, or a general entity
     /// reference has no internal declaration.
+    ///
+    /// An entity-reference name is an NCName. `&a:b;` is this error because
+    /// the name contains a colon. It is not reported as an undefined entity.
+    /// `&missing;` is also this error; that message says `undefined entity`.
     Syntax,
     /// The bytes are not UTF-8, or the document declares an encoding other than
     /// UTF-8. UTF-16 (BOM or encoding declaration) is rejected here. There is
