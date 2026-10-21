@@ -86,6 +86,18 @@ impl<R> IoInput<R> {
         if pos < COMPACT_MIN || pos < self.buf.len() / 2 || pos > self.buf.len() {
             return pos;
         }
+        self.discard_prefix(pos)
+    }
+
+    /// Drop bytes before the current token.
+    ///
+    /// [`compact`] keeps the 64 KiB copy heuristic. The window cap is separate:
+    /// a consumed prefix must not count toward `max_token_len`, so a full
+    /// window discards it before another read.
+    fn discard_prefix(&mut self, pos: usize) -> usize {
+        if pos == 0 || pos > self.buf.len() {
+            return pos;
+        }
         let drop = pos;
         self.buf.copy_within(drop.., 0);
         self.buf.truncate(self.buf.len() - drop);
@@ -134,6 +146,16 @@ impl<R: BufRead> IoInput<R> {
                         self.view_end = None;
                         self.view_eof = self.eof;
                         return Ok(());
+                    }
+                    // `pull` refuses another read once `buf.len()` hits
+                    // max_token_len + READ_CHUNK. Bytes already consumed are
+                    // not part of this token; drop them and frame it again
+                    // before that cap can report a false TokenLength.
+                    let cap = (config.max_token_len as usize).saturating_add(READ_CHUNK);
+                    if *pos > 0 && *pos <= self.buf.len() && self.buf.len() >= cap {
+                        *pos = self.discard_prefix(*pos);
+                        framer = Framer::start(*pos, doc_start, content);
+                        continue;
                     }
                     self.pull(config)?;
                 }
