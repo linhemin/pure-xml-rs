@@ -120,6 +120,26 @@ pub(crate) fn decode_utf8(bytes: &[u8]) -> Result<(char, usize), ()> {
     char::from_u32(cp).map(|ch| (ch, width)).ok_or(())
 }
 
+/// A non-empty prefix of a well-formed UTF-8 sequence that runs off the slice.
+///
+/// Invalid lead bytes and bad continuations are not incomplete; they are
+/// malformed. Callers use this to tell a probe cut from a real encoding error.
+pub(crate) fn utf8_incomplete(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    let width = match bytes[0] {
+        byte if byte & 0xE0 == 0xC0 => 2,
+        byte if byte & 0xF0 == 0xE0 => 3,
+        byte if byte & 0xF8 == 0xF0 => 4,
+        _ => return false,
+    };
+    if bytes.len() >= width {
+        return false;
+    }
+    bytes[1..].iter().all(|byte| byte & 0xC0 == 0x80)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
