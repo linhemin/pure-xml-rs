@@ -5,7 +5,7 @@
 //! expand it here. That is what keeps tags and comments from crossing the
 //! entity boundary.
 
-use crate::name::{is_name_char, is_name_start, is_xml_char};
+use crate::name::{is_name_char, is_name_start, is_ncname_char, is_ncname_start, is_xml_char};
 
 pub(crate) enum WfFail {
     Syntax(String),
@@ -247,7 +247,7 @@ impl Cursor<'_> {
 
     fn pi(&mut self) -> Result<(), String> {
         self.index += 2;
-        let target = self.read_name()?;
+        let target = self.read_ncname()?;
         if target.eq_ignore_ascii_case("xml") {
             return Err("processing instruction target must not be `xml`".to_string());
         }
@@ -323,7 +323,7 @@ impl Cursor<'_> {
             self.expect_char(';')?;
             return Ok(());
         }
-        self.read_name()?;
+        self.read_ncname()?;
         self.expect_char(';')
     }
 
@@ -349,6 +349,29 @@ impl Cursor<'_> {
             self.bump();
         }
         Ok(())
+    }
+
+    /// PI targets and entity-reference names are NCNames.
+    fn read_ncname(&mut self) -> Result<String, String> {
+        let Some(first) = self.bump() else {
+            return Err("expected a name".to_string());
+        };
+        if !is_ncname_start(first) {
+            return Err(format!("invalid name start U+{:04X}", u32::from(first)));
+        }
+        let mut name = String::new();
+        name.push(first);
+        while let Some(ch) = self.peek_char() {
+            if !is_ncname_char(ch) {
+                break;
+            }
+            name.push(ch);
+            self.bump();
+        }
+        if self.peek_char() == Some(':') {
+            return Err("name must be an NCName".to_string());
+        }
+        Ok(name)
     }
 
     fn read_name(&mut self) -> Result<String, String> {
@@ -424,8 +447,16 @@ mod tests {
         assert!(check("<!-- ok -->").is_ok());
         assert!(check("<![CDATA[x]]>").is_ok());
         assert!(check("<?pi data?>").is_ok());
+        assert!(check("<a:b></a:b>").is_ok());
         assert!(check("<a>&inner;</a>").is_ok());
         assert!(check("<a><b></b></a>").is_ok());
+    }
+
+    #[test]
+    fn rejects_colons_in_pi_targets_and_entity_references() {
+        assert!(check("<?a:b x?>").is_err());
+        assert!(check("<?a: x?>").is_err());
+        assert!(check("&a:b;").is_err());
     }
 
     #[test]

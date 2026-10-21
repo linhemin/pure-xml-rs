@@ -77,7 +77,11 @@ pub enum LimitKind {
     /// Original input size in bytes.
     TotalInput,
     /// One attribute value, in UTF-8 bytes, after attribute-value normalization
-    /// and entity expansion. `limit` is `ParserConfig::max_text_len`.
+    /// and entity expansion. The length is checked as each character is
+    /// accepted, on the plain scan and on the normalizing path. `actual` is
+    /// the length at the first character that makes the value longer than the
+    /// limit (the limit plus that character's UTF-8 byte length). `limit` is
+    /// `ParserConfig::max_text_len`.
     AttrValueLength,
 }
 
@@ -115,6 +119,9 @@ pub enum ErrorKind {
         /// For [`LimitKind::AttrValueLength`] this is `max_text_len`.
         limit: u64,
         /// The measured value that exceeded `limit`.
+        ///
+        /// For [`LimitKind::AttrValueLength`] this is the value length at the
+        /// first character past the cap, not the length of the unread tail.
         actual: u64,
     },
     /// An entity declaration uses `SYSTEM` or `PUBLIC`, or a parameter-entity

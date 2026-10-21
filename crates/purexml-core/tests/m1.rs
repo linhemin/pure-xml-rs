@@ -797,7 +797,8 @@ fn expanded_bytes_attribute_text_name_depth_and_input_limits() {
     let (kind, limit, actual) = limit_of(&err);
     assert_eq!(kind, LimitKind::AttrValueLength);
     assert_eq!(limit, 4);
-    assert_eq!(actual, 10);
+    // First character past the cap, on the plain scan and after expansion.
+    assert_eq!(actual, 5);
 
     let err = parse_with(
         r#"<!DOCTYPE a [<!ENTITY e "0123456789">]><a b="&e;"/>"#,
@@ -807,7 +808,10 @@ fn expanded_bytes_attribute_text_name_depth_and_input_limits() {
         },
     )
     .unwrap_err();
-    assert_eq!(limit_of(&err).0, LimitKind::AttrValueLength);
+    let (kind, limit, actual) = limit_of(&err);
+    assert_eq!(kind, LimitKind::AttrValueLength);
+    assert_eq!(limit, 4);
+    assert_eq!(actual, 5);
 
     let err = parse_with(
         "<a>ab&#10;c</a>",

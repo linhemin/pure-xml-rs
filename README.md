@@ -87,7 +87,7 @@ assert_eq!(
 | `DEFAULT_MAX_ATTRS` | 1024 | `Attributes` |
 | `DEFAULT_MAX_NAME_LEN` | 1024 字节 | `NameLength` |
 | `DEFAULT_MAX_TEXT_LEN` | 16 MiB | `TextLength`（单个文本节点） |
-| `DEFAULT_MAX_TEXT_LEN` | 16 MiB | `AttrValueLength`（规范化并展开之后的单个属性值，`limit` 就是 `max_text_len`） |
+| `DEFAULT_MAX_TEXT_LEN` | 16 MiB | `AttrValueLength`（规范化并展开之后的单个属性值；写入时逐字符检查，`actual` 是第一次超过上限时的长度，`limit` 就是 `max_text_len`） |
 | `DEFAULT_MAX_TOTAL_INPUT` | 1 GiB | `TotalInput` |
 | `DEFAULT_MAX_ENTITY_DEPTH` | 8 | `EntityDepth`（文档中的引用算第 1 层，第 9 层失败） |
 | `DEFAULT_MAX_ENTITY_EXPANSIONS` | 10_000 | `EntityExpansions`（同一个实体的重复引用也计数；10_000 次可以，10_001 次失败） |
@@ -116,6 +116,8 @@ assert_eq!(
 - 任何参数实体引用 `%name;` 都是 `ExternalEntityForbidden`。属性默认值引号里的 `%` 是普通字符，不是参数实体引用。
 - 引用没有内部声明的一般实体是 `Syntax`（即使 DOCTYPE 指向了外部 DTD，因为那个 DTD 不会被加载）。`ATTLIST` 默认值里的一般实体也按这条检查，而且必须在使用前已经声明。
 - `ELEMENT` / `ATTLIST` / `NOTATION` 会做语法检查。`ATTLIST` 的默认值会补到元素上；非 `CDATA` 类型在普通属性规范化之后再折叠空白。属性值里经实体展开引入的字面 `<` 是 `Syntax`。
+- 属性值长度在接受每个字符时检查（纯文本快路径和需要规范化或实体展开的路径都一样）。超过 `max_text_len` 就停在那个字符，不再把后面的内容拷进缓冲。`actual` 等于当时的长度（上限加上该字符的 UTF-8 字节数）。刚好等于上限可以通过。
+- PI 目标、一般实体名、参数实体名、记法名（包括 `NDATA` 引用的记法名）必须是 NCName，不能含冒号。实体引用里的名字同样按 NCName 读，所以 `&a:b;` 是名字错误，不是“未定义实体”。`DOCTYPE` 名必须是 QName：没有冒号，或恰好一个冒号且两边都是 NCName（`a:b` 可以，`r:`、`:r`、`a:b:c` 不行）。Reader 和 Writer 用同一套规则。
 - 字符引用只接受小写 `&#x`。位数不设上限，数值超出 XML `Char` 才拒绝。内容里的 `]]>` 只禁止三个字面字符连在一起；`]]&gt;` 是合法写法，解析结果是字符 `]]>`。
 - 实体替换文本的良构检查用堆上的元素栈，嵌套超过 `max_depth` 是 `SecurityLimit(ElementDepth)`，不会把线程栈打爆。`ELEMENT` 内容模型也用堆上的显式栈，调用栈深度与嵌套层数无关；层数仍受 `max_depth` 限制，并且不超过 1024 层，超过是 `SecurityLimit(ElementDepth)`。
 - `ATTLIST` 默认值在声明处做一次 UTF-8 校验（非 `CDATA` 再折叠空白），结果放进一个 `Arc<str>`。之后每个元素只克隆这个 `Arc`，不再扫描原文。属性去重按驻留 URI 的指针比较，不按 URI 内容哈希。每次补上默认属性，都把名字字节和完整值字节计入展开比率的分子；默认值用得很重时，可能需要调高 `max_expansion_ratio`。
@@ -127,9 +129,7 @@ assert_eq!(
 
 ## 留到 M2
 
-- **D11**：属性值只要走过实体展开或空白规范化，长度要等整个值读完才检查 `AttrValueLength`。临时缓冲仍受输入大小和 1 MiB 展开上限约束，安全套件里的 16 MiB+1 会报错。
-- **D23**：PI 目标、实体名、记法名里的冒号，以及 DOCTYPE 名是否必须是 QName。Reader 目前接受，Writer 拒绝其中一部分。
-- DOM、XPath、校验和完整往返。`from_reader` 仍会把输入缓冲到 `max_total_input`。
+- DOM、XPath、校验和完整往返。`from_reader` 仍会把输入缓冲到 `max_total_input`。增量读取和 DOM 不在这一批改动里。
 
 ### 编码
 
@@ -158,7 +158,7 @@ LimitKind::EntityDepth | EntityExpansions | ExpandedBytes | ExpansionRatio
 ## 模块
 
 - `purexml`：门面，重新导出 core。
-- `purexml-core`：`config`（限制与 `ParserConfig`）、`error`、`event`、`reader`（拉取解析）、`writer`（转义写出）。名字字符类和实体良构检查是私有实现细节。
+- `purexml-core`：`config`（限制与 `ParserConfig`）、`error`、`event`、`reader`（拉取解析）、`writer`（转义写出）、`rules`（NCName、QName、命名空间绑定，Reader 和 Writer 共用）。名字字符类和实体良构检查是私有实现细节。
 
 ## 许可证
 
