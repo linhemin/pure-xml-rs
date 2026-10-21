@@ -1,5 +1,5 @@
 //! fuzz 目标 reader_chunked（M2 计划 §6）：同一输入走 from_bytes、from_vec 和按任意块长序列切块的
-//! from_reader，事件序列和错误（kind、line、column、offset）必须完全相同（TotalInput 只比最终错误）。
+//! from_reader，事件序列和错误（kind、line、column、offset）必须完全相同（TotalInput 按位置判定，也要求完全相同，计划 v7）。
 //! 输入的前 4 个字节决定块长序列和限额档位：档位 1 用很小的上限，让 probe 边界在小输入里就触发。
 //!
 //! 注意：不用 `BufReader::with_capacity(n, &[u8])` 来切块。IoInput 一次请求 8 KiB，

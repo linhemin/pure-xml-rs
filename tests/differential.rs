@@ -75,7 +75,7 @@ fn pure(input: &[u8]) -> Result<Vec<Node>, String> {
 }
 
 /// M2：同一份字节走 from_bytes、from_vec、from_reader（逐字节、7 字节块、8 KiB 默认），
-/// 事件序列和错误（kind、position）必须完全相同。TotalInput 只比最终错误（计划 §0.1）。
+/// 事件序列和错误（kind、position）必须完全相同。TotalInput 按位置判定，不再是例外（计划 §0.1 v7）。
 macro_rules! snap_events {
     ($reader:expr) => {{
         let reader = &mut $reader;
@@ -105,22 +105,12 @@ impl std::io::Read for Chunks<'_> {
 fn path_mismatches(input: &[u8]) -> Vec<String> {
     let mut r = purexml::Reader::from_bytes(input);
     let base = snap_events!(r);
-    let total = matches!(
-        &base.1,
-        Err((
-            purexml::ErrorKind::SecurityLimit {
-                kind: purexml::LimitKind::TotalInput,
-                ..
-            },
-            _
-        ))
-    );
     let same = |label: &str,
                 got: (
         Vec<String>,
         Result<(), (purexml::ErrorKind, purexml::Position)>,
     )| {
-        let ok = if total { got.1 == base.1 } else { got == base };
+        let ok = got == base;
         (!ok).then(|| label.to_string())
     };
     let mut out = Vec::new();

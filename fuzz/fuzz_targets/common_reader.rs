@@ -1,7 +1,7 @@
 //! reader_chunked 和 reader_1byte 共用的比较逻辑（不是 fuzz 目标本身）。
 #![allow(dead_code)]
 
-use purexml::{LimitKind, ParserConfig, Reader};
+use purexml::{ParserConfig, Reader};
 use std::io::Read;
 
 #[derive(Debug, PartialEq)]
@@ -68,14 +68,7 @@ pub fn check(data: &[u8], sizes: [usize; 3], tight: bool) {
     let mut streamed =
         Reader::from_reader_with_config(Chunked { data, sizes, i: 0 }, config).expect("from_reader");
     let b = drain!(streamed);
-    let total = matches!(
-        &a.end,
-        Err((purexml::ErrorKind::SecurityLimit { kind: LimitKind::TotalInput, .. }, ..))
-    );
-    if total {
-        assert_eq!(a.end, b.end, "TotalInput 最终错误不一致（块长 {sizes:?}）");
-    } else {
-        assert_eq!(a, b, "from_bytes 与 from_reader（块长 {sizes:?}）不一致");
-    }
+    // v7（D31 裁定）：TotalInput 按位置判定，和其他错误一样要求事件和错误完全相同。
+    assert_eq!(a, b, "from_bytes 与 from_reader（块长 {sizes:?}）不一致");
 }
 

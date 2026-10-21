@@ -1,9 +1,12 @@
 //! M2 PR-B 增量读取回归（计划 §1、§4），2026-10-21 由 Tester 编写。
 //!
 //! 等价性：同一份字节经过 `from_bytes`、`from_vec`、各种切块的 `from_reader`，事件序列和错误
-//! （kind、limit、actual、line、column、offset）必须完全相同。例外只有两条（计划 §0.1）：
-//! - Io：一次性解析没有 IO；流式出 Io 时，之前的事件是完整序列的前缀，offset = 已成功读入的字节数；
-//! - TotalInput：只比较最终错误（流式报错前可以多吐出事件）。
+//! （kind、limit、actual、line、column、offset）必须完全相同。例外只有一条（计划 §0.1 v7）：
+//! - Io：一次性解析没有 IO；流式出 Io 时，之前的事件是完整序列的前缀，offset = 已成功读入的字节数。
+//!
+//! TotalInput 按位置判定（Lead 11:51 裁定，D31）：只有解析真正需要 offset = limit 的那个字节时才报，
+//! position 指向这个字节，actual = limit + 1；位置更靠前的错误优先，from_bytes 也一样。所以它和其他
+//! 错误一样要求事件序列和错误完全相同，不再是例外（v7 以前只比较最终错误）。
 //!
 //! position 口径（计划 §0.1 v5）：按字节计的 TokenLength、TotalInput、InternalSubsetLength 指向
 //! 越界的那个字节本身；按字符计的 TextLength、AttrValueLength、NameLength 指向越界字符之后。
@@ -303,25 +306,9 @@ fn stream(d: &[u8], c: &ParserConfig, plan: Plan, cap: Option<usize>) -> Run {
     }
 }
 
-fn is_total_input(e: &End) -> bool {
-    matches!(
-        e,
-        Err((
-            ErrorKind::SecurityLimit {
-                kind: LimitKind::TotalInput,
-                ..
-            },
-            _
-        ))
-    )
-}
-
 #[track_caller]
 fn assert_same(label: &str, base: &Snap, got: &Snap) {
-    if is_total_input(&base.end) {
-        assert_eq!(base.end, got.end, "{label}：TotalInput 的最终错误不同");
-        return;
-    }
+    // v7（D31 裁定）：TotalInput 不再只比最终错误，事件序列也必须相同。
     if base == got {
         return;
     }
@@ -1284,6 +1271,135 @@ fn total_input_boundaries() {
     let s = four_paths("TotalInput 多行", d.as_bytes(), &c);
     let (_, _, a, p) = limit_of("TotalInput 多行", &s);
     assert_eq!((a, p), (m + 1, position_after(&d.as_bytes()[..m as usize])));
+}
+
+/// D31（R2b fuzz 发现，Lead 11:51 裁定）：TotalInput 按位置判定。输入总长超过 max_total_input，
+/// 但在 offset = limit 之前就有别的错误时，四条路径（含各种块长）都报那个更早的错误。
+/// 修复前：from_bytes 一开始就按总长报 TotalInput，流式则随块长变化。
+#[test]
+fn d31_total_input_does_not_depend_on_chunking() {
+    let c = ParserConfig::default()
+        .with_max_text_len(12)
+        .with_max_total_input(512);
+    let docs = [
+        // 文本在 offset 3 开始，第 13 个字符（offset 15）越界，position = 16；总长 597
+        (
+            format!("<r>{}</r>{}", "t".repeat(30), " ".repeat(560)),
+            16u64,
+        ),
+        // 文本在 offset 498 开始，越界字符在 510，position = 511（limit 前一个字节）；总长 576
+        (
+            format!(
+                "<r>{}<a>{}</a></r>{}",
+                "<b/>".repeat(123),
+                "t".repeat(30),
+                " ".repeat(40)
+            ),
+            511,
+        ),
+    ];
+    for (i, (d, off)) in docs.iter().enumerate() {
+        let label = format!("D31 文档 {i}");
+        let base = all_chunkings(&label, d.as_bytes(), &c);
+        let (k, l, a, p) = limit_of(&label, &base);
+        assert_eq!(
+            (k, l, a, p.offset),
+            (LimitKind::TextLength, 12, 13, *off),
+            "{label}：应报更早的 TextLength"
+        );
+        assert_eq!(p, position_after(&d.as_bytes()[..*off as usize]));
+    }
+}
+
+/// 四条路径 + 固定块长 1/7/511/512/513/8192 和整块；全部与 from_bytes 完全相同。
+fn all_chunkings(label: &str, d: &[u8], c: &ParserConfig) -> Snap {
+    let base = four_paths(label, d, c);
+    for n in [1usize, 7, 511, 512, 513, 8192, d.len().max(1)] {
+        assert_same(
+            &format!("{label} [块长 {n}]"),
+            &base,
+            &stream(d, c, Plan::Schedule(vec![n]), None).snap,
+        );
+    }
+    base
+}
+
+/// TotalInput 本身（D31 裁定）：没有更早的错误时，四条路径和各种块长都报 TotalInput，
+/// position = limit 那个字节，actual = limit + 1，之前的事件完全相同；刚好等于 limit 时通过；
+/// 更靠后的错误（offset > limit）让位给 TotalInput。
+#[test]
+fn total_input_is_positional_on_all_chunkings() {
+    let m = 512u64;
+    let c = ParserConfig::default()
+        .with_max_text_len(12)
+        .with_max_total_input(m);
+    let pad = |len: usize| {
+        format!("<r>{}</r>", "<b/>".repeat((len - 7) / 4)) + &" ".repeat((len - 7) % 4)
+    };
+    // 边界：刚好 m 字节通过
+    let exact = pad(m as usize);
+    assert_eq!(exact.len(), m as usize);
+    let s = all_chunkings("TotalInput = m", exact.as_bytes(), &c);
+    assert!(s.end.is_ok(), "TotalInput = m 应通过，实际 {:?}", s.end);
+    let cases = [
+        // m+1：越界的是结尾后的空白
+        ("m+1（尾部空白）", pad(m as usize) + " "),
+        // 第 m 个字节落在一个注释 token 中间
+        (
+            "落在 token 中间",
+            // 注释占 507..524，第 512 个字节在注释内部；注释内容 10 个字符，不触发 max_text_len
+            format!("<r>{}<!--{}--></r>", "<b/>".repeat(126), "c".repeat(10)),
+        ),
+        // 多行：line/column 按主输入计算
+        ("多行", format!("<r>{}</r>", "<b/>\r\n".repeat(120))),
+        // 更靠后的错误（文本在 offset 600 才越界）让位给 TotalInput
+        (
+            "后面的错误让位",
+            format!("<r>{}<a>{}</a></r>", "<b/>".repeat(150), "t".repeat(30)),
+        ),
+    ];
+    for (name, d) in cases {
+        assert!(d.len() as u64 > m, "{name}：样本必须超过 limit");
+        let label = format!("TotalInput {name}");
+        let base = all_chunkings(&label, d.as_bytes(), &c);
+        let (k, l, a, p) = limit_of(&label, &base);
+        assert_eq!(
+            (k, l, a, p.offset),
+            (LimitKind::TotalInput, m, m + 1, m),
+            "{label}"
+        );
+        assert_eq!(
+            p,
+            position_after(&d.as_bytes()[..m as usize]),
+            "{label}：行列"
+        );
+        // 位置判定：limit 之前已经完整的 token 都要产出事件
+        assert!(!base.events.is_empty(), "{label}：limit 之前的事件不应丢掉");
+    }
+}
+
+/// D32（R2b fuzz 发现，reader_1byte）：内部子集里的 `<!-->`。定界扫描器把开头 `<!--` 的
+/// `--` 和后面的 `>` 当成了 `-->`，在 `]>` 处提前结束 token；引擎仍在未闭合的注释里，
+/// 读到窗口末尾就误报 TokenLength（32 MiB 上限、文档只有几十字节），位置还随块长变化。
+/// main 257c900 上报的是 Syntax。四条路径必须一致，并且不能是 TokenLength。
+#[test]
+fn d32_subset_comment_opener_is_not_a_terminator() {
+    let c = ParserConfig::default();
+    for d in [
+        "<!DOCTYPE r [<!-->]><r/>",
+        "<!DOCTYPE r [<!-->ENTITY ]>\n<r>&e;",
+        "\n<!DOCTYPE r [\n<!-->ENTITY e \"<?x<r>&e;&e;&e;&e;^&e;;\">\n]>\n<r>&e;e;&",
+    ] {
+        // 四条路径 + 各种块长的 kind 和 position 完全一致（assert_same），并且是 Syntax
+        let s = all_chunkings(&format!("D32 {d:?}"), d.as_bytes(), &c);
+        assert!(
+            matches!(s.end, Err((ErrorKind::Syntax, _))),
+            "D32 {d:?}：应报 Syntax（未闭合的注释），实际 {:?}",
+            s.end
+        );
+    }
+    // 合法的对照：注释里出现 `]>` 不结束内部子集
+    pass("D32 合法", b"<!DOCTYPE r [<!-- ]> -->]><r/>", &c);
 }
 
 #[test]
