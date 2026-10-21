@@ -65,6 +65,10 @@ pub struct ParserConfig {
     pub max_name_len: usize,
     /// Maximum UTF-8 byte length of one text node, and of one attribute value
     /// after normalization and entity expansion.
+    ///
+    /// Attribute values are checked while they are accumulated. A value that
+    /// grows past this limit fails at that character; `actual` is the length
+    /// then, and the rest of the value is not buffered.
     pub max_text_len: u64,
     /// Maximum original document size in bytes.
     pub max_total_input: u64,

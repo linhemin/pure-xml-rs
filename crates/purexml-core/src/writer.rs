@@ -12,7 +12,8 @@ use crate::event::{
     Attribute, Doctype, EmptyElement, EndElement, Event, Namespace, ProcessingInstruction, QName,
     StartElement, XmlDecl, XMLNS_NAMESPACE, XML_NAMESPACE,
 };
-use crate::name::{is_ncname_char, is_ncname_start, is_pubid_char, is_xml_char};
+use crate::name::{is_pubid_char, is_xml_char};
+use crate::rules::{self, BindingFault};
 
 /// Failure while writing XML.
 #[derive(Debug)]
@@ -169,18 +170,14 @@ fn check_system_literal(value: &str) -> Result<(), WriteError> {
 }
 
 fn check_name(name: &str) -> Result<(), WriteError> {
-    let mut parts = name.split(':');
-    let Some(first) = parts.next().filter(|part| !part.is_empty()) else {
-        return Err(WriteError::Syntax("empty name".to_string()));
-    };
-    check_ncname(first)?;
-    if let Some(second) = parts.next() {
-        check_ncname(second)?;
-        if parts.next().is_some() {
-            return Err(WriteError::Syntax(format!("invalid name `{name}`")));
-        }
+    if rules::is_qname(name) {
+        return Ok(());
     }
-    Ok(())
+    // A missing side (`:r`, `r:`, `a::b`) used to say "empty name".
+    if name.is_empty() || name.split(':').any(|part| part.is_empty()) {
+        return Err(WriteError::Syntax("empty name".to_string()));
+    }
+    Err(WriteError::Syntax(format!("invalid name `{name}`")))
 }
 
 fn split_qname(name: &str) -> (Option<&str>, &str) {
@@ -191,14 +188,14 @@ fn split_qname(name: &str) -> (Option<&str>, &str) {
 }
 
 fn check_ncname(name: &str) -> Result<(), WriteError> {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
+    if name.is_empty() {
         return Err(WriteError::Syntax("empty name".to_string()));
-    };
-    if !is_ncname_start(first) || !chars.all(is_ncname_char) {
-        return Err(WriteError::Syntax(format!("invalid name `{name}`")));
     }
-    Ok(())
+    if rules::is_ncname(name) {
+        Ok(())
+    } else {
+        Err(WriteError::Syntax(format!("invalid name `{name}`")))
+    }
 }
 
 /// Expanded name when a namespace URI is present, otherwise the lexical QName.
@@ -225,32 +222,17 @@ fn check_distinct_attributes(attributes: &[Attribute<'_>]) -> Result<(), WriteEr
 
 /// Reserved-namespace rules shared by the event API and the string API.
 fn check_namespace_binding(prefix: Option<&str>, uri: &str) -> Result<(), WriteError> {
-    if prefix == Some("xmlns") {
-        return Err(WriteError::Syntax(
-            "the xmlns prefix must not be declared".to_string(),
-        ));
-    }
-    if prefix == Some("xml") && uri != XML_NAMESPACE {
-        return Err(WriteError::Syntax(
-            "the xml prefix is bound to the XML namespace".to_string(),
-        ));
-    }
-    if prefix.is_some() && uri.is_empty() {
-        return Err(WriteError::Syntax(
-            "a prefixed namespace declaration must not have an empty URI".to_string(),
-        ));
-    }
-    if uri == XML_NAMESPACE && prefix != Some("xml") {
-        return Err(WriteError::Syntax(
-            "the XML namespace must not be bound to another prefix".to_string(),
-        ));
-    }
-    if uri == XMLNS_NAMESPACE {
-        return Err(WriteError::Syntax(
-            "the xmlns namespace must not be declared".to_string(),
-        ));
-    }
-    Ok(())
+    let message = match rules::namespace_binding(prefix, uri) {
+        Ok(()) => return Ok(()),
+        Err(BindingFault::XmlnsPrefix) => "the xmlns prefix must not be declared",
+        Err(BindingFault::XmlPrefix) => "the xml prefix is bound to the XML namespace",
+        Err(BindingFault::EmptyPrefixed) => {
+            "a prefixed namespace declaration must not have an empty URI"
+        }
+        Err(BindingFault::XmlNamespace) => "the XML namespace must not be bound to another prefix",
+        Err(BindingFault::XmlnsNamespace) => "the xmlns namespace must not be declared",
+    };
+    Err(WriteError::Syntax(message.to_string()))
 }
 
 fn check_namespace_decls(namespaces: &[Namespace<'_>]) -> Result<(), WriteError> {
@@ -373,7 +355,7 @@ impl<W: Write> Writer<W> {
 
     /// Write a processing instruction.
     pub fn write_pi_str(&mut self, target: &str, data: Option<&str>) -> Result<(), WriteError> {
-        check_name(target)?;
+        check_ncname(target)?;
         if target.eq_ignore_ascii_case("xml") {
             return Err(WriteError::Syntax(
                 "processing instruction target is reserved or empty".to_string(),

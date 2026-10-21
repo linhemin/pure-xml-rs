@@ -11,6 +11,9 @@
 //! checked on every expansion and every default injection once the numerator
 //! exceeds [`EXPANSION_RATIO_FLOOR_BYTES`]. Repeating a large default may
 //! require a higher `max_expansion_ratio`.
+//!
+//! An entity-reference name is an NCName. `&a:b;` is [`ErrorKind::Syntax`]
+//! at the colon, not an undefined-entity error.
 
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
@@ -43,6 +46,11 @@ const MODEL_DEPTH_CEILING: usize = 1024;
 /// `S` is the input holder: `&[u8]` for borrowed bytes, `Vec<u8>` after a
 /// buffered read. Events borrow from that input when no normalization or
 /// entity expansion was required.
+///
+/// Entity-reference names are NCNames. `&a:b;` fails with
+/// [`ErrorKind::Syntax`] because of the colon. A well-formed name with no
+/// internal declaration, such as `&missing;`, is also [`ErrorKind::Syntax`],
+/// and that message says `undefined entity`.
 ///
 /// The 0.x API is unstable.
 pub struct Reader<S> {
@@ -735,7 +743,8 @@ impl Engine {
         self.seen_doctype = true;
         self.expect_bytes(input, b"<!DOCTYPE")?;
         self.expect_ws(input)?;
-        let name = self.read_name(input, false)?;
+        // A document-type name is a QName: zero or one colon, both sides NCName.
+        let name = flatten_qname(input, self.read_qname(input)?);
         self.skip_ws(input)?;
         let mut system_id = None;
         let mut public_id = None;
@@ -820,7 +829,7 @@ impl Engine {
             let at = self.err_pos();
             self.advance_one(input)?;
             self.expect_ws(input)?;
-            let name = self.read_name_string(input, false)?;
+            let name = self.read_ncname_string(input, "entity name")?;
             self.expect_ws(input)?;
             if self.starts_with_token(input, b"SYSTEM") || self.starts_with_token(input, b"PUBLIC")
             {
@@ -835,9 +844,12 @@ impl Engine {
             return Ok(());
         }
         let at = self.err_pos();
-        let name = self.read_name_string(input, false)?;
+        let name = self.read_ncname_string(input, "entity name")?;
         self.expect_ws(input)?;
         if self.starts_with_token(input, b"SYSTEM") || self.starts_with_token(input, b"PUBLIC") {
+            // A bad NDATA notation name is Syntax. A well-formed external
+            // declaration is still forbidden and is never loaded.
+            self.scan_external_notation(input)?;
             return Err(self.external_at(
                 at,
                 format!("external entity declaration `&{name};` is forbidden"),
@@ -875,7 +887,7 @@ impl Engine {
                     self.advance_one(input)?;
                     out.push(self.parse_char_ref(input)?);
                 } else {
-                    let name = self.read_name_string(input, false)?;
+                    let name = self.read_name_string(input, true)?;
                     self.expect_byte(input, b';')?;
                     out.push('&');
                     out.push_str(&name);
@@ -1146,7 +1158,7 @@ impl Engine {
             self.expect_byte(input, b'(')?;
             self.skip_ws(input)?;
             self.reject_dtd_pe(input)?;
-            let _name = self.read_name(input, false)?;
+            let _name = self.read_ncname_decl(input, "notation name")?;
             loop {
                 self.skip_ws(input)?;
                 self.reject_dtd_pe(input)?;
@@ -1156,7 +1168,7 @@ impl Engine {
                 self.advance_one(input)?;
                 self.skip_ws(input)?;
                 self.reject_dtd_pe(input)?;
-                let _name = self.read_name(input, false)?;
+                let _name = self.read_ncname_decl(input, "notation name")?;
             }
             self.expect_byte(input, b')')?;
             return Ok(false);
@@ -1220,7 +1232,7 @@ impl Engine {
         self.expect_bytes(input, b"<!NOTATION")?;
         self.expect_ws(input)?;
         self.reject_dtd_pe(input)?;
-        let _name = self.read_name(input, false)?;
+        let _name = self.read_ncname_decl(input, "notation name")?;
         self.expect_ws(input)?;
         self.reject_dtd_pe(input)?;
         if self.starts_with_token(input, b"SYSTEM") {
@@ -1554,36 +1566,25 @@ impl Engine {
     }
 
     fn validate_xmlns(&self, prefix: Option<&str>, uri: &str) -> Result<()> {
-        match prefix {
-            None => {
-                if uri == XML_NAMESPACE || uri == XMLNS_NAMESPACE {
-                    return Err(
-                        self.syntax("the default namespace must not be the xml or xmlns namespace")
-                    );
-                }
+        let message = match crate::rules::namespace_binding(prefix, uri) {
+            Ok(()) => return Ok(()),
+            Err(crate::rules::BindingFault::XmlnsPrefix) => "the xmlns prefix must not be declared",
+            Err(crate::rules::BindingFault::XmlPrefix) => {
+                "the xml prefix must be bound to the XML namespace"
             }
-            Some("xmlns") => {
-                return Err(self.syntax("the xmlns prefix must not be declared"));
+            Err(crate::rules::BindingFault::EmptyPrefixed) => {
+                "cannot undeclare a namespace prefix in XML namespaces 1.0"
             }
-            Some("xml") => {
-                if uri != XML_NAMESPACE {
-                    return Err(self.syntax("the xml prefix must be bound to the XML namespace"));
-                }
-            }
-            Some(_) => {
-                if uri.is_empty() {
-                    return Err(
-                        self.syntax("cannot undeclare a namespace prefix in XML namespaces 1.0")
-                    );
-                }
-                if uri == XML_NAMESPACE || uri == XMLNS_NAMESPACE {
-                    return Err(
-                        self.syntax("this prefix must not be bound to a reserved namespace")
-                    );
-                }
-            }
-        }
-        Ok(())
+            Err(
+                crate::rules::BindingFault::XmlNamespace
+                | crate::rules::BindingFault::XmlnsNamespace,
+            ) if prefix.is_none() => "the default namespace must not be the xml or xmlns namespace",
+            Err(
+                crate::rules::BindingFault::XmlNamespace
+                | crate::rules::BindingFault::XmlnsNamespace,
+            ) => "this prefix must not be bound to a reserved namespace",
+        };
+        Err(self.syntax(message))
     }
 
     fn resolve_name(&self, input: &[u8], name: RawQName, element: bool) -> Result<ResolvedName> {
@@ -1710,11 +1711,13 @@ impl Engine {
             }
             if b == b'&' {
                 if plain {
-                    buf.push_str(assume_utf8(&input[start..self.pos]));
+                    self.append_attr_prefix(&mut buf, input, start, self.pos)?;
                     plain = false;
                 }
                 match self.expand_ref(input)? {
-                    RefOut::Char(ch) => buf.push(ch),
+                    RefOut::Char(ch) => {
+                        self.push_limited(&mut buf, ch, LimitKind::AttrValueLength)?
+                    }
                     RefOut::Pushed => {}
                 }
                 continue;
@@ -1723,34 +1726,70 @@ impl Engine {
             let raw_special = matches!(b, b'\t' | b'\n' | b'\r');
             let ch = self.consume_attr_literal(input)?;
             if plain && raw_special {
-                buf.push_str(assume_utf8(&input[start..mark]));
+                self.append_attr_prefix(&mut buf, input, start, mark)?;
                 plain = false;
-                buf.push(ch);
-            } else if !plain {
-                buf.push(ch);
+                self.push_limited(&mut buf, ch, LimitKind::AttrValueLength)?;
+            } else if plain {
+                // Still a borrow of the input. Stop at this character instead
+                // of waiting until the closing quote.
+                self.check_len(self.pos - start, LimitKind::AttrValueLength)?;
+            } else {
+                self.push_limited(&mut buf, ch, LimitKind::AttrValueLength)?;
             }
         }
-        // Length is the value after normalization and entity expansion.
         if plain {
             self.check_len(self.pos - start - 1, LimitKind::AttrValueLength)?;
             Ok(RawStr::Range(start..self.pos - 1))
         } else {
-            self.check_len(buf.len(), LimitKind::AttrValueLength)?;
             Ok(RawStr::Owned(buf))
         }
     }
 
-    /// ASCII attribute value with no references and no whitespace.
+    /// Copy a plain prefix that is already known to fit, or refuse the tail.
+    ///
+    /// The per-character check in [`Self::parse_attr_value`] rejects an
+    /// over-long prefix before this runs. The walk is the backstop so a
+    /// prefix is never copied past the cap.
+    fn append_attr_prefix(
+        &mut self,
+        buf: &mut String,
+        input: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Result<()> {
+        let len = end.saturating_sub(start);
+        if (len as u64) > self.config.max_text_len {
+            let mut accepted = 0usize;
+            for ch in assume_utf8(&input[start..end]).chars() {
+                accepted += ch.len_utf8();
+                if (accepted as u64) > self.config.max_text_len {
+                    return Err(self.limit(
+                        LimitKind::AttrValueLength,
+                        self.config.max_text_len,
+                        accepted as u64,
+                    ));
+                }
+            }
+        }
+        if len > 0 {
+            buf.push_str(assume_utf8(&input[start..end]));
+        }
+        Ok(())
+    }
+
+    /// ASCII attribute value with no references and no whitespace that needs
+    /// normalizing.
     ///
     /// Returns `None` without consuming when the value needs the normalizing
-    /// path. A hit advances over the value and its closing quote in one step
-    /// instead of one function call per byte.
+    /// path. A value that crosses `max_text_len` fails at that byte: `actual`
+    /// is the length then, and the rest of the value is not scanned.
     fn try_plain_attr(&mut self, input: &[u8], quote: u8) -> Result<Option<RawStr>> {
         if !self.frames.is_empty() || self.cr_pending {
             return Ok(None);
         }
         let start = self.pos;
         let bytes = &input[start..];
+        let max = self.config.max_text_len;
         let mut i = 0usize;
         while i < bytes.len() {
             let byte = bytes[i];
@@ -1759,17 +1798,20 @@ impl Engine {
                 self.column = self.column.saturating_add(len);
                 self.pos = start + i;
                 self.advance_one(input)?;
-                // Same as the slow path: the reported length is the finished
-                // value, not the first byte past the cap.
                 self.check_len(i, LimitKind::AttrValueLength)?;
                 return Ok(Some(RawStr::Range(start..start + i)));
             }
             // XML 1.0 Char excludes C0 controls and U+007F. Those, references,
-            // and '<' take the normalizing path (or its error).
+            // and '<' take the normalizing path (or its error). A prefix that
+            // is already over the cap fails here, before that byte.
             if !(0x20..0x7F).contains(&byte) || byte == b'&' || byte == b'<' {
                 return Ok(None);
             }
             i += 1;
+            if (i as u64) > max {
+                self.advance_n(input, i)?;
+                return Err(self.limit(LimitKind::AttrValueLength, max, i as u64));
+            }
         }
         Ok(None)
     }
@@ -1935,7 +1977,7 @@ impl Engine {
 
     fn parse_pi_inner(&mut self, input: &[u8]) -> Result<RawEvent> {
         self.expect_bytes(input, b"<?")?;
-        let target = self.read_name(input, false)?;
+        let target = self.read_ncname_decl(input, "processing instruction target")?;
         if target.as_str(input).eq_ignore_ascii_case("xml") {
             return Err(self.syntax("processing instruction target must not be 'xml'"));
         }
@@ -2000,7 +2042,12 @@ impl Engine {
                 buf.push_str(assume_utf8(&input[start..mark]));
                 plain = false;
             }
-            if !plain {
+            // Count this character before looking for the terminator. A comment
+            // that never closes still reports TextLength at the first overflow,
+            // with `actual` equal to the length including that character.
+            if plain {
+                self.check_len(self.pos - start, LimitKind::TextLength)?;
+            } else {
                 let new_len = buf.len() + ch.len_utf8();
                 self.check_len(new_len, LimitKind::TextLength)?;
                 buf.push(ch);
@@ -2059,6 +2106,44 @@ impl Engine {
         } else {
             Ok(RawStr::Owned(buf))
         }
+    }
+
+    /// NCName, rejecting a colon that would make the token a QName.
+    fn read_ncname_decl(&mut self, input: &[u8], what: &str) -> Result<RawStr> {
+        let name = self.read_name(input, true)?;
+        if self.peek_byte(input) == Some(b':') {
+            return Err(self.syntax(format!("{what} must be an NCName")));
+        }
+        Ok(name)
+    }
+
+    fn read_ncname_string(&mut self, input: &[u8], what: &str) -> Result<String> {
+        Ok(self.read_ncname_decl(input, what)?.into_string(input))
+    }
+
+    /// Parse `ExternalID NDataDecl?` far enough to check the notation name.
+    ///
+    /// The caller still reports [`ErrorKind::ExternalEntityForbidden`]. A
+    /// notation name that is not an NCName is [`ErrorKind::Syntax`] instead.
+    fn scan_external_notation(&mut self, input: &[u8]) -> Result<()> {
+        if self.starts_with_token(input, b"SYSTEM") {
+            self.advance_n(input, 6)?;
+            self.expect_ws(input)?;
+            let _system = self.read_quoted_plain(input)?;
+        } else {
+            self.advance_n(input, 6)?;
+            self.expect_ws(input)?;
+            let _public = self.read_pubid_literal(input)?;
+            self.expect_ws(input)?;
+            let _system = self.read_quoted_plain(input)?;
+        }
+        self.skip_ws(input)?;
+        if self.starts_with_token(input, b"NDATA") {
+            self.advance_n(input, 5)?;
+            self.expect_ws(input)?;
+            let _name = self.read_ncname_decl(input, "notation name")?;
+        }
+        Ok(())
     }
 
     fn read_qname(&mut self, input: &[u8]) -> Result<RawQName> {
@@ -2140,6 +2225,11 @@ impl Engine {
         }
     }
 
+    /// Read one general-entity or character reference.
+    ///
+    /// The entity name is an NCName, so `&a:b;` fails at the colon with
+    /// [`ErrorKind::Syntax`]. The name is not looked up, and the error is not
+    /// an undefined entity.
     fn expand_ref(&mut self, input: &[u8]) -> Result<RefOut> {
         let origin = self.err_pos();
         self.advance_one(input)?;
@@ -2147,7 +2237,7 @@ impl Engine {
             self.advance_one(input)?;
             return Ok(RefOut::Char(self.parse_char_ref(input)?));
         }
-        let name = self.read_name_string(input, false)?;
+        let name = self.read_name_string(input, true)?;
         self.expect_byte(input, b';')?;
         if let Some(ch) = predefined(&name) {
             return Ok(RefOut::Char(ch));
@@ -2564,6 +2654,20 @@ impl Engine {
         if self.frames.pop().is_some() {
             self.entity_depth = self.entity_depth.saturating_sub(1);
             self.open_entities.pop();
+        }
+    }
+}
+
+fn flatten_qname(input: &[u8], name: RawQName) -> RawStr {
+    let Some(prefix) = name.prefix else {
+        return name.local;
+    };
+    match (prefix, name.local) {
+        (RawStr::Range(prefix), RawStr::Range(local)) if prefix.end + 1 == local.start => {
+            RawStr::Range(prefix.start..local.end)
+        }
+        (prefix, local) => {
+            RawStr::Owned(format!("{}:{}", prefix.as_str(input), local.as_str(input)))
         }
     }
 }

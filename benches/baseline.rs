@@ -86,28 +86,53 @@ fn ns_dense(target: usize) -> String {
     s
 }
 
-fn purexml_drain(x: &[u8]) -> usize {
-    use purexml::{Event, Reader};
-    let mut r = Reader::from_bytes(x);
-    let mut n = 0;
-    while let Some(ev) = r.read_event().expect("purexml") {
-        match ev {
-            // 命名空间解析结果也计入，三方都要做的工作量对齐
-            Event::StartElement(e) => {
-                n += e.attributes.iter().map(|a| a.value.len()).sum::<usize>()
-                    + e.name.namespace.as_deref().map_or(0, str::len)
-                    + 1
+/// 读完全部事件，并读取属性值、命名空间 URI 和文本长度（三方工作量对齐）。
+/// 用宏而不是泛型函数，这样不依赖 `Reader` 的类型参数（M2 PR-B 会把 from_reader 的返回类型
+/// 改成 `Reader<IoInput<R>>`，宏不用跟着改）。
+macro_rules! purexml_drain_reader {
+    ($r:expr) => {{
+        use purexml::Event;
+        let mut r = $r;
+        let mut n = 0usize;
+        while let Some(ev) = r.read_event().expect("purexml") {
+            match ev {
+                // 命名空间解析结果也计入，三方都要做的工作量对齐
+                Event::StartElement(e) => {
+                    n += e.attributes.iter().map(|a| a.value.len()).sum::<usize>()
+                        + e.name.namespace.as_deref().map_or(0, str::len)
+                        + 1
+                }
+                Event::EmptyElement(e) => {
+                    n += e.attributes.iter().map(|a| a.value.len()).sum::<usize>()
+                        + e.name.namespace.as_deref().map_or(0, str::len)
+                        + 1
+                }
+                Event::Text(t) => n += t.len(),
+                _ => n += 1,
             }
-            Event::EmptyElement(e) => {
-                n += e.attributes.iter().map(|a| a.value.len()).sum::<usize>()
-                    + e.name.namespace.as_deref().map_or(0, str::len)
-                    + 1
-            }
-            Event::Text(t) => n += t.len(),
-            _ => n += 1,
         }
-    }
-    n
+        n
+    }};
+}
+
+fn purexml_drain(x: &[u8]) -> usize {
+    purexml_drain_reader!(purexml::Reader::from_bytes(x))
+}
+
+/// from_reader 路径：`BufReader` 默认容量（8 KiB），与 M2 设计稿 §4.2 的口径一致。
+/// M2 只记录，不作门槛；目标是不超过同时段 from_bytes 的 1.3 倍（Lead 08:45 裁定）。
+fn purexml_reader_drain(x: &[u8]) -> usize {
+    let src = std::io::BufReader::new(x);
+    purexml_drain_reader!(purexml::Reader::from_reader(src).expect("purexml from_reader"))
+}
+
+/// 测量参数可以用环境变量覆盖，默认值与 M1 相同（30 样本，预热 1 s，测量 2 s / 5 s）。
+/// M2 门槛测量用 `PXB_SAMPLES=50 PXB_WARMUP=2 PXB_MEAS_SMALL=5 PXB_MEAS_LARGE=10`。
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn quick_drain(x: &[u8]) -> usize {
@@ -161,12 +186,24 @@ fn bench(c: &mut Criterion) {
             let input = make(size);
             let mut g = c.benchmark_group(format!("{shape}/{size_name}"));
             g.throughput(Throughput::Bytes(input.len() as u64));
-            g.warm_up_time(Duration::from_secs(1));
-            g.measurement_time(Duration::from_secs(if size > 4096 { 5 } else { 2 }));
-            g.sample_size(30);
+            g.warm_up_time(Duration::from_secs(env_u64("PXB_WARMUP", 1)));
+            g.measurement_time(Duration::from_secs(if size > 4096 {
+                env_u64("PXB_MEAS_LARGE", 5)
+            } else {
+                env_u64("PXB_MEAS_SMALL", 2)
+            }));
+            g.sample_size(env_u64("PXB_SAMPLES", 30) as usize);
             g.bench_with_input(BenchmarkId::new("purexml", input.len()), &input, |b, x| {
                 b.iter(|| purexml_drain(black_box(x.as_bytes())))
             });
+            // from_reader 只测 1 MB 档（M2 只记录，F-2）
+            if size > 4096 {
+                g.bench_with_input(
+                    BenchmarkId::new("purexml-from_reader", input.len()),
+                    &input,
+                    |b, x| b.iter(|| purexml_reader_drain(black_box(x.as_bytes()))),
+                );
+            }
             g.bench_with_input(
                 BenchmarkId::new("quick-xml", input.len()),
                 &input,

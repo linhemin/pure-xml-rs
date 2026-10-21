@@ -4,7 +4,7 @@
 //! - `d14_*` ～ `d17_*`、`d19_*`：第二轮新发现的缺陷（D18 栈溢出见 `stack_depth_m1.rs`），修复前会失败，按约定保持开启。
 //!
 //! - 第三轮及之后：D14、D20、D21、D22 按 Lead 裁决 M1 内修，测试保持开启；D16 已修好，不再 ignore；
-//!   只有 D23 移到 M2，对应测试标 `#[ignore = "M2: D23"]`（断言不变），用 `cargo test -- --ignored` 运行。
+//!   D23 当时移到 M2、标过 `#[ignore = "M2: D23"]`；M2 PR-A（72924c7）修复后已去掉 ignore，断言不变。
 //!
 //! 缺陷编号和说明见 M1-test-report.md。
 
@@ -1043,7 +1043,6 @@ fn d22_writer_error_leaves_sink_unchanged() {
 // 6b29230 和 ddaaacc 全部接受；Writer 又拒绝 `a:` 但接受 `a:b`，所以解析成功的事件会写不出去（writer_roundtrip crash-543336e4）。
 
 #[test]
-#[ignore = "M2: D23"]
 fn d23_colons_in_pi_entity_notation_names_rejected() {
     for x in [
         "<r><?a:b x?></r>",
