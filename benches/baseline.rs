@@ -90,7 +90,7 @@ fn ns_dense(target: usize) -> String {
 /// 用宏而不是泛型函数，这样不依赖 `Reader` 的类型参数（M2 PR-B 会把 from_reader 的返回类型
 /// 改成 `Reader<IoInput<R>>`，宏不用跟着改）。
 macro_rules! purexml_drain_reader {
-    ($r:expr) => {{
+    ($r:expr_2021) => {{
         use purexml::Event;
         let mut r = $r;
         let mut n = 0usize;

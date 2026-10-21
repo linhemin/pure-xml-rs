@@ -2,9 +2,9 @@
 
 ## Rust 版本
 
-库本身的 MSRV 是 **1.70**（`rust-version`）。`purexml` 与 `purexml-core` 不使用更高版本才有的语言特性，也没有运行时依赖。
+库本身的 MSRV 是 **1.99.1**（`rust-version`，跟随本地 stable），edition **2024**。`purexml` 与 `purexml-core` 没有运行时依赖。
 
-`cargo test` 会编译 dev-dependencies。`quick-xml` 0.42 要求 Rust **1.86**，测试里的 `Option::is_none_or` 要求 **1.82**。请保持 0.42，不要退回 0.39（该版本有安全通告）。本地验收使用 stable **1.99.1**：
+`cargo test` 会编译 dev-dependencies。请保持 `quick-xml` 0.42，不要退回 0.39（该版本有安全通告）。本地验收使用 stable **1.99.1**：
 
 ```bash
 cargo +1.99.1 test --workspace --no-fail-fast

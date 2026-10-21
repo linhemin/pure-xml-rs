@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- MSRV is 1.99.1, raised from 1.70 to follow the local stable toolchain.
+  The workspace edition is 2024 (`purexml`, `purexml-core`, and `purexml-fuzz`).
 - Entity-reference names are NCNames. `&a:b;` is a name error
   (`ErrorKind::Syntax`) at the colon. It is no longer reported as an
   undefined entity. A reference such as `&missing;`, whose name is an NCName

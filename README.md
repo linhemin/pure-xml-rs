@@ -126,7 +126,7 @@ assert_eq!(
 
 ## 工具链
 
-库的 MSRV 是 1.70，没有运行时依赖。`cargo test` 会编译 dev-dependencies：`quick-xml` 0.42 要求 Rust 1.86，测试代码里的 `Option::is_none_or` 要求 1.82。本仓库本地用 stable 1.99.1 跑测试、clippy 和 fmt。不要把 `quick-xml` 降到 0.39（有安全通告）。见 `CONTRIBUTING.md`。
+库的 MSRV 是 1.99.1（跟随本地 stable），edition 2024，没有运行时依赖。`cargo test` 会编译 dev-dependencies。不要把 `quick-xml` 降到 0.39（有安全通告）。见 `CONTRIBUTING.md`。
 
 ## 留到 M2
 
