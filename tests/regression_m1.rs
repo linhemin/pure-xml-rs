@@ -538,13 +538,13 @@ fn d14_low_density_default_shared_under_default_ratio() {
         let mut seen = Vec::new();
         let mut first_ok = None;
         while let Some(ev) = r.read_event().expect("默认配置下应放行") {
-            if let purexml::Event::StartElement(el) = ev {
-                if let Some(a) = el.attribute("a") {
-                    if first_ok.is_none() {
-                        first_ok = Some(a.value.bytes().all(|b| b == b'v'));
-                    }
-                    seen.push((a.value.as_ptr() as usize, a.value.len()));
+            if let purexml::Event::StartElement(el) = ev
+                && let Some(a) = el.attribute("a")
+            {
+                if first_ok.is_none() {
+                    first_ok = Some(a.value.bytes().all(|b| b == b'v'));
                 }
+                seen.push((a.value.as_ptr() as usize, a.value.len()));
             }
         }
         (seen, first_ok, t.elapsed())

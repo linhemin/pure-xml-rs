@@ -988,15 +988,14 @@ impl Engine {
             if let Some(sep) = self
                 .peek_byte(input)
                 .filter(|byte| matches!(byte, b'|' | b','))
+                && (frame.sep.is_none() || frame.sep == Some(sep))
             {
-                if frame.sep.is_none() || frame.sep == Some(sep) {
-                    stack.last_mut().expect("open content group").sep = Some(sep);
-                    self.advance_one(input)?;
-                    self.skip_ws(input)?;
-                    self.reject_dtd_pe(input)?;
-                    self.push_content_particle(input, &mut stack, limit)?;
-                    continue;
-                }
+                stack.last_mut().expect("open content group").sep = Some(sep);
+                self.advance_one(input)?;
+                self.skip_ws(input)?;
+                self.reject_dtd_pe(input)?;
+                self.push_content_particle(input, &mut stack, limit)?;
+                continue;
             }
             self.expect_byte(input, b')')?;
             self.skip_occurrence(input)?;
@@ -1211,13 +1210,11 @@ impl Engine {
         }
         let raw = self.parse_attr_value(input)?;
         // One UTF-8 check at the declaration. Later elements clone the `Arc`.
-        if cdata {
-            if let RawStr::Range(range) = raw {
-                let bytes = &input[range.start..range.end];
-                let text = std::str::from_utf8(bytes)
-                    .map_err(|_| self.encoding("malformed UTF-8 in attribute default"))?;
-                return Ok(Some(Arc::from(text)));
-            }
+        if cdata && let RawStr::Range(range) = raw {
+            let bytes = &input[range.start..range.end];
+            let text = std::str::from_utf8(bytes)
+                .map_err(|_| self.encoding("malformed UTF-8 in attribute default"))?;
+            return Ok(Some(Arc::from(text)));
         }
         let text = raw.into_string(input);
         let text = if cdata {
@@ -1680,10 +1677,10 @@ impl Engine {
 
     fn parse_attr_value(&mut self, input: &[u8]) -> Result<RawStr> {
         let quote = self.require_quote(input)?;
-        if self.frames.is_empty() {
-            if let Some(raw) = self.try_plain_attr(input, quote)? {
-                return Ok(raw);
-            }
+        if self.frames.is_empty()
+            && let Some(raw) = self.try_plain_attr(input, quote)?
+        {
+            return Ok(raw);
         }
         let base_depth = self.frames.len();
         let start = self.pos;
@@ -2680,13 +2677,15 @@ fn raw_qname_string(input: &[u8], name: &RawQName) -> String {
 }
 
 fn owned_qname(name: &str) -> RawQName {
-    if let Some((prefix, local)) = name.split_once(':') {
-        if !prefix.is_empty() && !local.is_empty() && !local.contains(':') {
-            return RawQName {
-                prefix: Some(RawStr::Owned(prefix.to_string())),
-                local: RawStr::Owned(local.to_string()),
-            };
-        }
+    if let Some((prefix, local)) = name.split_once(':')
+        && !prefix.is_empty()
+        && !local.is_empty()
+        && !local.contains(':')
+    {
+        return RawQName {
+            prefix: Some(RawStr::Owned(prefix.to_string())),
+            local: RawStr::Owned(local.to_string()),
+        };
     }
     RawQName {
         prefix: None,

@@ -1073,24 +1073,24 @@ impl Document {
         let parent = node.parent;
         let prev = node.prev;
         let next = node.next;
-        if let Some(prev) = prev {
-            if let Some(sibling) = self.nodes.get_mut(prev as usize) {
-                sibling.next = next;
-            }
+        if let Some(prev) = prev
+            && let Some(sibling) = self.nodes.get_mut(prev as usize)
+        {
+            sibling.next = next;
         }
-        if let Some(next) = next {
-            if let Some(sibling) = self.nodes.get_mut(next as usize) {
-                sibling.prev = prev;
-            }
+        if let Some(next) = next
+            && let Some(sibling) = self.nodes.get_mut(next as usize)
+        {
+            sibling.prev = prev;
         }
-        if let Some(parent) = parent {
-            if let Some(parent_node) = self.nodes.get_mut(parent as usize) {
-                if parent_node.first_child == Some(index) {
-                    parent_node.first_child = next;
-                }
-                if parent_node.last_child == Some(index) {
-                    parent_node.last_child = prev;
-                }
+        if let Some(parent) = parent
+            && let Some(parent_node) = self.nodes.get_mut(parent as usize)
+        {
+            if parent_node.first_child == Some(index) {
+                parent_node.first_child = next;
+            }
+            if parent_node.last_child == Some(index) {
+                parent_node.last_child = prev;
             }
         }
         if let Some(node) = self.nodes.get_mut(index as usize) {
@@ -1103,10 +1103,10 @@ impl Document {
     }
 
     fn test_set_next(&mut self, id: NodeId, next: Option<u32>) {
-        if let Some(index) = self.live_index(id) {
-            if let Some(node) = self.nodes.get_mut(index as usize) {
-                node.next = next;
-            }
+        if let Some(index) = self.live_index(id)
+            && let Some(node) = self.nodes.get_mut(index as usize)
+        {
+            node.next = next;
         }
     }
 }
