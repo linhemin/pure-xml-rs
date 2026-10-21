@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 mod config;
+pub mod dom;
 mod error;
 mod event;
 mod name;
@@ -26,9 +27,10 @@ mod wf;
 mod writer;
 
 pub use config::{
-    DEFAULT_MAX_ATTRS, DEFAULT_MAX_DEPTH, DEFAULT_MAX_ENTITY_DEPTH, DEFAULT_MAX_ENTITY_EXPANSIONS,
-    DEFAULT_MAX_EXPANDED_BYTES, DEFAULT_MAX_EXPANSION_RATIO, DEFAULT_MAX_NAME_LEN,
-    DEFAULT_MAX_TEXT_LEN, DEFAULT_MAX_TOTAL_INPUT, EXPANSION_RATIO_FLOOR_BYTES, ParserConfig,
+    DEFAULT_MAX_ATTRS, DEFAULT_MAX_DEPTH, DEFAULT_MAX_DOM_BYTES, DEFAULT_MAX_ENTITY_DEPTH,
+    DEFAULT_MAX_ENTITY_EXPANSIONS, DEFAULT_MAX_EXPANDED_BYTES, DEFAULT_MAX_EXPANSION_RATIO,
+    DEFAULT_MAX_NAME_LEN, DEFAULT_MAX_NODES, DEFAULT_MAX_TEXT_LEN, DEFAULT_MAX_TOTAL_INPUT,
+    EXPANSION_RATIO_FLOOR_BYTES, ParserConfig,
 };
 pub use error::{Error, ErrorKind, LimitKind, Position, Result};
 pub use event::{
@@ -53,4 +55,6 @@ const _: fn() = || {
     assert::<ProcessingInstruction<'static>>();
     assert::<XmlDecl<'static>>();
     assert::<Doctype<'static>>();
+    assert::<dom::Document>();
+    assert::<dom::NodeId>();
 };

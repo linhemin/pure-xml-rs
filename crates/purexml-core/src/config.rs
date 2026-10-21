@@ -49,6 +49,19 @@ pub const DEFAULT_MAX_EXPANSION_RATIO: u64 = 10;
 /// than or equal to this floor.
 pub const EXPANSION_RATIO_FLOOR_BYTES: u64 = 64 * 1024;
 
+/// Nodes a DOM document may create, including the document node and tombstones.
+///
+/// A removed node keeps its slot. [`crate::dom::NodeId`] values are never
+/// reused. Attributes are not nodes.
+pub const DEFAULT_MAX_NODES: u64 = 10_000_000;
+
+/// Logical DOM heap bytes, not allocator capacity. Default is 1 GiB.
+///
+/// The count is the string arena plus node, element, attribute, and
+/// namespace-declaration records. Tombstones and abandoned attribute ranges
+/// stay in the total. The arena will not grow past `u32::MAX`.
+pub const DEFAULT_MAX_DOM_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// Tunable limits for [`crate::Reader`].
 ///
 /// External entities and external DTDs cannot be enabled. There is no field
@@ -95,6 +108,13 @@ pub struct ParserConfig {
     /// the numerator's saturating add panics. General-entity expansion is
     /// still capped by [`Self::max_expanded_bytes`].
     pub max_expansion_ratio: u64,
+    /// Nodes the DOM may create, including the document node and tombstones.
+    ///
+    /// The pull parser does not read this field. See [`DEFAULT_MAX_NODES`].
+    pub max_nodes: u64,
+    /// Logical DOM bytes. The pull parser does not read this field.
+    /// See [`DEFAULT_MAX_DOM_BYTES`].
+    pub max_dom_bytes: u64,
 }
 
 impl ParserConfig {
@@ -156,6 +176,18 @@ impl ParserConfig {
         self.max_expansion_ratio = max_expansion_ratio;
         self
     }
+
+    /// Replace the DOM node cap. Tombstones count toward it.
+    pub fn with_max_nodes(mut self, max_nodes: u64) -> Self {
+        self.max_nodes = max_nodes;
+        self
+    }
+
+    /// Replace the logical DOM byte cap.
+    pub fn with_max_dom_bytes(mut self, max_dom_bytes: u64) -> Self {
+        self.max_dom_bytes = max_dom_bytes;
+        self
+    }
 }
 
 impl Default for ParserConfig {
@@ -170,6 +202,8 @@ impl Default for ParserConfig {
             max_entity_expansions: DEFAULT_MAX_ENTITY_EXPANSIONS,
             max_expanded_bytes: DEFAULT_MAX_EXPANDED_BYTES,
             max_expansion_ratio: DEFAULT_MAX_EXPANSION_RATIO,
+            max_nodes: DEFAULT_MAX_NODES,
+            max_dom_bytes: DEFAULT_MAX_DOM_BYTES,
         }
     }
 }
