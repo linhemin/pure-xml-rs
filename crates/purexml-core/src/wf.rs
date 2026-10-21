@@ -194,7 +194,7 @@ impl Cursor<'_> {
                 None => {
                     return Err(
                         "unterminated attribute value in entity replacement text".to_string()
-                    )
+                    );
                 }
             }
         }
@@ -239,7 +239,7 @@ impl Cursor<'_> {
                     ));
                 }
                 None => {
-                    return Err("unterminated CDATA section in entity replacement text".to_string())
+                    return Err("unterminated CDATA section in entity replacement text".to_string());
                 }
             }
         }
@@ -257,7 +257,7 @@ impl Cursor<'_> {
             }
             Some('?') => {}
             Some(_) => {
-                return Err("expected whitespace after a processing instruction target".to_string())
+                return Err("expected whitespace after a processing instruction target".to_string());
             }
             None => return Err("unterminated processing instruction".to_string()),
         }

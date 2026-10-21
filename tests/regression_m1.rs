@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{run_guarded, structure, ErrorClass, Guarded, Node};
+use common::{ErrorClass, Guarded, Node, run_guarded, structure};
 use std::time::{Duration, Instant};
 
 fn class(x: &str) -> Result<(), ErrorClass> {

@@ -8,7 +8,7 @@
 //! NCNames joined by one colon. The DOM will call the same functions so a
 //! name the reader accepts is a name the writer can emit.
 
-use crate::event::{XMLNS_NAMESPACE, XML_NAMESPACE};
+use crate::event::{XML_NAMESPACE, XMLNS_NAMESPACE};
 use crate::name::{is_ncname_char, is_ncname_start};
 
 /// `true` when `name` is one NCName.

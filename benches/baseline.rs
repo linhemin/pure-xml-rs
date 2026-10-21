@@ -4,7 +4,7 @@
 //! 三方工作量尽量对齐：都遍历所有事件 / 节点，都取出全部属性值与文本（含实体解码）。
 //! 命名空间：purexml 和 roxmltree 都解析元素的命名空间；quick-xml 用普通 Reader，不解析命名空间（它的 NsReader 是另一套 API）。
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::time::Duration;
 
 /// 配置型：中等嵌套、短文本、少量属性

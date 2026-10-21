@@ -4,10 +4,10 @@
 use std::io::Cursor;
 
 use purexml_core::{
-    Error, ErrorKind, Event, LimitKind, ParserConfig, Reader, Writer, XmlText, DEFAULT_MAX_ATTRS,
-    DEFAULT_MAX_DEPTH, DEFAULT_MAX_ENTITY_DEPTH, DEFAULT_MAX_ENTITY_EXPANSIONS,
+    DEFAULT_MAX_ATTRS, DEFAULT_MAX_DEPTH, DEFAULT_MAX_ENTITY_DEPTH, DEFAULT_MAX_ENTITY_EXPANSIONS,
     DEFAULT_MAX_EXPANDED_BYTES, DEFAULT_MAX_EXPANSION_RATIO, DEFAULT_MAX_NAME_LEN,
-    DEFAULT_MAX_TEXT_LEN, DEFAULT_MAX_TOTAL_INPUT, EXPANSION_RATIO_FLOOR_BYTES, XML_NAMESPACE,
+    DEFAULT_MAX_TEXT_LEN, DEFAULT_MAX_TOTAL_INPUT, EXPANSION_RATIO_FLOOR_BYTES, Error, ErrorKind,
+    Event, LimitKind, ParserConfig, Reader, Writer, XML_NAMESPACE, XmlText,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -330,9 +330,11 @@ fn predefined_and_numeric_character_references() {
 #[test]
 fn character_reference_to_cr_is_preserved_in_text() {
     let events = must("<a>A&#13;B</a>");
-    assert!(events
-        .iter()
-        .any(|ev| matches!(ev, Owned::Text(text) if text.as_str() == "A\rB")));
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, Owned::Text(text) if text.as_str() == "A\rB"))
+    );
 }
 
 #[test]
@@ -378,9 +380,11 @@ fn internal_entities_expand_including_markup_and_predefined() {
 #[test]
 fn char_ref_is_expanded_when_the_entity_is_declared() {
     let events = must(r#"<!DOCTYPE r [<!ENTITY e "&#65;">]><r>&e;</r>"#);
-    assert!(events
-        .iter()
-        .any(|ev| matches!(ev, Owned::Text(text) if text == "A")));
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, Owned::Text(text) if text == "A"))
+    );
 }
 
 #[test]
@@ -621,9 +625,11 @@ fn element_and_notation_declarations_are_skipped() {
             <!ENTITY e "z">
         ]><r>&e;</r>"#,
     );
-    assert!(events
-        .iter()
-        .any(|ev| matches!(ev, Owned::Text(text) if text == "z")));
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, Owned::Text(text) if text == "z"))
+    );
     match events.iter().find(|ev| matches!(ev, Owned::Start { .. })) {
         Some(Owned::Start { attrs, .. }) => {
             assert_eq!(attrs.len(), 1, "ATTLIST default is applied");
@@ -637,9 +643,11 @@ fn element_and_notation_declarations_are_skipped() {
 #[test]
 fn entity_depth_eight_ok_nine_fails() {
     let events = must(&entity_chain(8));
-    assert!(events
-        .iter()
-        .any(|ev| matches!(ev, Owned::Text(text) if text == "OK")));
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, Owned::Text(text) if text == "OK"))
+    );
 
     let err = must_err(&entity_chain(9));
     let (kind, limit, actual) = limit_of(&err);
@@ -822,14 +830,16 @@ fn expanded_bytes_attribute_text_name_depth_and_input_limits() {
     )
     .unwrap_err();
     assert_eq!(limit_of(&err).0, LimitKind::TextLength);
-    assert!(parse_with(
-        "<a>a&#10;b</a>",
-        ParserConfig {
-            max_text_len: 3,
-            ..ParserConfig::default()
-        }
-    )
-    .is_ok());
+    assert!(
+        parse_with(
+            "<a>a&#10;b</a>",
+            ParserConfig {
+                max_text_len: 3,
+                ..ParserConfig::default()
+            }
+        )
+        .is_ok()
+    );
 
     let mut name = String::from("<");
     name.push_str(&"a".repeat(1025));

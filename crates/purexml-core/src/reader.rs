@@ -20,11 +20,11 @@ use std::io::BufRead;
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::config::{ParserConfig, EXPANSION_RATIO_FLOOR_BYTES};
-use crate::error::{observe_byte, position_at, Error, ErrorKind, LimitKind, Position, Result};
+use crate::config::{EXPANSION_RATIO_FLOOR_BYTES, ParserConfig};
+use crate::error::{Error, ErrorKind, LimitKind, Position, Result, observe_byte, position_at};
 use crate::event::{
     Attribute, Doctype, EmptyElement, EndElement, Event, Namespace, ProcessingInstruction, QName,
-    StartElement, XmlDecl, XMLNS_NAMESPACE, XML_NAMESPACE,
+    StartElement, XML_NAMESPACE, XMLNS_NAMESPACE, XmlDecl,
 };
 use crate::name::{
     decode_utf8, is_name_char, is_name_start, is_ncname_char, is_ncname_start, is_pubid_char,
