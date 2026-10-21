@@ -22,7 +22,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::config::{ParserConfig, EXPANSION_RATIO_FLOOR_BYTES};
-use crate::error::{observe_byte, position_at, Error, ErrorKind, LimitKind, Position, Result};
+use crate::error::{observe_byte, Error, ErrorKind, LimitKind, Position, Result};
 use crate::event::{
     Attribute, Doctype, EmptyElement, EndElement, Event, Namespace, ProcessingInstruction, QName,
     StartElement, XmlDecl, XMLNS_NAMESPACE, XML_NAMESPACE,
@@ -283,55 +283,18 @@ impl<S: AsRef<[u8]>> Reader<S> {
     }
 
     fn pull_slice(&mut self) -> Result<(Option<usize>, Option<RawEvent>)> {
-        if !self.engine.started {
-            let len = self.input.as_ref().len() as u64;
-            if len > self.engine.config.max_total_input {
-                let limit = self.engine.config.max_total_input;
-                let err = self.engine.limit_at(
-                    LimitKind::TotalInput,
-                    limit,
-                    limit.saturating_add(1),
-                    position_at(self.input.as_ref(), limit as usize),
-                );
-                self.engine.started = true;
-                return Err(err);
-            }
-        }
-        // Same spin guard as `pull_raw`: an empty expansion that does not
-        // move the cursor cannot be framed again.
+        // The buffer is the whole document, so there is no second scan to
+        // find the token boundary. `max_token_len` is checked as the engine
+        // consumes bytes. `end_is_eof` stays true: running off the buffer is
+        // real EOF, not a probe cut.
         let mut parked = None;
         loop {
             let input = self.input.as_ref();
-            let probe = if self.engine.frames.is_empty() && self.engine.phase != Phase::Done {
-                let content = matches!(self.engine.phase, Phase::Content);
-                let mut framer = Framer::start(self.engine.pos, !self.engine.started, content);
-                // The bytes are all present, but this token is not the end of
-                // input unless the framer actually runs out of them. Forcing
-                // EOF here lets an empty expansion keep parsing the next token
-                // with no probe. Poll the way `prepare` does: not-EOF first.
-                let (at_eof, end) = match framer.poll(input, false, &self.engine.config) {
-                    Poll::Probe { end } => (false, Some(end.min(input.len()))),
-                    Poll::Ready { eof } => (eof, None),
-                    Poll::NeedMore => match framer.poll(input, true, &self.engine.config) {
-                        Poll::Probe { end } => (false, Some(end.min(input.len()))),
-                        Poll::Ready { eof } => (eof, None),
-                        Poll::NeedMore => (true, None),
-                    },
-                };
-                self.engine.end_is_eof = at_eof && end.is_none();
-                end
-            } else {
-                None
-            };
-            let start_pos = self.engine.pos;
-            let window = match probe {
-                Some(end) => &input[..end],
-                None => input,
-            };
-            let raw = self.engine.next_raw(window);
+            self.engine.end_is_eof = true;
+            let raw = self.engine.next_raw(input);
             if self.engine.need_frame {
-                // The expansion produced no event. Frame the token now under
-                // the cursor; do not parse the unframed tail.
+                // An empty expansion produced no event. `next_raw` records the
+                // next token's start; do not keep counting it as this token.
                 self.engine.need_frame = false;
                 if parked == Some(self.engine.pos) {
                     return Err(self.engine.token_limit(input));
@@ -339,14 +302,7 @@ impl<S: AsRef<[u8]>> Reader<S> {
                 parked = Some(self.engine.pos);
                 continue;
             }
-            let raw = raw?;
-            if probe.is_some() && self.engine.frames.is_empty() {
-                let consumed = self.engine.pos.saturating_sub(start_pos) as u64;
-                if consumed > self.engine.config.max_token_len {
-                    return Err(self.engine.token_limit(input));
-                }
-            }
-            return Ok((probe, raw));
+            return Ok((None, raw?));
         }
     }
 }
@@ -636,12 +592,40 @@ impl Engine {
 
     fn token_limit(&self, input: &[u8]) -> Error {
         let limit = self.config.max_token_len;
+        debug_assert!(
+            self.token_limit_matches_scanner(input),
+            "TokenLength: scanner and engine disagree (origin {:?}, pos {}, window {})",
+            self.token_origin,
+            self.pos,
+            input.len()
+        );
         self.limit_at(
             LimitKind::TokenLength,
             limit,
             limit.saturating_add(1),
             self.position_on_token_byte(input, limit),
         )
+    }
+
+    /// The framer, started at `token_origin`, cuts this window on `max_token_len`.
+    ///
+    /// A `TokenLength` report whose cut is somewhere else means the scanner
+    /// and the engine do not agree on where the token ends.
+    fn token_limit_matches_scanner(&self, input: &[u8]) -> bool {
+        let start = self.token_origin.offset.saturating_sub(self.base) as usize;
+        if start > input.len() {
+            return false;
+        }
+        let content = matches!(self.phase, Phase::Content);
+        let doc_start = start == 0 && input.starts_with(&[0xEF, 0xBB, 0xBF]);
+        let mut framer = Framer::start(start, doc_start, content);
+        let cap_end = start
+            .saturating_add(self.config.max_token_len as usize)
+            .saturating_add(1);
+        match framer.poll(input, self.end_is_eof, &self.config) {
+            Poll::Probe { end } => end == cap_end,
+            Poll::NeedMore | Poll::Ready { .. } => false,
+        }
     }
 
     /// Cursor sitting on the byte `index` bytes after `token_origin`.
@@ -750,7 +734,7 @@ impl Engine {
     fn consume_bom(&mut self, input: &[u8]) -> Result<()> {
         if input.starts_with(&[0xEF, 0xBB, 0xBF]) {
             self.pos = 3;
-            return Ok(());
+            return self.enforce_token_len(input);
         }
         if input.starts_with(&[0xFE, 0xFF])
             || input.starts_with(&[0xFF, 0xFE])
@@ -827,9 +811,10 @@ impl Engine {
         loop {
             // Empty text (an entity that expands to nothing) does not produce
             // an event, so this loop steps onto the next main-input token.
-            // A streaming window only framed the previous token. Ask for a new
-            // frame instead of reading a one-byte lookahead as a tag.
-            if self.frames.is_empty() && !self.end_is_eof && self.pos != self.frame_anchor {
+            // Token start is recorded only in `next_raw`. Ask for a new frame
+            // so the next token is not counted as part of this one, and so a
+            // streaming window is not read as a one-byte lookahead.
+            if self.frames.is_empty() && self.pos != self.frame_anchor {
                 self.need_frame = true;
                 return Err(self.syntax("reframing"));
             }
@@ -2065,6 +2050,9 @@ impl Engine {
         let max = self.config.max_text_len;
         let mut i = 0usize;
         while i < bytes.len() {
+            if self.main_byte_over_limit(start + i) {
+                return Err(self.token_limit(input));
+            }
             let byte = bytes[i];
             if byte == quote {
                 let len = i as u64;
@@ -2150,6 +2138,9 @@ impl Engine {
         let mut i = 0usize;
         let mut brackets = 0u8;
         while i < bytes.len() {
+            if self.main_byte_over_limit(start + i) {
+                return Err(self.token_limit(input));
+            }
             let b = bytes[i];
             if b == b'<' {
                 break;
@@ -2894,6 +2885,26 @@ impl Engine {
         Ok(())
     }
 
+    /// `index` is a main-input byte that would make the current token longer
+    /// than `max_token_len`. Entity replacement bytes are not main input.
+    fn main_byte_over_limit(&self, index: usize) -> bool {
+        if !self.frames.is_empty() {
+            return false;
+        }
+        let end = self.base.saturating_add(index as u64).saturating_add(1);
+        end.saturating_sub(self.token_origin.offset) > self.config.max_token_len
+    }
+
+    fn enforce_token_len(&self, input: &[u8]) -> Result<()> {
+        if self.frames.is_empty() {
+            let consumed = (self.base + self.pos as u64).saturating_sub(self.token_origin.offset);
+            if consumed > self.config.max_token_len {
+                return Err(self.token_limit(input));
+            }
+        }
+        Ok(())
+    }
+
     fn advance_one(&mut self, input: &[u8]) -> Result<()> {
         self.pop_finished();
         if self.frames.is_empty() {
@@ -2904,6 +2915,7 @@ impl Engine {
             let at_byte = self.pos_now();
             self.observe(b);
             self.pos += 1;
+            self.enforce_token_len(input)?;
             if let Some(start) = self.subset_start {
                 let len = (self.pos - start) as u64;
                 if len > self.config.max_internal_subset_len {

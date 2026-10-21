@@ -233,18 +233,6 @@ impl std::error::Error for Error {}
 /// Result of a parse operation.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Compute a [`Position`] by scanning `input` up to `offset` bytes.
-pub(crate) fn position_at(input: &[u8], offset: usize) -> Position {
-    let offset = offset.min(input.len());
-    let mut pos = Position::start();
-    let mut cr_pending = false;
-    for &b in &input[..offset] {
-        observe_byte(&mut pos, &mut cr_pending, b);
-    }
-    pos.offset = offset as u64;
-    pos
-}
-
 pub(crate) fn observe_byte(pos: &mut Position, cr_pending: &mut bool, b: u8) {
     if *cr_pending {
         *cr_pending = false;

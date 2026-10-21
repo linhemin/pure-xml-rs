@@ -220,12 +220,6 @@ impl<R: BufRead> IoInput<R> {
         Ok(())
     }
 
-    fn observe(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            observe_byte(&mut self.read_pos, &mut self.read_cr, byte);
-        }
-    }
-
     fn total_input(&self, limit: u64) -> Error {
         Error::new(
             ErrorKind::SecurityLimit {
@@ -236,6 +230,12 @@ impl<R: BufRead> IoInput<R> {
             self.read_pos,
             "input exceeds max_total_input",
         )
+    }
+
+    fn observe(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            observe_byte(&mut self.read_pos, &mut self.read_cr, byte);
+        }
     }
 
     fn io_error(&self, message: &str) -> Error {
@@ -1069,10 +1069,27 @@ impl Framer {
             }
             Sub::Data => {
                 if doc.quote.is_none() {
+                    // Consume the whole opener before looking for the closer.
+                    // One byte would let `-->` match inside `<!-->` (`--` plus
+                    // the following `>`), and the same overlap hits `<?` / `?>`.
                     if starts_at(buf, self.i, b"<!--") {
                         doc.sub = Sub::Comment;
+                        for _ in 0..4 {
+                            if let Some(done) = self.bump_subset(buf, eof, config, &mut doc) {
+                                return Some(done);
+                            }
+                        }
+                        self.state = State::Doctype(doc);
+                        return None;
                     } else if starts_at(buf, self.i, b"<?") {
                         doc.sub = Sub::Pi;
+                        for _ in 0..2 {
+                            if let Some(done) = self.bump_subset(buf, eof, config, &mut doc) {
+                                return Some(done);
+                            }
+                        }
+                        self.state = State::Doctype(doc);
+                        return None;
                     } else if !eof
                         && (proper_prefix_at(buf, self.i, b"<!--")
                             || proper_prefix_at(buf, self.i, b"<?"))
