@@ -8,6 +8,12 @@
 //!   DOCTYPE 名必须是 QName（`a:b` 合法，`r:`、`:r`、`a:b:c` 不合法）。
 //! - D23 fuzz 样本（r8/r9/r9b，去重后 9 个）全部应报 Syntax，from_bytes 与逐字节 from_reader 一致。
 //!
+//! - D26：注释、CDATA、PI 的内容逐字符检查 `max_text_len`，在第一个越界字符处停下，报 TextLength，
+//!   `actual` 为计入该字符后的长度；未闭合的超长注释/PI 同样报 TextLength，且不缓冲尾巴。
+//! - position 口径（R1b 实测统一）：所有长度限额（TextLength、AttrValueLength）的 position 都是
+//!   **越界字符之后的游标**（offset = 越界字符起点 + 其 UTF-8 字节数，column 同样指向其后）。
+//!   两条路径（from_bytes、逐字节 from_reader）的 kind、limit、actual、position 都必须相同。
+//!
 //! 只按错误类别、限额种类、limit/actual 断言；名字错误与未定义实体同为 Syntax，
 //! 区分两者只能看 message，这里只做“不含 undefined entity”的反向检查。
 
@@ -37,10 +43,18 @@ impl Read for OneByte<'_> {
     }
 }
 
-type Key = (ErrorClass, Option<String>, Option<u64>, Option<u64>);
+/// (类别, 限额种类, limit, actual, (line, column, offset))
+type Key = (
+    ErrorClass,
+    Option<String>,
+    Option<u64>,
+    Option<u64>,
+    (u64, u64, u64),
+);
 
 fn key_of(e: &purexml::Error) -> Key {
-    match &e.kind {
+    let p = (e.position.line, e.position.column, e.position.offset);
+    let (c, k, l, a) = match &e.kind {
         purexml::ErrorKind::SecurityLimit {
             kind,
             limit,
@@ -57,7 +71,8 @@ fn key_of(e: &purexml::Error) -> Key {
             (ErrorClass::ExternalEntityForbidden, None, None, None)
         }
         _ => (ErrorClass::Io, None, None, None),
-    }
+    };
+    (c, k, l, a, p)
 }
 
 /// from_reader 路径（逐字节）的最终结果。M1 的 from_reader 构造时就可能报错，同样计入。
@@ -77,7 +92,13 @@ fn via_reader(input: &[u8], limits: Limits) -> Result<(), Key> {
 }
 
 fn key(f: &Failure) -> Key {
-    (f.class, f.limit.clone(), f.limit_value, f.actual)
+    (
+        f.class,
+        f.limit.clone(),
+        f.limit_value,
+        f.actual,
+        (f.line, f.column, f.offset),
+    )
 }
 
 /// 两条路径都跑，要求一致，返回 from_bytes 的失败。
@@ -401,5 +422,167 @@ fn d23_fuzz_samples_rejected() {
         "<doc><?:p d?></doc>",                                 // fd3c5623
     ] {
         name_error(x);
+    }
+}
+
+// ───────────── D26：注释、CDATA、PI 逐字符检查 ─────────────
+
+/// 断言报 TextLength，actual 为首次超过时的长度，position 为越界字符之后的游标（offset）。
+#[track_caller]
+fn text_over(input: &str, max: usize, actual: u64, offset: u64) {
+    let f = both(input, lim(max)).expect_err("应报 TextLength");
+    assert_eq!(f.class, ErrorClass::SecurityLimit, "{input:?} {f:?}");
+    assert_eq!(f.limit.as_deref(), Some("TextLength"), "{input:?} {f:?}");
+    assert_eq!(f.limit_value, Some(max as u64), "{input:?}");
+    assert_eq!(
+        f.actual,
+        Some(actual),
+        "actual 应为首次超过时的长度：{input:?}"
+    );
+    assert_eq!(
+        f.offset, offset,
+        "position 应为越界字符之后的游标：{input:?} {f:?}"
+    );
+}
+
+#[track_caller]
+fn text_ok(input: &str, max: usize) {
+    assert!(
+        both(input, lim(max)).is_ok(),
+        "刚好等于上限应通过：{input:?}"
+    );
+}
+
+/// (名字, 前缀, 后缀) 三种 token；后缀带 `zz` 尾巴，验证不是“读完再报”。
+const D26_TOKENS: [(&str, &str, &str); 3] = [
+    ("comment", "<r><!--", "zz--></r>"),
+    ("cdata", "<r><![CDATA[", "zz]]></r>"),
+    ("pi", "<r><?p ", "zz?></r>"),
+];
+
+#[test]
+fn d26_exact_limit_passes() {
+    for (_, pre, post) in D26_TOKENS {
+        let close = &post[2..];
+        // 纯 ASCII 和以多字节字符结尾，都刚好 8 字节
+        for body in [
+            "x".repeat(8),
+            format!("{}é", "x".repeat(6)),
+            format!("x{}", "😀"),
+        ] {
+            let body = if body.len() == 5 {
+                format!("xxx{body}")
+            } else {
+                body
+            };
+            assert_eq!(body.len(), 8);
+            text_ok(&format!("{pre}{body}{close}"), 8);
+        }
+    }
+}
+
+#[test]
+fn d26_first_overflow_actual_and_position() {
+    for (_, pre, post) in D26_TOKENS {
+        for ch in ["y", "é", "€", "😀"] {
+            let n = ch.len() as u64;
+            // 之前正好 8 字节：actual = 8 + n，position = 越界字符之后
+            let s = format!("{pre}{}{ch}{post}", "x".repeat(8));
+            let at = (pre.len() + 8) as u64;
+            text_over(&s, 8, 8 + n, at + n);
+            // 之前 7 字节，多字节字符跨过上限：actual = 7 + n（1 字节时不越界，越界的是尾巴的第一个 z）
+            let s = format!("{pre}{}{ch}{post}", "x".repeat(7));
+            let at = (pre.len() + 7) as u64;
+            if n == 1 {
+                text_over(&s, 8, 9, at + 2);
+            } else {
+                text_over(&s, 8, 7 + n, at + n);
+            }
+        }
+    }
+}
+
+#[test]
+fn d26_normalizing_path_same_rule() {
+    // 注释里有 \r 时走规范化缓冲路径（\r 计 1 字节）；越界字符起点 = 7（前缀）+ 1 + 7 = 15
+    for ch in ["y", "é", "€", "😀"] {
+        let n = ch.len() as u64;
+        let s = format!("<r><!--\r{}{ch}zz--></r>", "x".repeat(7));
+        text_over(&s, 8, 8 + n, 15 + n);
+    }
+    text_ok(&format!("<r><!--\r\n{}--></r>", "x".repeat(7)), 8);
+}
+
+#[test]
+fn d26_unterminated_overlong_token_reports_text_length() {
+    for pre in ["<r><!--", "<r><?p ", "<r><![CDATA["] {
+        let s = format!("{pre}{}", "x".repeat(20));
+        text_over(&s, 8, 9, (pre.len() + 9) as u64);
+        // 未超限的未闭合 token 仍是语法错误
+        let f = both(&format!("{pre}xxxx"), lim(8)).expect_err("未闭合");
+        assert_eq!(f.class, ErrorClass::Syntax, "{pre} {f:?}");
+    }
+}
+
+#[test]
+fn d26_does_not_buffer_the_tail() {
+    let max = 64 << 10;
+    // 纯路径和规范化路径（带 \r）各一份，后面 32 MiB 尾巴，不闭合
+    for pre in [
+        "<r><!--",
+        "<r><!--\r",
+        "<r><?p ",
+        "<r><?p \r",
+        "<r><![CDATA[\r",
+    ] {
+        let s = format!("{pre}{}", "x".repeat(32 << 20));
+        let n = s.len();
+        match run_guarded("d26-tail", Duration::from_secs(10), move || {
+            common::parse_with(s.as_bytes(), lim(max))
+                .map(|_| ())
+                .map_err(|f| (f.limit, f.actual))
+        }) {
+            Guarded::Done {
+                value, peak_bytes, ..
+            } => {
+                assert_eq!(
+                    value,
+                    Err((Some("TextLength".to_string()), Some(max as u64 + 1))),
+                    "{pre:?}"
+                );
+                assert!(
+                    peak_bytes < 2 << 20,
+                    "{pre:?}：峰值 {peak_bytes} 字节，输入 {n}：尾巴被缓冲了"
+                );
+            }
+            Guarded::TimedOut => panic!("{pre:?} 超时"),
+            Guarded::Panicked(m) => panic!("{pre:?} panic {m}"),
+        }
+    }
+}
+
+#[test]
+fn length_limits_share_one_position_rule() {
+    // 普通文本、属性值、注释、CDATA、PI：越界字符 1/2/3/4 字节，position 都在越界字符之后
+    let shapes: [(&str, &str, &str); 5] = [
+        ("TextLength", "<r>", "zz</r>"),
+        ("AttrValueLength", "<r a=\"", "zz\"/>"),
+        ("TextLength", "<r><!--", "zz--></r>"),
+        ("TextLength", "<r><![CDATA[", "zz]]></r>"),
+        ("TextLength", "<r><?p ", "zz?></r>"),
+    ];
+    for (kind, pre, post) in shapes {
+        for ch in ["y", "é", "€", "😀"] {
+            let n = ch.len() as u64;
+            let s = format!("{pre}{}{ch}{post}", "x".repeat(8));
+            let f = both(&s, lim(8)).expect_err("应越界");
+            assert_eq!(f.limit.as_deref(), Some(kind), "{s:?}");
+            assert_eq!(f.actual, Some(8 + n), "{s:?}");
+            let after = (pre.len() + 8) as u64 + n;
+            assert_eq!(f.offset, after, "{s:?}：offset 应在越界字符之后");
+            // 单行输入：column（按字符计，1 起）= 越界字符之后的字符位置
+            let col = (pre.chars().count() + 8 + 1 + 1) as u64;
+            assert_eq!(f.column, col, "{s:?}：column 应在越界字符之后");
+        }
     }
 }
