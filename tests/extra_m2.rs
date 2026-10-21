@@ -342,15 +342,22 @@ impl BufRead for Chunks<'_> {
 }
 
 fn corpus_files() -> Vec<std::path::PathBuf> {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // Same root as `w3c_runner`: `PUREXML_W3C_DIR`, or the gitignored cache
+    // populated by tests/w3c/fetch.sh. The xmltest directories are not in the
+    // repo, so a hardcoded cache path sees only the local data files.
+    let w3c = std::env::var_os("PUREXML_W3C_DIR").map_or_else(
+        || manifest.join("tests/w3c/cache/xmlconf"),
+        std::path::PathBuf::from,
+    );
     let mut out = Vec::new();
-    for dir in [
-        "tests/w3c/cache/xmlconf/xmltest/valid/sa",
-        "tests/w3c/cache/xmlconf/xmltest/not-wf/sa",
-        "tests/w3c/cache/xmlconf/xmltest/valid/not-sa",
-        "tests/data/attacks",
-        "tests/data/fuzz-regressions",
+    for root in [
+        w3c.join("xmltest/valid/sa"),
+        w3c.join("xmltest/not-wf/sa"),
+        w3c.join("xmltest/valid/not-sa"),
+        manifest.join("tests/data/attacks"),
+        manifest.join("tests/data/fuzz-regressions"),
     ] {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
         let mut stack = vec![root];
         while let Some(dir) = stack.pop() {
             let entries = match std::fs::read_dir(&dir) {
