@@ -83,6 +83,16 @@ pub enum LimitKind {
     /// limit (the limit plus that character's UTF-8 byte length). `limit` is
     /// `ParserConfig::max_text_len`.
     AttrValueLength,
+    /// Raw byte length of one top-level token (leading whitespace through the
+    /// terminator, not the lookahead byte). `actual` is `limit + 1`. The
+    /// position is the first byte of that token. Checked on both the slice
+    /// and the streaming reader.
+    TokenLength,
+    /// Raw byte length of one DTD internal subset, counting bytes after `[`
+    /// and before `]`. `actual` is the length at the first byte that makes
+    /// the subset longer than the limit. The position is the cursor after
+    /// that byte.
+    InternalSubsetLength,
 }
 
 impl fmt::Display for LimitKind {
@@ -98,6 +108,8 @@ impl fmt::Display for LimitKind {
             Self::TextLength => "text length",
             Self::TotalInput => "total input",
             Self::AttrValueLength => "attribute value length",
+            Self::TokenLength => "token length",
+            Self::InternalSubsetLength => "internal subset length",
         })
     }
 }
