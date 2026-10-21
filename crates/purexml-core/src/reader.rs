@@ -2253,9 +2253,6 @@ impl Engine {
             None => return Err(self.end_input(input, "unterminated processing instruction")),
         };
         self.expect_bytes(input, b"?>")?;
-        if let Some(RawStr::Owned(text)) = &data {
-            self.check_len(text.len(), LimitKind::TextLength)?;
-        }
         Ok(RawEvent::PI { target, data })
     }
 
