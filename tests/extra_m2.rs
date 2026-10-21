@@ -287,28 +287,6 @@ fn snap_chunks(data: &[u8], chunk: usize, config: ParserConfig) -> Snap {
 fn assert_equivalent(label: &str, data: &[u8], chunk: usize, config: ParserConfig) {
     let left = snap_bytes(data, config.clone());
     let right = snap_chunks(data, chunk, config);
-    let total = |snap: &Snap| {
-        matches!(
-            snap.err.as_ref().map(|err| &err.kind),
-            Some(ErrorKind::SecurityLimit {
-                kind: LimitKind::TotalInput,
-                ..
-            })
-        )
-    };
-    if total(&left) && total(&right) {
-        assert_eq!(left.err, right.err, "{label} chunk {chunk}: TotalInput");
-        assert!(
-            left.events.len() <= right.events.len(),
-            "{label} chunk {chunk}: slice yielded more events than the stream"
-        );
-        assert_eq!(
-            left.events,
-            right.events[..left.events.len()],
-            "{label} chunk {chunk}: streamed prefix"
-        );
-        return;
-    }
     assert_eq!(left, right, "{label} chunk {chunk}");
 }
 
@@ -607,9 +585,14 @@ fn total_input_reports_limit_plus_one_at_the_offending_byte() {
         }
         other => panic!("{other:?}"),
     }
-    assert!(slice.events.is_empty());
+    // `<a/>` occupies offsets 0..3. The next byte is offset 4, so that
+    // element's events are yielded and then TotalInput is reported there.
+    let prefix = snap_bytes(b"<a/>", ParserConfig::default());
+    assert!(prefix.err.is_none());
+    assert_eq!(slice.events, prefix.events);
+    assert!(!slice.events.is_empty());
     assert_eq!(slice.err.as_ref().unwrap().offset, 4);
-    assert_eq!(slice.err, streamed.err);
+    assert_eq!(slice, streamed);
 }
 
 #[test]

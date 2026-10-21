@@ -113,10 +113,10 @@ impl<R: BufRead> Reader<IoInput<R>> {
     /// number of bytes successfully read so far (line and column match that
     /// offset). `Ok(0)` is end of input.
     ///
-    /// A streaming total-input failure can yield events for tokens that ended
-    /// before the overflowing byte. [`Reader::from_bytes`] reports that limit
-    /// on the first `read_event`, before any event. Both use `actual = limit + 1`
-    /// and a position on the overflowing byte.
+    /// `max_total_input` is positional on every entry point. The error is
+    /// reported only when parsing needs the byte at that offset, with
+    /// `actual = limit + 1` and the position on that byte. Tokens that ended
+    /// before it are yielded first. An earlier error wins.
     pub fn from_reader(reader: R) -> Result<Self> {
         Self::from_reader_with_config(reader, ParserConfig::default())
     }
@@ -710,6 +710,12 @@ impl Engine {
         self.ensure_started(input)?;
         if self.frames.is_empty() {
             self.frame_anchor = self.pos;
+        }
+        // The byte at offset `max_total_input` is needed as soon as a token
+        // starts on it, including when the epilog only peeks at it.
+        if self.frames.is_empty() && input.get(self.pos).is_some() && self.at_total_input(self.pos)
+        {
+            return Err(self.total_input_limit());
         }
         let result = match self.phase {
             Phase::Done => Ok(None),
@@ -2050,6 +2056,10 @@ impl Engine {
         let max = self.config.max_text_len;
         let mut i = 0usize;
         while i < bytes.len() {
+            if self.at_total_input(start + i) {
+                self.advance_n(input, i)?;
+                return Err(self.total_input_limit());
+            }
             if self.main_byte_over_limit(start + i) {
                 return Err(self.token_limit(input));
             }
@@ -2138,6 +2148,10 @@ impl Engine {
         let mut i = 0usize;
         let mut brackets = 0u8;
         while i < bytes.len() {
+            if self.at_total_input(start + i) {
+                self.advance_n(input, i)?;
+                return Err(self.total_input_limit());
+            }
             if self.main_byte_over_limit(start + i) {
                 return Err(self.token_limit(input));
             }
@@ -2885,6 +2899,24 @@ impl Engine {
         Ok(())
     }
 
+    /// The main-input byte at `index` is the one past `max_total_input`.
+    fn at_total_input(&self, index: usize) -> bool {
+        if !self.frames.is_empty() {
+            return false;
+        }
+        self.base.saturating_add(index as u64) >= self.config.max_total_input
+    }
+
+    fn total_input_limit(&self) -> Error {
+        let limit = self.config.max_total_input;
+        self.limit_at(
+            LimitKind::TotalInput,
+            limit,
+            limit.saturating_add(1),
+            self.pos_now(),
+        )
+    }
+
     /// `index` is a main-input byte that would make the current token longer
     /// than `max_token_len`. Entity replacement bytes are not main input.
     fn main_byte_over_limit(&self, index: usize) -> bool {
@@ -2908,6 +2940,9 @@ impl Engine {
     fn advance_one(&mut self, input: &[u8]) -> Result<()> {
         self.pop_finished();
         if self.frames.is_empty() {
+            if input.get(self.pos).is_some() && self.at_total_input(self.pos) {
+                return Err(self.total_input_limit());
+            }
             let b = input
                 .get(self.pos)
                 .copied()

@@ -7,7 +7,7 @@
 use std::io::{BufRead, ErrorKind as IoErrorKind};
 
 use crate::config::ParserConfig;
-use crate::error::{observe_byte, Error, ErrorKind, LimitKind, Position, Result};
+use crate::error::{observe_byte, Error, ErrorKind, Position, Result};
 use crate::name::{decode_utf8, is_name_char, is_name_start, is_whitespace, utf8_incomplete};
 
 /// Bytes pulled per `read` when the source has them. Not a public knob.
@@ -178,19 +178,21 @@ impl<R: BufRead> IoInput<R> {
         let buf_room = cap.saturating_sub(self.buf.len());
         let max = config.max_total_input;
         let already = self.read_pos.offset;
+        // Keep the byte at offset `max` so the engine can report TotalInput
+        // when it actually reads it. Do not pull anything past that byte, and
+        // do not fail here: an earlier error in the bytes already buffered
+        // has to win, independent of the chunk size.
         if already > max {
-            return Err(self.total_input(max));
+            self.blocked = true;
+            return Ok(());
         }
         let input_room = if max == u64::MAX {
             usize::MAX / 4
         } else {
-            ((max + 1) - already) as usize
+            ((max - already) as usize).saturating_add(1)
         };
         let want = READ_CHUNK.min(buf_room).min(input_room);
         if want == 0 {
-            if input_room == 0 {
-                return Err(self.total_input(max));
-            }
             self.blocked = true;
             return Ok(());
         }
@@ -210,26 +212,9 @@ impl<R: BufRead> IoInput<R> {
             }
         };
         let bytes = &tmp[..n];
-        if max != u64::MAX && already.saturating_add(n as u64) > max {
-            let pre = (max - already) as usize;
-            self.observe(&bytes[..pre]);
-            return Err(self.total_input(max));
-        }
         self.observe(bytes);
         self.buf.extend_from_slice(bytes);
         Ok(())
-    }
-
-    fn total_input(&self, limit: u64) -> Error {
-        Error::new(
-            ErrorKind::SecurityLimit {
-                kind: LimitKind::TotalInput,
-                limit,
-                actual: limit.saturating_add(1),
-            },
-            self.read_pos,
-            "input exceeds max_total_input",
-        )
     }
 
     fn observe(&mut self, bytes: &[u8]) {

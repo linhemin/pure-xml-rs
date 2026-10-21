@@ -138,7 +138,7 @@ assert_eq!(
 
 窗口大约是 `max_token_len` 再加一个 8 KiB 的读块，和文档总长无关。已经消费的前缀会压缩掉。`max_token_len` 小于 `max_text_len` 时，长文本会先碰到 `TokenLength`。只由 CR LF 组成的超长 token，规范化后的长度大约是原始长度的一半，默认 32 MiB 的 token 上限可能比 16 MiB 的文本上限更早触发。
 
-`max_total_input` 在两条路径上的**触发时机不同**：切片在第一次 `read_event`、任何事件之前就检查整份长度；流式是读到越界字节时才检查，在此之前已经完整结束的 token 可以已经产出事件。两边的 `actual` 都是 `limit + 1`，位置都在越界的那个字节上。
+`max_total_input` 按位置判定，切片和流式相同：只有解析真正需要 offset = limit 的那个字节时才报 `TotalInput`。位置是这个字节，`actual` 恒为 `limit + 1`。在它之前已经完整结束的 token 会先产出事件；位置更靠前的错误优先，不会因为缓冲区更长就提前拒绝。流式窗口仍然大约是 `max_token_len` 再加一个读块，不会为了这条限制把后续输入全部读进来。
 
 I/O：`ErrorKind::Interrupted` 会一直重试。`WouldBlock` 和其他 I/O 错误变成 `ErrorKind::Io` 并熔断（之后每次 `read_event` 都返回同一个错误）。I/O 错误的 `offset` 是已经成功读入的原始字节数。`Ok(0)` 是 EOF，之后的字节不再读取。`read` 若声称读到的字节数大于缓冲区，报 `ErrorKind::Io`，不 panic。用户 reader 自己的 panic 会原样抛出。
 

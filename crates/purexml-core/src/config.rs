@@ -86,12 +86,11 @@ pub struct ParserConfig {
     pub max_text_len: u64,
     /// Maximum original document size in bytes.
     ///
-    /// On [`crate::Reader::from_bytes`] this is checked on the first
-    /// [`crate::Reader::read_event`], before any event is yielded. On
-    /// [`crate::Reader::from_reader`] it is checked as bytes are pulled, so
-    /// events for tokens that ended before the overflowing byte may already
-    /// have been yielded. Both paths report `actual = limit + 1` and a
-    /// position on that overflowing byte.
+    /// Reported only when parsing needs the byte at this offset. The position
+    /// is that byte and `actual` is `limit + 1`. [`crate::Reader::from_bytes`],
+    /// [`crate::Reader::from_vec`], and [`crate::Reader::from_reader`] all
+    /// follow that rule: a shorter document passes, and an error at an earlier
+    /// offset wins. Events for tokens that ended before the byte are yielded.
     pub max_total_input: u64,
     /// Maximum raw byte length of one top-level token. See
     /// [`DEFAULT_MAX_TOKEN_LEN`].
