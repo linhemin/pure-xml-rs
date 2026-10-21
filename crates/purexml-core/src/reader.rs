@@ -283,59 +283,71 @@ impl<S: AsRef<[u8]>> Reader<S> {
     }
 
     fn pull_slice(&mut self) -> Result<(Option<usize>, Option<RawEvent>)> {
-        let input = self.input.as_ref();
-        if !self.engine.started && input.len() as u64 > self.engine.config.max_total_input {
-            let limit = self.engine.config.max_total_input;
-            let err = self.engine.limit_at(
-                LimitKind::TotalInput,
-                limit,
-                limit.saturating_add(1),
-                position_at(input, limit as usize),
-            );
-            self.engine.started = true;
-            return Err(err);
-        }
-        let probe = if self.engine.frames.is_empty() && self.engine.phase != Phase::Done {
-            let content = matches!(self.engine.phase, Phase::Content);
-            let mut framer = Framer::start(self.engine.pos, !self.engine.started, content);
-            match framer.poll(input, true, &self.engine.config) {
-                Poll::Probe { end } => {
-                    self.engine.end_is_eof = false;
-                    Some(end.min(input.len()))
-                }
-                _ => {
-                    self.engine.end_is_eof = true;
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let start_pos = self.engine.pos;
-        let window = match probe {
-            Some(end) => &input[..end],
-            None => input,
-        };
-        let raw = self.engine.next_raw(window);
-        if self.engine.need_frame {
-            // The slice window already holds the following token. Parsing it
-            // from here would disagree with the streaming path, which frames
-            // one token at a time. Drop the flag and parse the token that the
-            // cursor is on now; the full slice is still the window.
-            self.engine.need_frame = false;
-            self.engine.end_is_eof = true;
-            let window = self.input.as_ref();
-            let raw = self.engine.next_raw(window)?;
-            return Ok((None, raw));
-        }
-        let raw = raw?;
-        if probe.is_some() && self.engine.frames.is_empty() {
-            let consumed = self.engine.pos.saturating_sub(start_pos) as u64;
-            if consumed > self.engine.config.max_token_len {
-                return Err(self.engine.token_limit(input));
+        if !self.engine.started {
+            let len = self.input.as_ref().len() as u64;
+            if len > self.engine.config.max_total_input {
+                let limit = self.engine.config.max_total_input;
+                let err = self.engine.limit_at(
+                    LimitKind::TotalInput,
+                    limit,
+                    limit.saturating_add(1),
+                    position_at(self.input.as_ref(), limit as usize),
+                );
+                self.engine.started = true;
+                return Err(err);
             }
         }
-        Ok((probe, raw))
+        // Same spin guard as `pull_raw`: an empty expansion that does not
+        // move the cursor cannot be framed again.
+        let mut parked = None;
+        loop {
+            let input = self.input.as_ref();
+            let probe = if self.engine.frames.is_empty() && self.engine.phase != Phase::Done {
+                let content = matches!(self.engine.phase, Phase::Content);
+                let mut framer = Framer::start(self.engine.pos, !self.engine.started, content);
+                // The bytes are all present, but this token is not the end of
+                // input unless the framer actually runs out of them. Forcing
+                // EOF here lets an empty expansion keep parsing the next token
+                // with no probe. Poll the way `prepare` does: not-EOF first.
+                let (at_eof, end) = match framer.poll(input, false, &self.engine.config) {
+                    Poll::Probe { end } => (false, Some(end.min(input.len()))),
+                    Poll::Ready { eof } => (eof, None),
+                    Poll::NeedMore => match framer.poll(input, true, &self.engine.config) {
+                        Poll::Probe { end } => (false, Some(end.min(input.len()))),
+                        Poll::Ready { eof } => (eof, None),
+                        Poll::NeedMore => (true, None),
+                    },
+                };
+                self.engine.end_is_eof = at_eof && end.is_none();
+                end
+            } else {
+                None
+            };
+            let start_pos = self.engine.pos;
+            let window = match probe {
+                Some(end) => &input[..end],
+                None => input,
+            };
+            let raw = self.engine.next_raw(window);
+            if self.engine.need_frame {
+                // The expansion produced no event. Frame the token now under
+                // the cursor; do not parse the unframed tail.
+                self.engine.need_frame = false;
+                if parked == Some(self.engine.pos) {
+                    return Err(self.engine.token_limit(input));
+                }
+                parked = Some(self.engine.pos);
+                continue;
+            }
+            let raw = raw?;
+            if probe.is_some() && self.engine.frames.is_empty() {
+                let consumed = self.engine.pos.saturating_sub(start_pos) as u64;
+                if consumed > self.engine.config.max_token_len {
+                    return Err(self.engine.token_limit(input));
+                }
+            }
+            return Ok((probe, raw));
+        }
     }
 }
 
