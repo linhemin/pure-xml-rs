@@ -263,46 +263,71 @@ impl<S: AsRef<[u8]>> Reader<S> {
     /// take ownership with [`crate::event::XmlText::into_owned`].
     ///
     /// After an error, this returns that same error.
+    #[inline]
     pub fn read_event(&mut self) -> Result<Option<Event<'_>>> {
-        if let Some(err) = self.poison.clone() {
-            return Err(err);
+        if self.poison.is_some() {
+            return self.poisoned();
         }
-        let (probe_end, raw) = match self.pull_slice() {
-            Ok(value) => value,
-            Err(err) => {
-                self.poison = Some(err.clone());
-                return Err(err);
-            }
+        // The buffer is the whole document. There is no framer probe.
+        // `max_token_len` and `max_total_input` are the precomputed
+        // `main_stop` checked as main-input bytes are consumed.
+        let raw = {
+            self.engine.end_is_eof = true;
+            let input = self.input.as_ref();
+            self.engine.next_raw(input)
         };
-        let input = self.input.as_ref();
-        let window = match probe_end {
-            Some(end) => &input[..end.min(input.len())],
-            None => input,
-        };
-        Ok(raw.map(|raw| materialize(window, raw)))
+        if self.engine.need_frame {
+            return self.read_slice_after_reframe();
+        }
+        self.finish_slice(raw)
     }
 
-    fn pull_slice(&mut self) -> Result<(Option<usize>, Option<RawEvent>)> {
-        // The buffer is the whole document, so there is no second scan to
-        // find the token boundary. `max_token_len` is checked as the engine
-        // consumes bytes. `end_is_eof` stays true: running off the buffer is
-        // real EOF, not a probe cut.
-        let mut parked = None;
+    #[inline]
+    fn finish_slice(&mut self, raw: Result<Option<RawEvent>>) -> Result<Option<Event<'_>>> {
+        match raw {
+            Ok(raw) => {
+                let input = self.input.as_ref();
+                Ok(raw.map(|raw| materialize(input, raw)))
+            }
+            Err(err) => {
+                self.poison = Some(err.clone());
+                Err(err)
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn poisoned(&mut self) -> Result<Option<Event<'_>>> {
+        Err(self.poison.clone().expect("poison"))
+    }
+
+    /// The previous `next_raw` finished an empty expansion and asked for a
+    /// new token start. Rare; kept out of the slice hot path.
+    #[cold]
+    #[inline(never)]
+    fn read_slice_after_reframe(&mut self) -> Result<Option<Event<'_>>> {
+        let mut parked = Some(self.engine.pos);
         loop {
-            let input = self.input.as_ref();
-            self.engine.end_is_eof = true;
-            let raw = self.engine.next_raw(input);
+            self.engine.need_frame = false;
+            let raw = {
+                self.engine.end_is_eof = true;
+                let input = self.input.as_ref();
+                self.engine.next_raw(input)
+            };
             if self.engine.need_frame {
-                // An empty expansion produced no event. `next_raw` records the
-                // next token's start; do not keep counting it as this token.
-                self.engine.need_frame = false;
                 if parked == Some(self.engine.pos) {
-                    return Err(self.engine.token_limit(input));
+                    let err = {
+                        let input = self.input.as_ref();
+                        self.engine.token_limit(input)
+                    };
+                    self.poison = Some(err.clone());
+                    return Err(err);
                 }
                 parked = Some(self.engine.pos);
                 continue;
             }
-            return Ok((None, raw?));
+            return self.finish_slice(raw);
         }
     }
 }
@@ -481,6 +506,13 @@ struct Engine {
     frame_anchor: usize,
     /// The engine finished one main-input token and the next one is not framed.
     need_frame: bool,
+    /// First main-input index that must not be consumed for this token.
+    /// The minimum of the token cap and `max_total_input`.
+    main_stop: usize,
+    /// First main-input index at absolute offset `max_total_input`.
+    total_stop: usize,
+    /// First main-input index past `max_token_len` from `token_origin`.
+    token_stop: usize,
     line: u64,
     column: u64,
     cr_pending: bool,
@@ -530,6 +562,9 @@ impl Engine {
             token_cr: false,
             frame_anchor: 0,
             need_frame: false,
+            main_stop: usize::MAX,
+            total_stop: usize::MAX,
+            token_stop: usize::MAX,
             line: 1,
             column: 1,
             cr_pending: false,
@@ -590,6 +625,8 @@ impl Engine {
         }
     }
 
+    #[cold]
+    #[inline(never)]
     fn token_limit(&self, input: &[u8]) -> Error {
         let limit = self.config.max_token_len;
         debug_assert!(
@@ -652,6 +689,8 @@ impl Engine {
         self.frames.is_empty() && !self.end_is_eof && self.pos >= input.len()
     }
 
+    #[cold]
+    #[inline(never)]
     fn end_input(&self, input: &[u8], message: &str) -> Error {
         if self.at_window_end(input) {
             self.token_limit(input)
@@ -671,10 +710,14 @@ impl Engine {
             .unwrap_or_else(|| self.pos_now())
     }
 
+    #[cold]
+    #[inline(never)]
     fn syntax(&self, message: impl Into<String>) -> Error {
         Error::new(ErrorKind::Syntax, self.err_pos(), message)
     }
 
+    #[cold]
+    #[inline(never)]
     fn encoding(&self, message: impl Into<String>) -> Error {
         Error::new(ErrorKind::Encoding, self.err_pos(), message)
     }
@@ -683,10 +726,14 @@ impl Engine {
         Error::new(ErrorKind::ExternalEntityForbidden, position, message)
     }
 
+    #[cold]
+    #[inline(never)]
     fn limit(&self, kind: LimitKind, limit: u64, actual: u64) -> Error {
         self.limit_at(kind, limit, actual, self.err_pos())
     }
 
+    #[cold]
+    #[inline(never)]
     fn limit_at(&self, kind: LimitKind, limit: u64, actual: u64, position: Position) -> Error {
         Error::new(
             ErrorKind::SecurityLimit {
@@ -703,6 +750,7 @@ impl Engine {
         if self.frames.is_empty() {
             self.token_origin = self.pos_now();
             self.token_cr = self.cr_pending;
+            self.arm_main_limits();
         }
         if let Some(err) = self.boundary_error.take() {
             return Err(err);
@@ -713,8 +761,7 @@ impl Engine {
         }
         // The byte at offset `max_total_input` is needed as soon as a token
         // starts on it, including when the epilog only peeks at it.
-        if self.frames.is_empty() && input.get(self.pos).is_some() && self.at_total_input(self.pos)
-        {
+        if self.frames.is_empty() && self.pos >= self.total_stop && self.pos < input.len() {
             return Err(self.total_input_limit());
         }
         let result = match self.phase {
@@ -740,7 +787,10 @@ impl Engine {
     fn consume_bom(&mut self, input: &[u8]) -> Result<()> {
         if input.starts_with(&[0xEF, 0xBB, 0xBF]) {
             self.pos = 3;
-            return self.enforce_token_len(input);
+            if self.pos > self.token_stop {
+                return Err(self.token_limit(input));
+            }
+            return Ok(());
         }
         if input.starts_with(&[0xFE, 0xFF])
             || input.starts_with(&[0xFF, 0xFE])
@@ -2054,6 +2104,7 @@ impl Engine {
     /// Returns `None` without consuming when the value needs the normalizing
     /// path. A value that crosses `max_text_len` fails at that byte: `actual`
     /// is the length then, and the rest of the value is not scanned.
+    #[inline]
     fn try_plain_attr(&mut self, input: &[u8], quote: u8) -> Result<Option<RawStr>> {
         if !self.frames.is_empty() || self.cr_pending {
             return Ok(None);
@@ -2061,14 +2112,11 @@ impl Engine {
         let start = self.pos;
         let bytes = &input[start..];
         let max = self.config.max_text_len;
+        let hard = self.main_stop.saturating_sub(start);
         let mut i = 0usize;
         while i < bytes.len() {
-            if self.at_total_input(start + i) {
-                self.advance_n(input, i)?;
-                return Err(self.total_input_limit());
-            }
-            if self.main_byte_over_limit(start + i) {
-                return Err(self.token_limit(input));
+            if i >= hard {
+                return self.stop_plain_scan(input, i);
             }
             let byte = bytes[i];
             if byte == quote {
@@ -2146,21 +2194,19 @@ impl Engine {
         }
     }
 
+    #[inline]
     fn try_plain_text(&mut self, input: &[u8]) -> Result<Option<RawStr>> {
         if !self.frames.is_empty() {
             return Ok(None);
         }
         let start = self.pos;
         let bytes = &input[start..];
+        let hard = self.main_stop.saturating_sub(start);
         let mut i = 0usize;
         let mut brackets = 0u8;
         while i < bytes.len() {
-            if self.at_total_input(start + i) {
-                self.advance_n(input, i)?;
-                return Err(self.total_input_limit());
-            }
-            if self.main_byte_over_limit(start + i) {
-                return Err(self.token_limit(input));
+            if i >= hard {
+                return self.stop_plain_scan(input, i);
             }
             let b = bytes[i];
             if b == b'<' {
@@ -2859,6 +2905,7 @@ impl Engine {
         }
     }
 
+    #[inline]
     fn skip_ws(&mut self, input: &[u8]) -> Result<usize> {
         let mut count = 0usize;
         while let Some(b) = self.peek_byte(input) {
@@ -2891,6 +2938,7 @@ impl Engine {
         self.current_bytes(input).get(offset).copied()
     }
 
+    #[inline]
     fn peek_byte(&mut self, input: &[u8]) -> Option<u8> {
         if self.halt {
             return None;
@@ -2902,6 +2950,7 @@ impl Engine {
         self.current_bytes(input).first().copied()
     }
 
+    #[inline]
     fn current_bytes<'a>(&'a self, input: &'a [u8]) -> &'a [u8] {
         if let Some(frame) = self.frames.last() {
             let bytes = self.entities[frame.entity_idx].as_bytes();
@@ -2913,6 +2962,7 @@ impl Engine {
         }
     }
 
+    #[inline]
     fn advance_n(&mut self, input: &[u8], n: usize) -> Result<()> {
         for _ in 0..n {
             self.advance_one(input)?;
@@ -2920,14 +2970,28 @@ impl Engine {
         Ok(())
     }
 
-    /// The main-input byte at `index` is the one past `max_total_input`.
-    fn at_total_input(&self, index: usize) -> bool {
-        if !self.frames.is_empty() {
-            return false;
-        }
-        self.base.saturating_add(index as u64) >= self.config.max_total_input
+    /// Recompute the main-input cursor ceiling from `token_origin`.
+    ///
+    /// One compare against [`Self::main_stop`] replaces a per-byte
+    /// `max_token_len` / `max_total_input` calculation. The ceiling is an
+    /// index into the current buffer; `prepare` updates `base` before the
+    /// next token arms this again.
+    fn arm_main_limits(&mut self) {
+        let origin = self.token_origin.offset.saturating_sub(self.base);
+        let token_room = u64_as_index(self.config.max_token_len);
+        let token_stop = u64_as_index(origin).saturating_add(token_room);
+        let total_stop = if self.config.max_total_input <= self.base {
+            0
+        } else {
+            u64_as_index(self.config.max_total_input - self.base)
+        };
+        self.token_stop = token_stop;
+        self.total_stop = total_stop;
+        self.main_stop = token_stop.min(total_stop);
     }
 
+    #[cold]
+    #[inline(never)]
     fn total_input_limit(&self) -> Error {
         let limit = self.config.max_total_input;
         self.limit_at(
@@ -2938,57 +3002,86 @@ impl Engine {
         )
     }
 
-    /// `index` is a main-input byte that would make the current token longer
-    /// than `max_token_len`. Entity replacement bytes are not main input.
-    fn main_byte_over_limit(&self, index: usize) -> bool {
-        if !self.frames.is_empty() {
-            return false;
+    #[cold]
+    #[inline(never)]
+    fn main_limit_error(&self, input: &[u8]) -> Error {
+        if self.pos >= self.total_stop {
+            self.total_input_limit()
+        } else {
+            self.token_limit(input)
         }
-        let end = self.base.saturating_add(index as u64).saturating_add(1);
-        end.saturating_sub(self.token_origin.offset) > self.config.max_token_len
     }
 
-    fn enforce_token_len(&self, input: &[u8]) -> Result<()> {
-        if self.frames.is_empty() {
-            let consumed = (self.base + self.pos as u64).saturating_sub(self.token_origin.offset);
-            if consumed > self.config.max_token_len {
-                return Err(self.token_limit(input));
-            }
+    /// `scanned` bytes of a plain run fit. The next byte is past `main_stop`.
+    #[cold]
+    #[inline(never)]
+    fn stop_plain_scan(&mut self, input: &[u8], scanned: usize) -> Result<Option<RawStr>> {
+        if self.pos.saturating_add(scanned) >= self.total_stop {
+            self.advance_n(input, scanned)?;
+            Err(self.total_input_limit())
+        } else {
+            Err(self.token_limit(input))
         }
-        Ok(())
     }
 
+    #[inline]
     fn advance_one(&mut self, input: &[u8]) -> Result<()> {
         self.pop_finished();
-        if self.frames.is_empty() {
-            if input.get(self.pos).is_some() && self.at_total_input(self.pos) {
-                return Err(self.total_input_limit());
-            }
-            let b = input
-                .get(self.pos)
-                .copied()
-                .ok_or_else(|| self.end_input(input, "unexpected end of input"))?;
-            let at_byte = self.pos_now();
-            self.observe(b);
-            self.pos += 1;
-            self.enforce_token_len(input)?;
-            if let Some(start) = self.subset_start {
-                let len = (self.pos - start) as u64;
-                if len > self.config.max_internal_subset_len {
-                    return Err(self.limit_at(
-                        LimitKind::InternalSubsetLength,
-                        self.config.max_internal_subset_len,
-                        len,
-                        at_byte,
-                    ));
-                }
-            }
-        } else if let Some(frame) = self.frames.last_mut() {
+        if let Some(frame) = self.frames.last_mut() {
             frame.pos += 1;
+            return Ok(());
+        }
+        // One predicted compare. The default caps sit far past a normal
+        // document, so this branch is not taken on the slice hot path.
+        if self.pos >= self.main_stop {
+            return self.advance_at_stop(input);
+        }
+        if self.subset_start.is_some() {
+            return self.advance_main_subset(input);
+        }
+        let b = input
+            .get(self.pos)
+            .copied()
+            .ok_or_else(|| self.end_input(input, "unexpected end of input"))?;
+        self.observe(b);
+        self.pos += 1;
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn advance_at_stop(&mut self, input: &[u8]) -> Result<()> {
+        if self.pos >= input.len() {
+            return Err(self.end_input(input, "unexpected end of input"));
+        }
+        Err(self.main_limit_error(input))
+    }
+
+    /// Byte inside an internal subset. The length cap is not on the content path.
+    #[inline(never)]
+    fn advance_main_subset(&mut self, input: &[u8]) -> Result<()> {
+        let b = input
+            .get(self.pos)
+            .copied()
+            .ok_or_else(|| self.end_input(input, "unexpected end of input"))?;
+        let at_byte = self.pos_now();
+        self.observe(b);
+        self.pos += 1;
+        if let Some(start) = self.subset_start {
+            let len = (self.pos - start) as u64;
+            if len > self.config.max_internal_subset_len {
+                return Err(self.limit_at(
+                    LimitKind::InternalSubsetLength,
+                    self.config.max_internal_subset_len,
+                    len,
+                    at_byte,
+                ));
+            }
         }
         Ok(())
     }
 
+    #[inline]
     fn observe(&mut self, byte: u8) {
         let mut position = self.pos_now();
         observe_byte(&mut position, &mut self.cr_pending, byte);
@@ -3033,6 +3126,10 @@ impl Engine {
             self.open_entities.pop();
         }
     }
+}
+
+fn u64_as_index(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
 }
 
 fn flatten_qname(input: &[u8], name: RawQName) -> RawStr {
