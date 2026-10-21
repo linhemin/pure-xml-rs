@@ -2034,7 +2034,12 @@ impl Engine {
                 buf.push_str(assume_utf8(&input[start..mark]));
                 plain = false;
             }
-            if !plain {
+            // Count this character before looking for the terminator. A comment
+            // that never closes still reports TextLength at the first overflow,
+            // with `actual` equal to the length including that character.
+            if plain {
+                self.check_len(self.pos - start, LimitKind::TextLength)?;
+            } else {
                 let new_len = buf.len() + ch.len_utf8();
                 self.check_len(new_len, LimitKind::TextLength)?;
                 buf.push(ch);

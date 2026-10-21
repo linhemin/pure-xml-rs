@@ -1,8 +1,6 @@
-//! M2 PR-A cases: incremental attribute-value limits (D11 / D-Q4) and the
-//! shared NCName / QName rules (D23).
-//!
-//! Tester files stay untouched, including the ignored
-//! `d23_colons_in_pi_entity_notation_names_rejected` test.
+//! M2 PR-A cases: incremental attribute-value limits (D11 / D-Q4), the
+//! shared NCName / QName rules (D23), and per-character comment, CDATA, and
+//! PI lengths (D26).
 
 use purexml::{
     Doctype, Error, ErrorKind, Event, LimitKind, ParserConfig, ProcessingInstruction, Reader,
@@ -222,4 +220,97 @@ fn doctype(name: &str) -> Event<'_> {
         public_id: None,
         has_internal_subset: false,
     })
+}
+
+fn text_actual(err: &Error) -> (u64, u64, u64) {
+    match err.kind {
+        ErrorKind::SecurityLimit {
+            kind: LimitKind::TextLength,
+            limit,
+            actual,
+        } => (limit, actual, err.position.offset),
+        _ => panic!("expected TextLength, got {err}"),
+    }
+}
+
+/// `from_bytes` and `from_reader` report the same TextLength, including offset.
+fn assert_text_limit(xml: &str, max: u64, actual: u64, body_at: usize) {
+    let slice = pull(xml, config(max)).expect_err(xml);
+    let (limit, got, offset) = text_actual(&slice);
+    assert_eq!(limit, max, "{xml}");
+    assert_eq!(got, actual, "{xml}");
+    assert_eq!(offset, (body_at + actual as usize) as u64, "{xml}");
+    assert!(offset < xml.len() as u64, "{xml}");
+
+    let streamed = read_reader(xml, max).expect_err(xml);
+    assert_eq!(slice.kind, streamed.kind, "{xml}");
+    assert_eq!(slice.position, streamed.position, "{xml}");
+}
+
+fn read_reader(xml: &str, max: u64) -> Result<Vec<EventOwned>, Error> {
+    let mut streamed = Reader::from_reader(std::io::Cursor::new(xml.as_bytes()))
+        .unwrap()
+        .with_config(config(max));
+    let mut out = Vec::new();
+    loop {
+        match streamed.read_event() {
+            Ok(None) => return Ok(out),
+            Ok(Some(Event::Doctype(dtd))) => out.push(EventOwned::Doctype(dtd.name.into_owned())),
+            Ok(Some(Event::PI(pi))) => out.push(EventOwned::Pi(pi.target.into_owned())),
+            Ok(Some(_)) => out.push(EventOwned::Other),
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+#[test]
+fn d26_comment_cdata_and_pi_stop_at_the_first_overflow() {
+    let comment = format!("<!--{}--><r/>", "0123456789");
+    assert_text_limit(&comment, 4, 5, comment.find('0').unwrap());
+    let long = format!("<!--{}--><r/>", "x".repeat(100_000));
+    assert_text_limit(&long, 4, 5, long.find('x').unwrap());
+    assert!(pull("<!--0123--><r/>", config(4)).is_ok());
+    assert!(pull("<!----><r/>", config(0)).is_ok());
+    let one = "<!--x--><r/>";
+    assert_text_limit(one, 0, 1, one.find('x').unwrap());
+
+    let cdata = format!("<r><![CDATA[{}]]></r>", "0123456789");
+    assert_text_limit(&cdata, 4, 5, cdata.find('0').unwrap());
+    assert!(pull("<r><![CDATA[0123]]></r>", config(4)).is_ok());
+
+    let pi = format!("<?t {}?><r/>", "0123456789");
+    assert_text_limit(&pi, 4, 5, pi.find('0').unwrap());
+    assert!(pull("<?t 0123?><r/>", config(4)).is_ok());
+    assert!(pull("<?t?><r/>", config(0)).is_ok());
+    assert!(pull("<?t ?><r/>", config(0)).is_ok());
+}
+
+#[test]
+fn d26_multibyte_crlf_and_unterminated_comment() {
+    // U+00E9 is two bytes. Four ASCII bytes sit on the cap, so actual is 6.
+    let comment = "<!--xxxxéyyy--><r/>";
+    assert_text_limit(comment, 4, 6, comment.find('x').unwrap());
+    // Three ASCII bytes, then a 4-byte character, cap 4: actual is 7.
+    let crossed = "<!--xxx😀--><r/>";
+    assert_text_limit(crossed, 4, 7, crossed.find('x').unwrap());
+    let cdata = "<r><![CDATA[xxxx€]]></r>";
+    assert_text_limit(cdata, 4, 7, cdata.find('x').unwrap());
+    let pi = "<?t xxxx😀?><r/>";
+    assert_text_limit(pi, 4, 8, pi.find('x').unwrap());
+
+    // CRLF is one content character. Four `x`s plus that newline is length 5,
+    // and the cursor sits after both raw bytes.
+    let crlf = "<!--xxxx\r\nyyy--><r/>";
+    let err = pull(crlf, config(4)).expect_err(crlf);
+    let (limit, actual, offset) = text_actual(&err);
+    assert_eq!((limit, actual), (4, 5));
+    assert_eq!(offset, (crlf.find('x').unwrap() + 6) as u64);
+    let streamed = read_reader(crlf, 4).expect_err(crlf);
+    assert_eq!(err.kind, streamed.kind);
+    assert_eq!(err.position, streamed.position);
+    assert!(pull("<!--xxx\r\n--><r/>", config(4)).is_ok());
+
+    let mut open = String::from("<!--");
+    open.push_str(&"x".repeat(100_000));
+    assert_text_limit(&open, 4, 5, open.find('x').unwrap());
 }
