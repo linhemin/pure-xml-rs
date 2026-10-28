@@ -3151,7 +3151,6 @@ fn encoding_vs_byte_limit_c12c5a0_reports_token_length() {
 /// 期望 TokenLength 48/49 @66（Lead 11:03 给出的期望值）。94d3c46 / 2431508 都报 @65（起点算到了
 /// 序言空白 17）。是否计入序言空白待 Lead 裁定，裁定后去掉 #[ignore] 或改期望。
 #[test]
-#[ignore = "待 Lead 裁定：序言空白是否计入下一个 token 的 TokenLength"]
 fn c12c5a0_doctype_token_starts_at_markup() {
     let d: &[u8] = C12C5A0;
     let s = all_chunkings("c12c5a0 绝对偏移", d, &c12c5a0_config());
