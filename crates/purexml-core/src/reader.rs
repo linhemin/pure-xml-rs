@@ -2467,6 +2467,14 @@ impl Engine {
                 }
                 brackets = 0;
                 i += 1;
+                if (i as u64) > self.config.max_text_len {
+                    self.advance_n(input, i)?;
+                    return Err(self.limit(
+                        LimitKind::TextLength,
+                        self.config.max_text_len,
+                        i as u64,
+                    ));
+                }
                 continue;
             }
             brackets = 0;

@@ -37,3 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the first character past the cap, including that character's UTF-8 bytes.
   The position is the cursor after that character. An unterminated comment
   that exceeds the cap reports `TextLength`.
+
+### Security
+
+- `>` characters in text were not counted toward `max_text_len`, allowing the
+  limit to be bypassed; fixed.
