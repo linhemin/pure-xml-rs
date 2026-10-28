@@ -340,6 +340,20 @@ fn seeded_schedule(seed: u64) -> Vec<usize> {
 
 /// 计划 §1.2 的切法。返回检查过的路径数。
 fn check_doc(label: &str, d: &[u8], c: &ParserConfig) -> usize {
+    check_doc_depth(label, d, c, Depth::Full)
+}
+
+/// 切块覆盖的深度。Full：每个切点、64 种随机切块、7 种 BufReader 容量；
+/// Quick（默认套件用）：切点按步长取样（首尾和 0..=8 全保留）、8 种随机切块、3 种容量。
+/// 两者每条路径上的断言完全相同，只是路径少；Full 放在 #[ignore] 用例里每轮用 --ignored 跑。
+#[derive(Clone, Copy, PartialEq)]
+enum Depth {
+    Full,
+    Quick,
+}
+
+fn check_doc_depth(label: &str, d: &[u8], c: &ParserConfig, depth: Depth) -> usize {
+    let quick = depth == Depth::Quick;
     let base = bytes(d, c);
     assert_eq!(base, vec_path(d, c), "{label}：from_vec 与 from_bytes 不同");
     let mut n = 1;
@@ -355,7 +369,8 @@ fn check_doc(label: &str, d: &[u8], c: &ParserConfig) -> usize {
     );
     n += 2;
     if d.len() <= 4096 {
-        for k in 0..=d.len() {
+        let step = if quick { (d.len() / 32).max(1) } else { 1 };
+        for k in (0..=d.len()).filter(|&k| k % step == 0 || k <= 8 || k + 8 >= d.len()) {
             let run = stream(d, c, Plan::Cut(k), None);
             assert_same(&format!("{label} [切点 {k}]"), &base, &run.snap);
             assert_eq!(
@@ -365,7 +380,13 @@ fn check_doc(label: &str, d: &[u8], c: &ParserConfig) -> usize {
             n += 1;
         }
     }
-    let rounds = if big { 16 } else { 64 };
+    let rounds = if quick {
+        8
+    } else if big {
+        16
+    } else {
+        64
+    };
     for seed in 0..rounds {
         let plan = Plan::Schedule(seeded_schedule(seed));
         assert_same(
@@ -375,7 +396,7 @@ fn check_doc(label: &str, d: &[u8], c: &ParserConfig) -> usize {
         );
         n += 1;
     }
-    let caps: &[usize] = if big {
+    let caps: &[usize] = if big || quick {
         &[1, 7, 4096]
     } else {
         &[1, 2, 3, 7, 16, 64, 8192]
@@ -541,15 +562,27 @@ fn crafted_cut_points_match_from_bytes() {
     eprintln!("crafted：{paths} 条路径");
 }
 
-#[test]
-fn corpus_matches_from_bytes_on_all_chunkings() {
+fn corpus_on_chunkings(depth: Depth) {
     let docs = corpus();
     assert!(docs.len() >= 90, "语料太少：{}", docs.len());
     let mut paths = 0;
     for (name, d) in &docs {
-        paths += check_doc(name, d, &ParserConfig::default());
+        paths += check_doc_depth(name, d, &ParserConfig::default(), depth);
     }
     eprintln!("语料 {} 份，{paths} 条路径", docs.len());
+}
+
+/// 默认套件：同一批语料，切点取样 + 8 种随机切块 + 3 种容量。
+#[test]
+fn corpus_matches_from_bytes_on_sampled_chunkings() {
+    corpus_on_chunkings(Depth::Quick);
+}
+
+/// 完整版：每个切点、64 种随机切块、7 种容量（debug 约 50 s）。
+#[test]
+#[ignore = "slow: 语料全切点（debug 约 50 s），需要跑 --ignored"]
+fn corpus_matches_from_bytes_on_all_chunkings() {
+    corpus_on_chunkings(Depth::Full);
 }
 
 #[test]
@@ -1753,8 +1786,20 @@ fn structural_and_entity_limits_on_four_paths() {
 }
 
 /// D21 的 6 个测试用的文档，在四条路径上重放，结果与 from_bytes 完全相同。
+/// 默认套件：同样 11 份文档、同样断言，流式路径为逐字节 + 2 种随机切块。
 #[test]
+fn d21_documents_replay_on_sampled_paths() {
+    d21_replay(2);
+}
+
+/// 完整版：逐字节 + 16 种随机切块（debug 约 20 s）。
+#[test]
+#[ignore = "slow: d21 大文档 × 17 条流式路径（debug 约 20 s），需要跑 --ignored"]
 fn d21_documents_replay_on_all_paths() {
+    d21_replay(16);
+}
+
+fn d21_replay(schedules: u64) {
     let d = ParserConfig::default();
     let attlist = |n: usize, name: &dyn Fn(usize) -> String, v: &str| {
         let mut s = String::from("<!DOCTYPE r [");
@@ -1877,7 +1922,7 @@ fn d21_documents_replay_on_all_paths() {
         ),
     ];
     for (label, doc, c, ok) in cases {
-        let s = four_paths_counted(label, doc.as_bytes(), &c);
+        let s = four_paths_counted(label, doc.as_bytes(), &c, schedules);
         if ok {
             assert_eq!(s.1, Ok(()), "{label}：应通过");
         } else {
@@ -1900,13 +1945,13 @@ fn d21_documents_replay_on_all_paths() {
 }
 
 /// four_paths 的计数版（大文档不保存事件文本，只比较事件数和结尾）。
-fn four_paths_counted(label: &str, d: &[u8], c: &ParserConfig) -> (usize, End) {
+fn four_paths_counted(label: &str, d: &[u8], c: &ParserConfig, schedules: u64) -> (usize, End) {
     let mut r = Reader::from_bytes(d).with_config(c.clone());
     let base = count!(r);
     let mut r = Reader::from_vec(d.to_vec()).with_config(c.clone());
     assert_eq!(base, count!(r), "{label}：from_vec");
     let mut plans = vec![Plan::Byte];
-    plans.extend((0..16).map(|s| Plan::Schedule(seeded_schedule(s + 2000))));
+    plans.extend((0..schedules).map(|s| Plan::Schedule(seeded_schedule(s + 2000))));
     for plan in plans {
         let mut r = Reader::from_reader_with_config(Feed::new(d, plan.clone()), c.clone()).unwrap();
         assert_eq!(base, count!(r), "{label}：{plan:?}");
@@ -2568,14 +2613,26 @@ fn limit_docs() -> Vec<String> {
 
 /// max_token_len 和 max_total_input 谁先到、两者恰好相等：t、u = 1..=48 全组合。
 /// 先到的赢；落在同一字节时报 TotalInput（Lead 13:56 裁定 1）。
+///
+/// 默认套件只跑 |t-u| <= 3 的对角带加 t、u 取 1 或 48 的边；全组合在 #[ignore] 版里。
 #[test]
+fn token_vs_total_input_earlier_wins_near_ties() {
+    token_vs_total(|t, u| t.abs_diff(u) <= 3 || t == 1 || u == 1 || t == 48 || u == 48);
+}
+
+#[test]
+#[ignore = "slow: t、u 全组合 2304 × 22 份文档（debug 约 10 s），需要跑 --ignored"]
 fn token_vs_total_input_earlier_wins() {
+    token_vs_total(|_, _| true);
+}
+
+fn token_vs_total(keep: fn(u64, u64) -> bool) {
     let d = ParserConfig::default();
     let mut ties = 0;
     for doc in limit_docs() {
         let b = doc.as_bytes();
         for t in 1..=48u64 {
-            for u in 1..=48u64 {
+            for u in (1..=48u64).filter(|&u| keep(t, u)) {
                 let label = format!("tok={t} tot={u} {doc:?}");
                 ties += earlier_wins(
                     &label,
@@ -2591,8 +2648,20 @@ fn token_vs_total_input_earlier_wins() {
 }
 
 /// 内部子集和实体展开的限额与 token/total 上限组合：同样要求“更早的那个赢”、四条路径一致。
+///
+/// 默认套件：v 步长 10、t 步长 6；完整步长（5、3）在 #[ignore] 版里。
 #[test]
+fn subset_and_entity_limits_with_token_and_total_sampled() {
+    subset_and_entity(10, 6);
+}
+
+#[test]
+#[ignore = "slow: v 步长 5 × t 步长 3 全组合（debug 约 7 s），需要跑 --ignored"]
 fn subset_and_entity_limits_with_token_and_total() {
+    subset_and_entity(5, 3);
+}
+
+fn subset_and_entity(v_step: usize, t_step: usize) {
     let d = ParserConfig::default();
     let docs = [
         "<!DOCTYPE r [<!ENTITY a \"0123456789\"><!ENTITY b \"&a;&a;\"><!-- c --><?p d?>]><r>x&b;y&a;</r>".to_string(),
@@ -2615,8 +2684,8 @@ fn subset_and_entity_limits_with_token_and_total() {
     for doc in &docs {
         let b = doc.as_bytes();
         for (on, mk) in &others {
-            for v in (1..=96u64).step_by(5) {
-                for t in (1..=96u64).step_by(3) {
+            for v in (1..=96u64).step_by(v_step) {
+                for t in (1..=96u64).step_by(t_step) {
                     for (cn, cap) in [
                         ("tok", d.clone().with_max_token_len(t)),
                         ("tot", d.clone().with_max_total_input(t)),
