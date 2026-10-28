@@ -41,6 +41,19 @@ use crate::name::{
 /// building an arbitrarily deep model.
 const MODEL_DEPTH_CEILING: usize = 1024;
 
+/// Subset markup introducers. A still-matching prefix of one of these is not
+/// Syntax while an armed byte-cap sits inside it.
+const SUBSET_MARKUP: &[&[u8]] = &[
+    b"<!--",
+    b"<?",
+    b"<!ENTITY",
+    b"<!ELEMENT",
+    b"<!ATTLIST",
+    b"<!NOTATION",
+    b"<![INCLUDE[",
+    b"<![IGNORE[",
+];
+
 /// Streaming XML reader.
 ///
 /// Construct with [`Reader::from_bytes`], [`Reader::from_str`], or
@@ -1297,6 +1310,10 @@ impl Engine {
                 None => return Err(self.end_input(input, "unterminated internal subset")),
                 Some(_) => {}
             }
+            // Same cut as prolog markup: a keyword is not Syntax until the
+            // byte that proves the mismatch is in hand. If that byte is the
+            // armed cap, or past it, the cap wins.
+            self.breach_if_cut(input, SUBSET_MARKUP)?;
             if self.starts_with(input, b"<!--") {
                 let _ = self.parse_comment(input)?;
                 continue;
@@ -1345,18 +1362,9 @@ impl Engine {
     /// True when the bytes at the cursor are a proper prefix of subset markup.
     /// The window ended before the keyword could be recognized.
     fn subset_introducer_incomplete(&mut self, input: &[u8]) -> bool {
-        const INTROS: &[&[u8]] = &[
-            b"<!--",
-            b"<?",
-            b"<!ENTITY",
-            b"<!ELEMENT",
-            b"<!ATTLIST",
-            b"<!NOTATION",
-            b"<![",
-        ];
         let rest = self.current_bytes(input);
         !rest.is_empty()
-            && INTROS
+            && SUBSET_MARKUP
                 .iter()
                 .any(|intro| intro.starts_with(rest) && rest.len() < intro.len())
     }
@@ -1454,11 +1462,26 @@ impl Engine {
     }
 
     fn percent_starts_name(&mut self, input: &[u8]) -> Result<bool> {
+        if self.current_bytes(input).first().copied() != Some(b'%') {
+            return Ok(false);
+        }
+        // The next character tells a reference from a stray '%'. If that
+        // character contains the armed cap, the cap wins, same as a keyword
+        // whose proving byte is the cap.
+        let width = {
+            let rest = self.current_bytes(input);
+            match rest.get(1).copied() {
+                Some(0xC0..=0xDF) => 2,
+                Some(0xE0..=0xEF) => 3,
+                Some(0xF0..=0xF7) => 4,
+                _ => 1,
+            }
+        };
+        if self.cap_in_lookahead(input, 1 + width) {
+            return Err(self.land_and_breach(input));
+        }
         let decoded = {
             let rest = self.current_bytes(input);
-            if rest.first().copied() != Some(b'%') {
-                return Ok(false);
-            }
             if rest.len() < 2 {
                 return Ok(false);
             }
@@ -3443,6 +3466,16 @@ impl Engine {
         } else {
             Ok(())
         }
+    }
+
+    /// The next `needed` bytes include the armed cap, so a decision that
+    /// must read them would consume the forbidden byte.
+    fn cap_in_lookahead(&self, input: &[u8], needed: usize) -> bool {
+        if !self.frames.is_empty() || needed == 0 {
+            return false;
+        }
+        let cap = self.main_stop;
+        cap >= self.pos && cap < self.pos.saturating_add(needed) && cap < input.len()
     }
 
     /// Bytes strictly before the armed cap are a proper prefix of `pattern`,

@@ -1013,3 +1013,237 @@ fn d26_multibyte_crlf_and_unterminated_comment() {
     open.push_str(&"x".repeat(100_000));
     assert_text_limit(&open, 4, 5, open.find('x').unwrap());
 }
+
+fn assert_all_paths(label: &str, data: &[u8], cfg: &ParserConfig) -> Snap {
+    let base = snap_bytes(data, cfg.clone());
+    assert_eq!(
+        snap_vec(data.to_vec(), cfg.clone()),
+        base,
+        "{label} from_vec"
+    );
+    for chunk in [1usize, 2, 3, 7] {
+        assert_eq!(
+            snap_chunks(data, chunk, cfg.clone()),
+            base,
+            "{label} chunk {chunk}"
+        );
+    }
+    base
+}
+
+fn assert_byte_limit(label: &str, snap: &Snap, kind: LimitKind, limit: u64, offset: u64) {
+    let err = snap.err.as_ref().unwrap_or_else(|| panic!("{label}: ok"));
+    match err.kind {
+        ErrorKind::SecurityLimit {
+            kind: got,
+            limit: got_limit,
+            actual,
+        } => assert_eq!(
+            (got, got_limit, actual, err.offset),
+            (kind, limit, limit + 1, offset),
+            "{label} line {} col {}",
+            err.line,
+            err.column
+        ),
+        ref other => panic!("{label}: {other:?} @{}", err.offset),
+    }
+}
+
+/// D40: a subset keyword mismatch at or after an armed byte-cap is the cap,
+/// on every path. A mismatch strictly before the cap stays Syntax at `<`.
+#[test]
+fn d40_subset_keyword_mismatch_respects_armed_byte() {
+    const PRE: &str = "<!DOCTYPE r [";
+    let start = PRE.len();
+    let keywords: &[(&str, &str)] = &[
+        ("ELEMENT", "<!ELEMENT"),
+        ("ENTITY", "<!ENTITY"),
+        ("ATTLIST", "<!ATTLIST"),
+        ("NOTATION", "<!NOTATION"),
+        ("INCLUDE", "<![INCLUDE["),
+        ("IGNORE", "<![IGNORE["),
+        ("comment", "<!--"),
+        ("pi", "<?"),
+    ];
+    for (name, keyword) in keywords {
+        let mut broken = keyword.as_bytes().to_vec();
+        let at = broken.len() - 1;
+        broken[at] = if broken[at] == b'x' { b'y' } else { b'x' };
+        let doc = format!("{PRE}{}]><r/>", String::from_utf8(broken).unwrap());
+        let doc = doc.as_bytes();
+        let mismatch = start + at;
+        for (which, cap) in [
+            ("before", mismatch + 1),
+            ("at", mismatch),
+            ("after", mismatch - 1),
+        ] {
+            let token = ParserConfig::default()
+                .with_max_token_len(cap as u64)
+                .with_max_internal_subset_len((mismatch + 8) as u64);
+            let snap = assert_all_paths(&format!("{name} token {which}"), doc, &token);
+            if which == "before" {
+                let err = snap.err.as_ref().unwrap();
+                assert!(
+                    matches!(err.kind, ErrorKind::Syntax),
+                    "{name} token before: {:?}",
+                    err.kind
+                );
+                assert_eq!(err.offset, start as u64, "{name} token before");
+            } else {
+                assert_byte_limit(
+                    &format!("{name} token {which}"),
+                    &snap,
+                    LimitKind::TokenLength,
+                    cap as u64,
+                    cap as u64,
+                );
+            }
+            let subset_limit = (cap - start) as u64;
+            let subset = ParserConfig::default()
+                .with_max_internal_subset_len(subset_limit)
+                .with_max_token_len((mismatch + 8) as u64);
+            let snap = assert_all_paths(&format!("{name} subset {which}"), doc, &subset);
+            if which == "before" {
+                let err = snap.err.as_ref().unwrap();
+                assert!(
+                    matches!(err.kind, ErrorKind::Syntax),
+                    "{name} subset before: {:?}",
+                    err.kind
+                );
+                assert_eq!(err.offset, start as u64, "{name} subset before");
+            } else {
+                assert_byte_limit(
+                    &format!("{name} subset {which}"),
+                    &snap,
+                    LimitKind::InternalSubsetLength,
+                    subset_limit,
+                    cap as u64,
+                );
+            }
+        }
+    }
+
+    let tight = ParserConfig::default()
+        .with_max_token_len(48)
+        .with_max_internal_subset_len(40)
+        .with_max_text_len(12)
+        .with_max_name_len(6)
+        .with_max_total_input(512);
+    for (label, doc) in [
+        (
+            "min-9318",
+            &b"<!DOCTYPE r [\n<!ENTITY a \"\">\n<!ENTITY a \"\"><!NOTAt"[..],
+        ),
+        (
+            "min-f0f2",
+            &b"<!DOCTYPE r [<!ENTITY a \"\">\n<!ENTITY a \"\"><!NOTATt"[..],
+        ),
+    ] {
+        let snap = assert_all_paths(label, doc, &tight);
+        assert_byte_limit(label, &snap, LimitKind::TokenLength, 48, 48);
+    }
+}
+
+/// Sites that already used the prolog keyword cut, plus the subset closer
+/// and a parameter-entity reference, stay on the same rule.
+#[test]
+fn d40_other_markup_matches_the_armed_byte() {
+    // Prolog `<!DOCTYPE`, mismatch at the `P`.
+    let prolog = b"<!DOCTYx r>";
+    let mismatch = 7usize;
+    for (which, cap) in [("before", 8usize), ("at", 7usize), ("after", 6usize)] {
+        let cfg = ParserConfig::default().with_max_token_len(cap as u64);
+        let snap = assert_all_paths(&format!("prolog {which}"), prolog, &cfg);
+        if which == "before" {
+            let err = snap.err.unwrap();
+            assert!(matches!(err.kind, ErrorKind::Syntax), "{:?}", err.kind);
+            assert_eq!(err.offset, 0);
+        } else {
+            assert_byte_limit(
+                "prolog",
+                &snap,
+                LimitKind::TokenLength,
+                cap as u64,
+                cap as u64,
+            );
+        }
+        let _ = mismatch;
+    }
+
+    // Content `<![CDATA[`. Token starts at offset 3.
+    let cdata = b"<r><![CDATAx[</r>";
+    let origin = 3usize;
+    let mismatch = 11usize;
+    for (which, cap) in [("before", 12usize), ("at", 11usize), ("after", 10usize)] {
+        let cfg = ParserConfig::default().with_max_token_len((cap - origin) as u64);
+        let snap = assert_all_paths(&format!("cdata {which}"), cdata, &cfg);
+        if which == "before" {
+            let err = snap.err.unwrap();
+            assert!(matches!(err.kind, ErrorKind::Syntax), "{:?}", err.kind);
+            assert_eq!(err.offset, origin as u64);
+        } else {
+            assert_byte_limit(
+                "cdata",
+                &snap,
+                LimitKind::TokenLength,
+                (cap - origin) as u64,
+                cap as u64,
+            );
+        }
+        let _ = mismatch;
+    }
+
+    // Parameter-entity reference. `%` is the first subset byte.
+    let pe = b"<!DOCTYPE r [%a]>";
+    let pct = b"<!DOCTYPE r [".len();
+    let name = pct + 1;
+    for (which, cap) in [("before", name + 1), ("at", name), ("after", pct)] {
+        let cfg = ParserConfig::default()
+            .with_max_token_len(cap as u64)
+            .with_max_internal_subset_len((cap - pct) as u64);
+        let snap = assert_all_paths(&format!("pe {which}"), pe, &cfg);
+        if which == "before" {
+            let err = snap.err.unwrap();
+            assert!(
+                matches!(err.kind, ErrorKind::ExternalEntityForbidden),
+                "{:?}",
+                err.kind
+            );
+            assert_eq!(err.offset, pct as u64);
+        } else if cap == pct {
+            assert_byte_limit(
+                "pe token",
+                &snap,
+                LimitKind::TokenLength,
+                cap as u64,
+                cap as u64,
+            );
+        } else {
+            // The name byte is inside the subset, and it is also a token byte.
+            // The earlier cap is the one under test; here both sit on `name`
+            // only when cap == name. Token origin is 0, so TokenLength's
+            // offset is `cap`. Subset starts at `pct`, so its offset is `cap`
+            // too when the subset limit equals `cap - pct`. They tie on the
+            // same byte: TotalInput is unset, TokenLength outranks subset.
+            assert_byte_limit("pe", &snap, LimitKind::TokenLength, cap as u64, cap as u64);
+        }
+    }
+
+    // `]>` closer. The byte after `]` is the cap.
+    let closer = b"<!DOCTYPE r []X>";
+    let bad = closer.len() - 2; // `X`
+    let cfg = ParserConfig::default().with_max_token_len(bad as u64);
+    let snap = assert_all_paths("closer at cap", closer, &cfg);
+    assert_byte_limit(
+        "closer",
+        &snap,
+        LimitKind::TokenLength,
+        bad as u64,
+        bad as u64,
+    );
+    let later = ParserConfig::default().with_max_token_len((bad + 1) as u64);
+    let snap = assert_all_paths("closer before cap", closer, &later);
+    let err = snap.err.unwrap();
+    assert!(matches!(err.kind, ErrorKind::Syntax), "{:?}", err.kind);
+    assert_eq!(err.offset, bad as u64);
+}
