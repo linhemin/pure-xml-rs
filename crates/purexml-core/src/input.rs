@@ -569,12 +569,21 @@ impl Framer {
     }
 
     /// BOM / UTF-16 sniff. `Some` means `poll` should return immediately.
-    fn prepare_document(&mut self, buf: &[u8], eof: bool, _config: &ParserConfig) -> Option<Poll> {
+    fn prepare_document(&mut self, buf: &[u8], eof: bool, config: &ParserConfig) -> Option<Poll> {
         if self.bom_done {
             return None;
         }
         let have = buf.len().saturating_sub(self.anchor);
         if have < 4 && !eof {
+            // The sniff needs 4 bytes. If TotalInput cuts that read short, the
+            // cap byte is already buffered: hand it to the engine instead of
+            // waiting. The engine reports the limit through decide_limit.
+            let cap = usize::try_from(config.max_total_input).unwrap_or(usize::MAX);
+            if cap < self.anchor.saturating_add(4) && cap < buf.len() {
+                return Some(Poll::Probe {
+                    end: cap.saturating_add(1),
+                });
+            }
             return Some(Poll::NeedMore);
         }
         self.bom_done = true;

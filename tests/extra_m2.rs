@@ -273,6 +273,11 @@ fn snap_bytes(data: &[u8], config: ParserConfig) -> Snap {
     snap_of!(reader)
 }
 
+fn snap_vec(data: Vec<u8>, config: ParserConfig) -> Snap {
+    let mut reader = Reader::from_vec(data).with_config(config);
+    snap_of!(reader)
+}
+
 fn snap_chunks(data: &[u8], chunk: usize, config: ParserConfig) -> Snap {
     let mut reader = Reader::from_reader(Chunks {
         data,
@@ -542,7 +547,8 @@ fn name_length_points_just_after_the_offending_character() {
         Some((err.line, err.column, err.offset))
     );
 
-    // A leading newline is part of the token. Cap 1 fails on `<`, line 2.
+    // Prolog whitespace is not part of the token. `\n<root/>` starts the
+    // token at `<` (offset 1). Cap 1 fails on `r`: line 2, column 2, offset 2.
     let broken = b"\n<root/>";
     let token = ParserConfig {
         max_token_len: 1,
@@ -557,12 +563,79 @@ fn name_length_points_just_after_the_offending_character() {
             actual: 2,
         }
     ));
-    assert_eq!((err.line, err.column, err.offset), (2, 1, 1));
+    assert_eq!((err.line, err.column, err.offset), (2, 2, 2));
     let streamed = snap_chunks(broken, 1, token);
     assert_eq!(
         streamed.err.as_ref().map(|e| (e.line, e.column, e.offset)),
-        Some((2, 1, 1))
+        Some((2, 2, 2))
     );
+}
+
+/// A UTF-8 BOM occupies no column. Offsets 0–2 (inside the BOM) and offset 3
+/// (the first byte after it) are line 1, column 1. The offset stays the raw
+/// byte index. A total-input cap inside the 4-byte BOM sniff is TotalInput
+/// on every path.
+#[test]
+fn bom_columns_and_total_input_agree_across_paths() {
+    let mut doc = vec![0xEF, 0xBB, 0xBF];
+    doc.extend_from_slice(b"<r/>");
+    for limit in [0u64, 1, 2, 3] {
+        let cfg = ParserConfig {
+            max_total_input: limit,
+            ..ParserConfig::default()
+        };
+        let want = ErrSnap {
+            kind: ErrorKind::SecurityLimit {
+                kind: LimitKind::TotalInput,
+                limit,
+                actual: limit + 1,
+            },
+            line: 1,
+            column: 1,
+            offset: limit,
+        };
+        let label = format!("BOM tot={limit}");
+        assert_eq!(
+            snap_bytes(&doc, cfg.clone()).err.as_ref(),
+            Some(&want),
+            "{label} from_bytes"
+        );
+        assert_eq!(
+            snap_vec(doc.clone(), cfg.clone()).err.as_ref(),
+            Some(&want),
+            "{label} from_vec"
+        );
+        for chunk in [1usize, 2, 3, 4, 7] {
+            assert_eq!(
+                snap_chunks(&doc, chunk, cfg.clone()).err.as_ref(),
+                Some(&want),
+                "{label} chunk {chunk}"
+            );
+        }
+    }
+
+    // The first byte after the BOM is column 1, even when it is a syntax error.
+    let mut junk = vec![0xEF, 0xBB, 0xBF];
+    junk.push(b'x');
+    let cfg = ParserConfig::default();
+    let want = ErrSnap {
+        kind: ErrorKind::Syntax,
+        line: 1,
+        column: 1,
+        offset: 3,
+    };
+    assert_eq!(snap_bytes(&junk, cfg.clone()).err.as_ref(), Some(&want));
+    assert_eq!(
+        snap_vec(junk.clone(), cfg.clone()).err.as_ref(),
+        Some(&want)
+    );
+    for chunk in [1usize, 3, 4] {
+        assert_eq!(
+            snap_chunks(&junk, chunk, cfg.clone()).err.as_ref(),
+            Some(&want),
+            "syntax after BOM chunk {chunk}"
+        );
+    }
 }
 
 #[test]

@@ -984,13 +984,11 @@ impl Engine {
     }
 
     fn consume_bom(&mut self, input: &[u8]) -> Result<()> {
+        // The sniff reads 4 bytes. A total-input cap inside that window is
+        // reported on the cap byte, before any Syntax decision. The BOM
+        // occupies no column, so offsets 0..=3 stay on line 1, column 1.
+        self.total_cuts_bom_sniff(input)?;
         if input.starts_with(&[0xEF, 0xBB, 0xBF]) {
-            // The BOM is not a token byte. A cap that falls inside it is
-            // TotalInput, at that raw offset. Column stays put.
-            if self.total_stop < 3 && self.total_stop < input.len() {
-                self.pos = self.total_stop;
-                return Err(self.breach_at_cursor(input));
-            }
             self.pos = 3;
             return Ok(());
         }
@@ -3310,6 +3308,27 @@ impl Engine {
             self.advance_one(input)?;
         }
         Ok(())
+    }
+
+    /// UTF-8 BOM sniff. A cap before the 4th byte wins, through [`decide_limit`].
+    ///
+    /// `pos` lands on the offending byte. Columns do not move: a BOM byte
+    /// never advances the column, and the first byte after it is column 1.
+    fn total_cuts_bom_sniff(&mut self, input: &[u8]) -> Result<()> {
+        const SNIFF: usize = 4;
+        const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+        if self.total_stop >= SNIFF || self.total_stop >= input.len() {
+            return Ok(());
+        }
+        let have = input.len().min(BOM.len());
+        if have == 0 || !BOM.starts_with(&input[..have]) {
+            return Ok(());
+        }
+        self.pos = self.total_stop;
+        self.line = 1;
+        self.column = 1;
+        self.cr_pending = false;
+        Err(self.breach_at_cursor(input))
     }
 
     /// Drop the token cap while a BOM or prolog/epilog whitespace is ahead.
