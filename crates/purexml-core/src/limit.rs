@@ -56,6 +56,12 @@ pub struct LimitFacts<'a> {
     /// A counter that has already overflowed, if this call is not only a
     /// byte-cap check.
     pub measured: Option<MeasuredLimit>,
+    /// Absolute offset of the byte that proves a UTF-8 sequence is illegal.
+    ///
+    /// That byte can be a continuation, not the lead. A byte cap at or before
+    /// it wins, because the encoding decision would have to read the cap.
+    /// `None` when this call is not an encoding decision.
+    pub encoding_needed: Option<u64>,
 }
 
 /// The limit that was actually exceeded.
@@ -107,8 +113,20 @@ pub fn decide_limit(facts: &LimitFacts<'_>) -> Option<LimitDecision> {
     };
 
     if let Some(origin) = facts.token_origin {
+        // A cap is in play when the cursor has reached it, or when an
+        // encoding proof would have to read it (`at` <= the proving byte)
+        // and the cursor is still on or before that cap.
+        let in_play = |at: u64| {
+            if facts.cursor >= at {
+                return true;
+            }
+            match facts.encoding_needed {
+                Some(needed) => facts.cursor <= at && at <= needed,
+                None => false,
+            }
+        };
         let total = facts.config.max_total_input;
-        if facts.cursor >= total {
+        if in_play(total) {
             consider(Candidate {
                 kind: LimitKind::TotalInput,
                 limit: total,
@@ -118,7 +136,7 @@ pub fn decide_limit(facts: &LimitFacts<'_>) -> Option<LimitDecision> {
             });
         }
         let token_at = origin.saturating_add(facts.config.max_token_len);
-        if facts.cursor >= token_at {
+        if in_play(token_at) {
             let limit = facts.config.max_token_len;
             consider(Candidate {
                 kind: LimitKind::TokenLength,
@@ -130,7 +148,7 @@ pub fn decide_limit(facts: &LimitFacts<'_>) -> Option<LimitDecision> {
         }
         if let Some(start) = facts.subset_start {
             let at = start.saturating_add(facts.config.max_internal_subset_len);
-            if facts.cursor >= at {
+            if in_play(at) {
                 let limit = facts.config.max_internal_subset_len;
                 consider(Candidate {
                     kind: LimitKind::InternalSubsetLength,
@@ -176,6 +194,7 @@ mod tests {
             token_origin: Some(0),
             subset_start: None,
             measured: None,
+            encoding_needed: None,
         }
     }
 
@@ -262,5 +281,30 @@ mod tests {
         let token = cfg().with_max_token_len(44);
         let view = facts(&token, 44);
         assert_eq!(decide_limit(&view).unwrap().kind, LimitKind::TokenLength);
+    }
+
+    #[test]
+    fn encoding_proof_past_the_token_cap_is_token_length() {
+        // 0xF2 at 64 is still a legal 4-byte lead. Byte 67 (0x02) is what
+        // proves the sequence illegal. The token cap at 66 is read first.
+        let config = cfg().with_max_token_len(48);
+        let mut view = facts(&config, 64);
+        view.token_origin = Some(18);
+        view.subset_start = Some(32);
+        view.encoding_needed = Some(67);
+        let got = decide_limit(&view).unwrap();
+        assert_eq!(
+            (got.kind, got.limit, got.actual, got.offset),
+            (LimitKind::TokenLength, 48, 49, 66)
+        );
+    }
+
+    #[test]
+    fn encoding_proof_before_the_cap_is_not_a_limit() {
+        let config = cfg().with_max_token_len(48);
+        let mut view = facts(&config, 64);
+        view.token_origin = Some(18);
+        view.encoding_needed = Some(64);
+        assert!(decide_limit(&view).is_none());
     }
 }

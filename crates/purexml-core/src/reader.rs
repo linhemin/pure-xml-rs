@@ -31,7 +31,7 @@ use crate::input::{Framer, IoInput, Poll};
 use crate::limit::{decide_limit, LimitFacts, MeasuredLimit};
 use crate::name::{
     decode_utf8, is_name_char, is_name_start, is_ncname_char, is_ncname_start, is_pubid_char,
-    is_whitespace, is_xml_char,
+    is_whitespace, is_xml_char, utf8_invalid_index,
 };
 
 /// Hard cap on ELEMENT content-model nesting, applied together with `max_depth`.
@@ -745,6 +745,31 @@ impl Engine {
         Error::new(ErrorKind::Encoding, self.err_pos(), message)
     }
 
+    /// Malformed UTF-8 at `lead`. `proven_index` is the byte, relative to the
+    /// lead, that shows the sequence is illegal.
+    ///
+    /// [`decide_limit`] sees that proving offset. A byte cap at or before it
+    /// wins and is reported on the cap byte. Otherwise the error stays
+    /// [`ErrorKind::Encoding`] on the lead.
+    #[cold]
+    #[inline(never)]
+    fn utf8_against_limit(&self, input: &[u8], lead: u64, proven_index: usize) -> Error {
+        let needed = lead.saturating_add(proven_index as u64);
+        let mut facts = self.limit_facts(None);
+        facts.cursor = lead;
+        facts.encoding_needed = Some(needed);
+        if let Some(decision) = decide_limit(&facts) {
+            return self.error_from_decision(input, decision, self.pos_now());
+        }
+        let at = if self.base + self.pos as u64 == lead {
+            self.pos_now()
+        } else {
+            let index = lead.saturating_sub(self.token_origin.offset);
+            self.position_on_token_byte(input, index)
+        };
+        Error::new(ErrorKind::Encoding, at, "malformed UTF-8")
+    }
+
     /// [`decide_limit`] at the cursor. Used when the window slice is not in hand.
     /// The cursor is the offending byte, so the reported position is `pos_now`.
     #[cold]
@@ -834,6 +859,7 @@ impl Engine {
                 None
             },
             measured,
+            encoding_needed: None,
         }
     }
 
@@ -1412,7 +1438,15 @@ impl Engine {
         };
         match decoded {
             Ok((ch, _)) => Ok(is_name_start(ch)),
-            Err(()) => Err(self.encoding("malformed UTF-8")),
+            Err(()) => {
+                let rest = self.current_bytes(input);
+                if let Some(proven) = utf8_invalid_index(&rest[1..]) {
+                    let lead = self.base + self.pos as u64 + 1;
+                    Err(self.utf8_against_limit(input, lead, proven))
+                } else {
+                    Err(self.encoding("malformed UTF-8"))
+                }
+            }
         }
     }
 
@@ -2453,6 +2487,10 @@ impl Engine {
                         i += n;
                     }
                     Err(()) => {
+                        if let Some(proven) = utf8_invalid_index(&bytes[i..]) {
+                            let lead = self.base + (start + i) as u64;
+                            return Err(self.utf8_against_limit(input, lead, proven));
+                        }
                         let at = start + i;
                         let width = match bytes.get(i).copied() {
                             Some(0xC0..=0xDF) => 2,
@@ -3073,6 +3111,9 @@ impl Engine {
                     } else {
                         Err(self.end_input(input, "unexpected end of input"))
                     }
+                } else if let Some(proven) = utf8_invalid_index(slice) {
+                    let lead = self.base + self.pos as u64;
+                    Err(self.utf8_against_limit(input, lead, proven))
                 } else {
                     Err(self.encoding("malformed UTF-8"))
                 }
@@ -3106,6 +3147,9 @@ impl Engine {
                     } else {
                         Err(self.end_input(input, "unexpected end of input"))
                     }
+                } else if let Some(proven) = utf8_invalid_index(slice) {
+                    let lead = self.base + self.pos as u64;
+                    Err(self.utf8_against_limit(input, lead, proven))
                 } else {
                     Err(self.encoding("malformed UTF-8"))
                 }
