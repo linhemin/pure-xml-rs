@@ -197,17 +197,17 @@ impl<R: BufRead> Reader<IoInput<R>> {
             } else {
                 false
             };
-            let start_pos = self.engine.pos;
             let raw = {
                 let window = self.input.window();
                 self.engine.next_raw(window)
             };
             if self.engine.need_frame {
-                // An empty expansion produced no event, so the engine is now
-                // sitting on the next main-input token. Frame that token and
-                // continue. Do not rewind: the expansion was already counted.
+                // An empty expansion, or a prolog/epilog whitespace run that
+                // filled the window, produced no event. Frame from the cursor
+                // and continue. Do not rewind: bytes already read stay read.
                 self.engine.need_frame = false;
                 let sig = (
+                    self.engine.base,
                     self.engine.pos,
                     self.input.buffered_len(),
                     self.input.saw_eof(),
@@ -219,8 +219,13 @@ impl<R: BufRead> Reader<IoInput<R>> {
                 continue;
             }
             let raw = raw?;
-            if probing && self.engine.frames.is_empty() {
-                let consumed = self.engine.pos.saturating_sub(start_pos) as u64;
+            if probing && self.engine.frames.is_empty() && self.engine.token_started {
+                let origin = self
+                    .engine
+                    .token_origin
+                    .offset
+                    .saturating_sub(self.engine.base) as usize;
+                let consumed = self.engine.pos.saturating_sub(origin) as u64;
                 if consumed > self.engine.config.max_token_len {
                     return Err(self.engine.token_limit(self.input.window()));
                 }
@@ -500,7 +505,14 @@ struct Engine {
     /// Window index of the first internal-subset byte, after `[`.
     subset_start: Option<usize>,
     /// Position of the top-level token currently being parsed.
+    ///
+    /// Set in [`Self::begin_token`] on the first byte of the token. A UTF-8
+    /// BOM and prolog or epilog whitespace are consumed first and are not
+    /// part of this offset. Content whitespace is the text token, so it is.
     token_origin: Position,
+    /// `false` while a BOM or prolog/epilog whitespace is still ahead of the
+    /// token. Total input still applies; the token cap does not.
+    token_started: bool,
     /// `cr_pending` at `token_origin`, so a later byte position can be scanned.
     token_cr: bool,
     /// Main-input index where the current `next_raw` started parsing.
@@ -566,6 +578,7 @@ impl Engine {
             end_is_eof: true,
             subset_start: None,
             token_origin: Position::start(),
+            token_started: false,
             token_cr: false,
             frame_anchor: 0,
             need_frame: false,
@@ -849,10 +862,20 @@ impl Engine {
 
     fn limit_facts(&self, measured: Option<MeasuredLimit>) -> LimitFacts<'_> {
         let on_main = self.frames.is_empty();
+        // Before the token starts, keep a token origin so TotalInput is still
+        // decided here, but put the token cap out of reach. The real origin is
+        // the first token byte, after the BOM and prolog/epilog whitespace.
+        let token_origin = if !on_main {
+            None
+        } else if self.token_started {
+            Some(self.token_origin.offset)
+        } else {
+            Some(u64::MAX)
+        };
         LimitFacts {
             config: &self.config,
             cursor: self.base + self.pos as u64,
-            token_origin: on_main.then_some(self.token_origin.offset),
+            token_origin,
             subset_start: if on_main {
                 self.subset_start.map(|start| self.base + start as u64)
             } else {
@@ -924,9 +947,9 @@ impl Engine {
     fn next_raw(&mut self, input: &[u8]) -> Result<Option<RawEvent>> {
         self.window_len = input.len();
         if self.frames.is_empty() {
-            self.token_origin = self.pos_now();
-            self.token_cr = self.cr_pending;
-            self.arm_main_limits();
+            // The token cap starts at the first token byte, not at a BOM or
+            // at prolog/epilog whitespace. TotalInput stays armed.
+            self.suspend_token_limit();
         }
         if let Some(err) = self.boundary_error.take() {
             return Err(err);
@@ -935,15 +958,15 @@ impl Engine {
         if self.frames.is_empty() {
             self.frame_anchor = self.pos;
         }
-        // The byte at offset `max_total_input` is needed as soon as a token
-        // starts on it, including when the epilog only peeks at it.
-        if self.frames.is_empty() && self.pos >= self.total_stop && self.pos < input.len() {
-            return Err(self.breach_at_cursor(input));
-        }
         let result = match self.phase {
             Phase::Done => Ok(None),
             Phase::Prolog => self.next_prolog(input).map(Some),
-            Phase::Content => self.next_content(input).map(Some),
+            Phase::Content => {
+                if self.frames.is_empty() {
+                    self.begin_token(input)?;
+                }
+                self.next_content(input).map(Some)
+            }
             Phase::Epilog => self.next_epilog(input),
         };
         if let Some(err) = self.boundary_error.take() {
@@ -962,10 +985,13 @@ impl Engine {
 
     fn consume_bom(&mut self, input: &[u8]) -> Result<()> {
         if input.starts_with(&[0xEF, 0xBB, 0xBF]) {
-            self.pos = 3;
-            if self.pos > self.token_stop {
-                return Err(self.token_limit(input));
+            // The BOM is not a token byte. A cap that falls inside it is
+            // TotalInput, at that raw offset. Column stays put.
+            if self.total_stop < 3 && self.total_stop < input.len() {
+                self.pos = self.total_stop;
+                return Err(self.breach_at_cursor(input));
             }
+            self.pos = 3;
             return Ok(());
         }
         if input.starts_with(&[0xFE, 0xFF])
@@ -987,10 +1013,12 @@ impl Engine {
         if self.at_document_start {
             self.at_document_start = false;
             if self.looks_like_xml_decl(input) {
+                self.begin_token(input)?;
                 return self.parse_xml_decl(input);
             }
         }
-        self.skip_ws(input)?;
+        self.skip_misc(input)?;
+        self.begin_token(input)?;
         match self.peek_byte(input) {
             None => Err(self.end_input(input, "document has no root element")),
             Some(b'<') => self.parse_prolog_markup(input),
@@ -1022,7 +1050,7 @@ impl Engine {
     }
 
     fn next_epilog(&mut self, input: &[u8]) -> Result<Option<RawEvent>> {
-        self.skip_ws(input)?;
+        self.skip_misc(input)?;
         if self.peek_byte(input).is_none() && self.frames.is_empty() {
             if !self.end_is_eof {
                 return Err(self.end_input(input, "unexpected end of input in the epilog"));
@@ -1030,6 +1058,7 @@ impl Engine {
             self.phase = Phase::Done;
             return Ok(None);
         }
+        self.begin_token(input)?;
         self.breach_if_cut(input, &[b"<!--", b"<?"])?;
         if self.starts_with(input, b"<!--") {
             return Ok(Some(RawEvent::Comment(self.parse_comment(input)?)));
@@ -1045,9 +1074,10 @@ impl Engine {
         loop {
             // Empty text (an entity that expands to nothing) does not produce
             // an event, so this loop steps onto the next main-input token.
-            // Token start is recorded only in `next_raw`. Ask for a new frame
-            // so the next token is not counted as part of this one, and so a
-            // streaming window is not read as a one-byte lookahead.
+            // Token start is recorded in `begin_token` on the next `next_raw`.
+            // Ask for a new frame so the next token is not counted as part of
+            // this one, and so a streaming window is not read as a one-byte
+            // lookahead.
             if self.frames.is_empty() && self.pos != self.frame_anchor {
                 self.need_frame = true;
                 return Err(self.syntax("reframing"));
@@ -3282,6 +3312,54 @@ impl Engine {
         Ok(())
     }
 
+    /// Drop the token cap while a BOM or prolog/epilog whitespace is ahead.
+    ///
+    /// [`Self::main_stop`] stays on the total-input cap, so those bytes are
+    /// still one compare on the hot path. [`Self::begin_token`] puts the
+    /// token cap back on the first byte of the token.
+    fn suspend_token_limit(&mut self) {
+        self.token_started = false;
+        self.token_stop = usize::MAX;
+        self.total_stop = self.total_stop_index();
+        self.rearm_main_stop();
+    }
+
+    /// The next byte is the first byte of a top-level token.
+    ///
+    /// A token that starts on the total-input cap reports that cap before
+    /// any markup is peeked.
+    fn begin_token(&mut self, input: &[u8]) -> Result<()> {
+        self.token_started = true;
+        self.token_origin = self.pos_now();
+        self.token_cr = self.cr_pending;
+        self.arm_main_limits();
+        if self.frames.is_empty() && self.pos >= self.total_stop && self.pos < input.len() {
+            return Err(self.breach_at_cursor(input));
+        }
+        Ok(())
+    }
+
+    /// Prolog/epilog `S`. Not part of the following token.
+    ///
+    /// A non-eof window that ends inside the run asks for another frame so
+    /// the streaming reader can discard the prefix and keep reading.
+    fn skip_misc(&mut self, input: &[u8]) -> Result<()> {
+        self.skip_ws(input)?;
+        if self.peek_byte(input).is_none() && !self.end_is_eof && self.frames.is_empty() {
+            self.need_frame = true;
+            return Err(self.syntax("reframing"));
+        }
+        Ok(())
+    }
+
+    fn total_stop_index(&self) -> usize {
+        if self.config.max_total_input <= self.base {
+            0
+        } else {
+            u64_as_index(self.config.max_total_input - self.base)
+        }
+    }
+
     /// Recompute the main-input cursor ceiling from `token_origin`.
     ///
     /// One compare against [`Self::main_stop`] replaces a per-byte
@@ -3292,13 +3370,8 @@ impl Engine {
         let origin = self.token_origin.offset.saturating_sub(self.base);
         let token_room = u64_as_index(self.config.max_token_len);
         let token_stop = u64_as_index(origin).saturating_add(token_room);
-        let total_stop = if self.config.max_total_input <= self.base {
-            0
-        } else {
-            u64_as_index(self.config.max_total_input - self.base)
-        };
         self.token_stop = token_stop;
-        self.total_stop = total_stop;
+        self.total_stop = self.total_stop_index();
         self.rearm_main_stop();
     }
 

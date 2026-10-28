@@ -17,8 +17,13 @@ pub const DEFAULT_MAX_TEXT_LEN: u64 = 16 * 1024 * 1024;
 /// Maximum original input size, in bytes.
 pub const DEFAULT_MAX_TOTAL_INPUT: u64 = 1024 * 1024 * 1024;
 
-/// Maximum raw byte length of one top-level token, including its leading
-/// whitespace and its terminator, and excluding the one-byte lookahead.
+/// Maximum raw byte length of one top-level token, from its first byte
+/// through its terminator, and excluding the one-byte lookahead.
+///
+/// A UTF-8 BOM and prolog or epilog whitespace are already consumed before
+/// the token. They count toward [`DEFAULT_MAX_TOTAL_INPUT`], not toward this
+/// cap. Whitespace inside content is a text token and does count. Offsets
+/// stay raw byte offsets; the BOM does not advance the column.
 ///
 /// Checked on both [`crate::Reader::from_bytes`] and [`crate::Reader::from_reader`].
 /// A value smaller than [`DEFAULT_MAX_TEXT_LEN`] makes a long text node fail

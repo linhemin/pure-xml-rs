@@ -360,13 +360,21 @@ impl Framer {
                         }
                         continue;
                     }
-                    if let Err(done) = self.consider(buf, eof, config.max_token_len) {
-                        return done;
+                    // Prolog/epilog S is not part of the next token. Do not
+                    // charge it to `max_token_len`. The anchor moves to the
+                    // first byte that is.
+                    if self.i >= buf.len() {
+                        return if eof {
+                            Poll::Ready { eof }
+                        } else {
+                            Poll::NeedMore
+                        };
                     }
                     if is_whitespace(buf[self.i]) {
                         self.i += 1;
                         continue;
                     }
+                    self.anchor = self.i;
                     if buf[self.i] == b'<' {
                         self.i += 1;
                         self.state = State::Lt { at: self.i - 1 };
@@ -556,7 +564,7 @@ impl Framer {
     }
 
     /// BOM / UTF-16 sniff. `Some` means `poll` should return immediately.
-    fn prepare_document(&mut self, buf: &[u8], eof: bool, config: &ParserConfig) -> Option<Poll> {
+    fn prepare_document(&mut self, buf: &[u8], eof: bool, _config: &ParserConfig) -> Option<Poll> {
         if self.bom_done {
             return None;
         }
@@ -567,13 +575,11 @@ impl Framer {
         self.bom_done = true;
         let prefix = &buf[self.anchor..];
         if prefix.starts_with(UTF8_BOM) {
-            if 3 > config.max_token_len {
-                let end = self.anchor + (config.max_token_len as usize) + 1;
-                if end <= buf.len() {
-                    return Some(Poll::Probe { end });
-                }
-            }
+            // The BOM is already consumed. The token, and its cap, start
+            // after these three bytes. The bytes still sit in the window so
+            // the engine can count them toward TotalInput.
             self.i = self.anchor + 3;
+            self.anchor = self.i;
             return None;
         }
         if rejected_bom(prefix) {

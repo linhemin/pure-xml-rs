@@ -94,8 +94,9 @@ pub enum LimitKind {
     /// is the cursor just after that character. `limit` is
     /// `ParserConfig::max_text_len`.
     AttrValueLength,
-    /// Raw byte length of one top-level token (leading whitespace through the
-    /// terminator, not the lookahead byte). `actual` is `limit + 1`. The
+    /// Raw byte length of one top-level token, from its first byte through the
+    /// terminator, not the lookahead byte. A UTF-8 BOM and prolog or epilog
+    /// whitespace are not part of the token. `actual` is `limit + 1`. The
     /// position is the offending byte itself, `limit` bytes from the start of
     /// the token, and does not depend on chunk size. Checked on both the slice
     /// and the streaming reader.
