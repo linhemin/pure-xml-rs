@@ -2326,7 +2326,19 @@ fn d34_prefixed_qname_counts_the_whole_name() {
         9,
         10,
     );
-    pass("D34 abc:defg = 8", b"<abc:defg xmlns:abc=\"u\"/>", &c8);
+    // 元素名 a:bcdefg 刚好 8 字符，属性名 xmlns:a 7 字符：通过。
+    pass("D34 a:bcdefg = 8", b"<a:bcdefg xmlns:a=\"u\"/>", &c8);
+    // 元素名 abc:defg 是 8 字符，但属性名 xmlns:abc 是 9 字符：按整个 QName 计长，
+    // 在属性名的第 9 个字符之后报 NameLength 8/9 @19。
+    fail(
+        "D34 abc:defg 的属性名 xmlns:abc = 9",
+        b"<abc:defg xmlns:abc=\"u\"/>",
+        &c8,
+        LimitKind::NameLength,
+        8,
+        9,
+        19,
+    );
     let (p, l) = ("p".repeat(600), "l".repeat(600));
     let d = format!("<{p}:{l} xmlns:{p}=\"u\"/>");
     fail(
@@ -2505,17 +2517,170 @@ fn err_offset(s: &Snap) -> u64 {
     }
 }
 
-/// 按字节计的限额：position 就是需要的那个字节；按字符计的：position 在字符之后，需要的是前一个字节。
-/// 实体类限额（ExpandedBytes 等）的检测字节和 position 不同（O-1），返回 None。
-fn needed_byte(kind: LimitKind, offset: u64) -> Option<u64> {
+/// 判定一个限额错误“需要读到的那个字节”（Lead 13:56 L0）：
+/// - 按字节计的限额：position 就是需要的那个字节；
+/// - 按字符计的限额：position 在越界字符之后，需要的是前一个字节；
+///   但如果越界字符来自一般实体引用 `&name;` 的展开，position 报在引用起始的 `&`，
+///   而判定要读到引用末尾的 `;`，需要的字节是 `;` 的偏移。
+///   `d[offset] == '&'` 时也可能是 `&` 前一个普通字符越界（position 同样落在 `&`），
+///   所以不能只看 `&`：用只含前缀 `d[..offset]` 的对照解析区分——前一个字符越界时，
+///   前缀解析在同一位置报同一个限额（kind、limit、actual 都相同）；越界来自展开时，
+///   前缀里没有这个引用，不会在该位置报该限额。两者都不像时直接失败，不退化成“二者之一”。
+///   字符引用 `&#..;` 的 position 在 `;` 之后，仍是 offset - 1。
+/// - 实体类限额（ExpandedBytes 等）的检测字节和 position 不同（O-1），返回 None。
+fn needed_byte(label: &str, d: &[u8], c: &ParserConfig, s: &Snap) -> Option<u64> {
+    let Err((
+        ErrorKind::SecurityLimit {
+            kind,
+            limit,
+            actual,
+        },
+        p,
+    )) = &s.end
+    else {
+        return None;
+    };
+    let offset = p.offset;
     match kind {
         LimitKind::TotalInput | LimitKind::TokenLength | LimitKind::InternalSubsetLength => {
             Some(offset)
         }
         LimitKind::TextLength | LimitKind::AttrValueLength | LimitKind::NameLength => {
-            Some(offset.saturating_sub(1))
+            let o = offset as usize;
+            let general_ref = d.get(o) == Some(&b'&') && d.get(o + 1) != Some(&b'#');
+            if !general_ref {
+                return Some(offset.saturating_sub(1));
+            }
+            let semi = o + d[o..]
+                .iter()
+                .position(|&b| b == b';')
+                .unwrap_or_else(|| panic!("{label}：offset {o} 处的 `&` 之后没有 `;`"));
+            let prefix = bytes(&d[..o], c);
+            match &prefix.end {
+                Err((
+                    ErrorKind::SecurityLimit {
+                        kind: k,
+                        limit: l,
+                        actual: a,
+                    },
+                    q,
+                )) if k == kind && q.offset == offset => {
+                    assert_eq!(
+                        (l, a),
+                        (limit, actual),
+                        "{label}：前缀对照在同一位置报 {k:?}，但 limit/actual 不同，无法判定"
+                    );
+                    Some(offset - 1)
+                }
+                Err((ErrorKind::SecurityLimit { kind: k, .. }, q))
+                    if q.offset >= offset && !(k == kind && q.offset == offset) =>
+                {
+                    panic!(
+                        "{label}：前缀对照在 offset {} 报 {k:?}，越过了截断点 {offset}，无法判定",
+                        q.offset
+                    )
+                }
+                _ => Some(semi as u64),
+            }
         }
         _ => None,
+    }
+}
+
+/// `needed_byte` 本身的对照：`&` 处报的按字符计限额，区分“越界字符来自展开”（需要 `;`）
+/// 和“`&` 前一个普通字符越界”（需要 `&` 前一个字节）；字符引用仍是 offset - 1。
+#[test]
+fn needed_byte_tells_expansion_from_plain_char() {
+    let e = "<!DOCTYPE r [<!ENTITY a \"xy\">]>";
+    let cases: [(String, u64, LimitKind, u64, u64, u64); 9] = [
+        // (文档, max_text_len, kind, actual, position, 需要的字节)
+        (
+            format!("{e}<r>abc&a;</r>"),
+            3,
+            LimitKind::TextLength,
+            4,
+            37,
+            39,
+        ), // 展开的 x
+        (
+            format!("{e}<r>abc&a;</r>"),
+            4,
+            LimitKind::TextLength,
+            5,
+            37,
+            39,
+        ), // 展开的 y
+        (
+            format!("{e}<r>abc&a;</r>"),
+            2,
+            LimitKind::TextLength,
+            3,
+            37,
+            36,
+        ), // & 前的 c
+        (
+            "<!DOCTYPE r [<!ENTITY a \"<q>xyz</q>\">]><r>abc&a;</r>".to_string(),
+            2,
+            LimitKind::TextLength,
+            3,
+            45,
+            44,
+        ),
+        (
+            "<!DOCTYPE r [<!ENTITY a \"xy\"><!ENTITY b \"&a;&a;\">]><r>a&b;</r>".to_string(),
+            4,
+            LimitKind::TextLength,
+            5,
+            55,
+            57, // 嵌套展开：需要外层引用的 `;`
+        ),
+        (
+            "<r>ab&#99;d</r>".to_string(),
+            2,
+            LimitKind::TextLength,
+            3,
+            10,
+            9,
+        ),
+        (
+            "<r>ab&#99;d</r>".to_string(),
+            1,
+            LimitKind::TextLength,
+            2,
+            5,
+            4,
+        ),
+        (
+            format!("{e}<r t=\"abc&a;\"/>"),
+            3,
+            LimitKind::AttrValueLength,
+            4,
+            40,
+            42,
+        ),
+        (
+            format!("{e}<r t=\"abc&a;\"/>"),
+            2,
+            LimitKind::AttrValueLength,
+            3,
+            40,
+            39,
+        ),
+    ];
+    for (doc, max, kind, actual, pos, need) in cases {
+        let c = ParserConfig::default().with_max_text_len(max);
+        let s = quick_paths(&format!("{doc:?} max={max}"), doc.as_bytes(), &c);
+        let (k, l, a, p) = limit_of(&doc, &s);
+        assert_eq!(
+            (k, l, a, p.offset),
+            (kind, max, actual, pos),
+            "{doc:?} max={max}"
+        );
+        assert_eq!(
+            needed_byte(&doc, doc.as_bytes(), &c, &s),
+            Some(need),
+            "{doc:?} max={max}"
+        );
     }
 }
 
@@ -2561,7 +2726,10 @@ fn earlier_wins(
         }
         (Some(_), None) => assert_eq!(s, sa, "{label}：只有 A 报限额"),
         (None, Some(_)) => assert_eq!(s, sb, "{label}：只有 B 报限额"),
-        (Some((ka, oa)), Some((kb, ob))) => match (needed_byte(ka, oa), needed_byte(kb, ob)) {
+        (Some((ka, _)), Some((kb, _))) => match (
+            needed_byte(&format!("{label} 只设 A"), d, a, &sa),
+            needed_byte(&format!("{label} 只设 B"), d, b, &sb),
+        ) {
             (Some(na), Some(nb)) if na != nb => {
                 let want = if na < nb { &sa } else { &sb };
                 assert_eq!(&s, want, "{label}：需要的字节 A {na} / B {nb}，先到的赢");
@@ -2936,4 +3104,217 @@ fn default_config_keeps_syntax_and_encoding_outcomes() {
             (w, e) => panic!("{label}：应为 {w:?}，实际 {e:?}"),
         }
     }
+}
+
+// ───────────── Encoding 与按字节计限额（L0：Encoding 的“需要的字节”是能证明序列非法的那个字节）─────────────
+
+/// r2c 样本 c12c5a0（reader_1byte，tight 配置）：内部子集字面量里 `F2 BE BE 02`（偏移 63–66），
+/// 要读到 `02`（66）才能证明非法。TokenLength 的边界字节不晚于 66，所以按 L0 报 TokenLength 48/49，
+/// 结果与把这 4 个字节换成 ASCII 的对照文档相同（kind、limit、actual、offset、事件；line/column
+/// 按本文档算），四路径全切块一致。
+///
+/// 注意：解析器把 `<!DOCTYPE` 前面的序言空白（偏移 17 的 `\n`）算进 DOCTYPE token，起点是 17，
+/// 边界字节是 65；若起点按 `<!DOCTYPE`（18）算则是 66。绝对偏移 66 单独放在
+/// `c12c5a0_doctype_token_starts_at_markup`（#[ignore]，待 Lead 裁定 token 起点口径）。
+#[test]
+fn encoding_vs_byte_limit_c12c5a0_reports_token_length() {
+    let d: &[u8] = C12C5A0;
+    let c = c12c5a0_config();
+    let s = all_chunkings("c12c5a0", d, &c);
+    let (k, l, a, p) = limit_of("c12c5a0", &s);
+    assert_eq!((k, l, a), (LimitKind::TokenLength, 48, 49), "c12c5a0");
+    assert!(
+        p.offset <= 66,
+        "c12c5a0：边界字节 {} 应不晚于证明字节 66",
+        p.offset
+    );
+    let mut ctl = d.to_vec();
+    ctl[63..67].fill(b'a');
+    let base = all_chunkings("c12c5a0 对照", &ctl, &c);
+    assert_eq!(s.events, base.events, "c12c5a0 事件同对照");
+    match &base.end {
+        Err((ErrorKind::SecurityLimit { .. }, bp)) => {
+            assert_eq!(bp.offset, p.offset, "c12c5a0 offset 同对照")
+        }
+        e => panic!("c12c5a0 对照应报限额，实际 {e:?}"),
+    }
+    assert_eq!(p, position_after(&d[..p.offset as usize]), "c12c5a0 行列");
+    let free = all_chunkings("c12c5a0 不设限额", d, &ParserConfig::default());
+    assert!(
+        matches!(&free.end, Err((ErrorKind::Encoding, _))),
+        "c12c5a0 不设限额应报 Encoding：{:?}",
+        free.end
+    );
+}
+
+/// 同一样本的绝对偏移：若 DOCTYPE token 从 `<!DOCTYPE`（18）起算，边界字节就是证明字节 02（66），
+/// 期望 TokenLength 48/49 @66（Lead 11:03 给出的期望值）。94d3c46 / 2431508 都报 @65（起点算到了
+/// 序言空白 17）。是否计入序言空白待 Lead 裁定，裁定后去掉 #[ignore] 或改期望。
+#[test]
+#[ignore = "待 Lead 裁定：序言空白是否计入下一个 token 的 TokenLength"]
+fn c12c5a0_doctype_token_starts_at_markup() {
+    let d: &[u8] = C12C5A0;
+    let s = all_chunkings("c12c5a0 绝对偏移", d, &c12c5a0_config());
+    let (k, l, a, p) = limit_of("c12c5a0 绝对偏移", &s);
+    assert_eq!(
+        (k, l, a, p.offset),
+        (LimitKind::TokenLength, 48, 49, 66),
+        "c12c5a0 绝对偏移"
+    );
+    assert_eq!(p, position_after(&d[..66]), "c12c5a0 行列");
+}
+
+const C12C5A0: &[u8] = b"\x0a<?x vion=\x221.0\x22?>\x0a<!DOCTYPE r [\x0a<!ENTITY a \x22@AAAAAAAAApp&amp;pp\xf2\xbe\xbe\x02\x00\x00\x00\x00\x00\x00\x00;&a?m\x0d\x0a;</r[>\x0a";
+
+fn c12c5a0_config() -> ParserConfig {
+    ParserConfig::default()
+        .with_max_token_len(48)
+        .with_max_internal_subset_len(40)
+        .with_max_text_len(12)
+        .with_max_name_len(6)
+        .with_max_total_input(512)
+}
+
+/// 非法 UTF-8 序列和“能证明非法的字节”在序列里的下标（Unicode 最大子部分规则）。
+fn bad_utf8_seqs() -> Vec<(&'static [u8], usize)> {
+    vec![
+        // 1 字节就能证明：C0/C1、F5–FF 首字节、孤立续字节
+        (b"\xc0", 0),
+        (b"\xc1", 0),
+        (b"\xf5", 0),
+        (b"\xf8", 0),
+        (b"\xff", 0),
+        (b"\x80", 0),
+        (b"\xbf", 0),
+        // 第 2 字节越出首字节允许的范围
+        (b"\xe0\x80", 1),
+        (b"\xed\xa0", 1),
+        (b"\xf0\x80", 1),
+        (b"\xf4\x90", 1),
+        // 过早断开的续字节：2、3、4 字节前缀后跟非续字节
+        (b"\xc3A", 1),
+        (b"\xe4A", 1),
+        (b"\xe4\xb8A", 2),
+        (b"\xe0\xa0A", 2),
+        (b"\xf0\x9fA", 2),
+        (b"\xf0\x9f\x98A", 3),
+        (b"\xf4\x8f\xbfA", 3),
+        (b"\xf2\xbe\xbe\x02", 3), // c12c5a0 的序列
+    ]
+}
+
+/// (上下文名, 序列之前的部分, 序列之后的部分)
+fn encoding_contexts() -> [(&'static str, &'static str, &'static str); 4] {
+    [
+        ("文本", "<r>aaaaaaaaaa", "zzzz</r>"),
+        ("属性值", "<r x=\"aaaaaaaaaa", "zzzz\"/>"),
+        ("注释", "<r><!--aaaaaaaaaa", "zzzz--></r>"),
+        (
+            "子集字面量",
+            "<!DOCTYPE r [<!ENTITY e \"aaaaaaaaaa",
+            "zzzz\">]><r/>",
+        ),
+    ]
+}
+
+/// 对每个上下文 × 非法序列，让 TokenLength / TotalInput 的边界字节扫过序列前后各 3 个字节：
+/// - 边界字节 ≤ 证明字节：报限额，结果与“把序列换成同长 ASCII”的对照文档完全相同
+///   （kind、limit、actual、position、之前的事件）；
+/// - 边界字节 > 证明字节：报 Encoding，结果与不设限额时完全相同。
+///
+/// `paths` 决定比对哪些路径（四路径硬断言）。返回检查的组合数。
+fn encoding_vs_byte_limit(paths: fn(&str, &[u8], &ParserConfig) -> Snap) -> usize {
+    let dflt = ParserConfig::default();
+    let mut n = 0;
+    for (ctx, pre, post) in encoding_contexts() {
+        for (seq, k) in bad_utf8_seqs() {
+            let mut d = pre.as_bytes().to_vec();
+            let start = d.len();
+            d.extend_from_slice(seq);
+            d.extend_from_slice(post.as_bytes());
+            let mut ctl = d.clone();
+            ctl[start..start + seq.len()].fill(b'a');
+            let proof = (start + k) as u64;
+            let lo = start as u64 - 3;
+            let hi = (start + seq.len() + 3) as u64;
+            let label = format!("{ctx} {seq:02x?}");
+            let free = paths(&format!("{label} 不设限额"), &d, &dflt);
+            assert!(
+                matches!(&free.end, Err((ErrorKind::Encoding, _))),
+                "{label}：不设限额应报 Encoding，实际 {:?}",
+                free.end
+            );
+            let mut seen = Vec::new();
+            let mut cfgs: Vec<(String, ParserConfig)> = (lo..=hi)
+                .map(|u| (format!("tot={u}"), dflt.clone().with_max_total_input(u)))
+                .collect();
+            cfgs.extend(
+                (1..=d.len() as u64)
+                    .map(|t| (format!("tok={t}"), dflt.clone().with_max_token_len(t))),
+            );
+            for (cn, c) in cfgs {
+                let lbl = format!("{label} {cn}");
+                let base = paths(&format!("{lbl} 对照"), &ctl, &c);
+                let b = match &base.end {
+                    Err((ErrorKind::SecurityLimit { kind, .. }, p))
+                        if matches!(kind, LimitKind::TokenLength | LimitKind::TotalInput)
+                            && (lo..=hi).contains(&p.offset) =>
+                    {
+                        p.offset
+                    }
+                    _ => continue,
+                };
+                check_limit_shape(&lbl, &base, &c);
+                seen.push((cn.starts_with("tok"), b));
+                let s = paths(&lbl, &d, &c);
+                if b <= proof {
+                    // kind、limit、actual、offset、之前的事件同对照文档；line/column 按本文档的字节前缀算
+                    // （多字节序列的首字节算一列，续字节不算，对照文档里同位置是 ASCII，列数会不同）
+                    let want = Snap {
+                        events: base.events.clone(),
+                        end: match &base.end {
+                            Err((k, _)) => Err((k.clone(), position_after(&d[..b as usize]))),
+                            Ok(()) => unreachable!(),
+                        },
+                    };
+                    assert_eq!(
+                        s, want,
+                        "{lbl}：边界字节 {b} ≤ 证明非法的字节 {proof}，应报限额（同对照文档）"
+                    );
+                } else {
+                    assert_eq!(
+                        s, free,
+                        "{lbl}：证明非法的字节 {proof} < 边界字节 {b}，应报 Encoding（同不设限额）"
+                    );
+                }
+                n += 1;
+            }
+            // 不能是空转：两种限额的边界都要扫过整个窗口
+            for tok in [false, true] {
+                let mut bs: Vec<u64> = seen.iter().filter(|x| x.0 == tok).map(|x| x.1).collect();
+                bs.sort();
+                bs.dedup();
+                assert_eq!(
+                    bs,
+                    (lo..=hi).collect::<Vec<_>>(),
+                    "{label}：{} 的边界没有扫满窗口",
+                    if tok { "TokenLength" } else { "TotalInput" }
+                );
+            }
+        }
+    }
+    n
+}
+
+#[test]
+fn encoding_vs_byte_limit_needed_byte_sampled() {
+    let n = encoding_vs_byte_limit(quick_paths);
+    println!("encoding_vs_byte_limit_needed_byte_sampled：{n} 组");
+}
+
+#[test]
+#[ignore = "slow: 四路径 + 16 种随机切块 + 固定块长全切块，需要跑 --ignored"]
+fn encoding_vs_byte_limit_needed_byte() {
+    let n = encoding_vs_byte_limit(all_chunkings);
+    println!("encoding_vs_byte_limit_needed_byte：{n} 组");
 }
