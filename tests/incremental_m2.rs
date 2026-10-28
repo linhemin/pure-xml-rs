@@ -1402,6 +1402,202 @@ fn d32_subset_comment_opener_is_not_a_terminator() {
     pass("D32 合法", b"<!DOCTYPE r [<!-- ]> -->]><r/>", &c);
 }
 
+/// R2c（6894e02 审查）：在 XML 声明、PI、DOCTYPE、注释、CDATA 的开头、中间关键字和结尾附近，
+/// 用 max_token_len、max_total_input = 1..=64 把探测截在每一个字节上，四条路径加各种块长必须完全一致；
+/// 报 TokenLength / TotalInput 时 limit、actual 按口径（actual = limit + 1，TotalInput 的 offset = limit）。
+/// 默认限额下：合法文档必须通过；任何前缀（EOF 截断）和畸形输入都不能报 TokenLength / TotalInput。
+fn probe_cut_docs() -> Vec<(&'static str, bool)> {
+    vec![
+        (
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><r/>",
+            true,
+        ),
+        ("<?xml version='1.0'?>\n<?pi data?><r/>", true),
+        ("<?xml version=\"1.0\" encoding=\"?>\"?><r/>", false),
+        ("<?xml version=\"1.0\" encodin=\"x\"?><r/>", false),
+        ("<?xml version=\"1.0\" stand?><r/>", false),
+        ("<?xml version=\"1.0\" ?<r/>", false),
+        ("<?xml version=\"1.0\" standalone=\"maybe\"?><r/>", false),
+        (
+            "<!DOCTYPE r [<!ENTITY e \"x\"><!-- c --><?p d?>]><r>&e;</r>",
+            true,
+        ),
+        ("<!DOCTYPE r PUBLIC \"p\" \"s\"><r/>", true),
+        ("<!DOCTYPE r [<!-->]><r/>", false),
+        ("<!DOCTYPE r [<?>]><r/>", false),
+        (
+            "<!DOCTYPE r [<!ELEMENT r ANY><!ATTLIST r a CDATA \"d\">]><r/>",
+            true,
+        ),
+        ("<r><!-- comment --><![CDATA[x]]>y<?p q?></r>", true),
+        ("<r><!-- a -- b --></r>", false),
+        ("<r><![CDAT[x]]></r>", false),
+        ("<![CDATA[x]]><r/>", false),
+        ("<r><?xml x?></r>", false),
+        ("<r a=\"1\" b='2'>t&amp;&#x41;</r><!--e--><?p?>", true),
+    ]
+}
+
+fn check_limit_shape(label: &str, s: &Snap, c: &ParserConfig) {
+    if let Err((
+        ErrorKind::SecurityLimit {
+            kind,
+            limit,
+            actual,
+        },
+        p,
+    )) = &s.end
+    {
+        match kind {
+            LimitKind::TokenLength => {
+                assert_eq!(
+                    (*limit, *actual),
+                    (c.max_token_len, c.max_token_len + 1),
+                    "{label}"
+                );
+            }
+            LimitKind::TotalInput => {
+                assert_eq!(
+                    (*limit, *actual, p.offset),
+                    (c.max_total_input, c.max_total_input + 1, c.max_total_input),
+                    "{label}"
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn is_cap(e: &End) -> bool {
+    matches!(
+        e,
+        Err((
+            ErrorKind::SecurityLimit {
+                kind: LimitKind::TokenLength | LimitKind::TotalInput,
+                ..
+            },
+            _
+        ))
+    )
+}
+
+#[test]
+fn probe_cuts_in_keywords_match_on_all_paths() {
+    let d = ParserConfig::default();
+    for (doc, valid) in probe_cut_docs() {
+        let b = doc.as_bytes();
+        let n = b.len() as u64;
+        let base = all_chunkings(&format!("默认 {doc:?}"), b, &d);
+        assert_eq!(base.end.is_ok(), valid, "默认 {doc:?}：{:?}", base.end);
+        // 每个前缀（EOF 截断）：默认限额下不能报 TokenLength / TotalInput
+        for k in 0..b.len() {
+            let label = format!("默认 {doc:?} 前缀 {k}");
+            let s = all_chunkings(&label, &b[..k], &d);
+            assert!(!is_cap(&s.end), "{label}：不应报上限，实际 {:?}", s.end);
+        }
+        let base_off = err_offset(&base);
+        for t in 1..=64u64 {
+            for (name, c) in [
+                ("max_token_len", d.clone().with_max_token_len(t)),
+                ("max_total_input", d.clone().with_max_total_input(t)),
+            ] {
+                let label = format!("{name}={t} {doc:?}");
+                let s = all_chunkings(&label, b, &c);
+                check_limit_shape(&label, &s, &c);
+                if t >= n {
+                    assert_eq!(s, base, "{label}：上限不小于文档长度时应与默认一致");
+                    continue;
+                }
+                // Lead 13:56 统一原则：默认配置下的错误在 offset ≥ t（判断要读到 t 或之后），
+                // 或者文档合法，TotalInput 就在 t 上先报。
+                if name == "max_total_input" && base_off >= t {
+                    let (k, l, a, p) = limit_of(&label, &s);
+                    assert_eq!(
+                        (k, l, a, p.offset),
+                        (LimitKind::TotalInput, t, t + 1, t),
+                        "{label}"
+                    );
+                }
+                // 合法文档只能通过或报 TokenLength，不能变成 Syntax / Encoding。
+                if name == "max_token_len" && valid {
+                    assert!(
+                        s.end.is_ok() || limit_of(&label, &s).0 == LimitKind::TokenLength,
+                        "{label}：合法文档只能通过或报 TokenLength，实际 {:?}",
+                        s.end
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// D33（Lead 13:56 裁定，统一原则）：按字节计的限额只看位置，在越界的那个字节上报，
+/// 先于任何需要读到该字节及之后的 Syntax/Encoding 判断。五类都写死 kind、actual、position：
+/// (a) 只设 tot：TotalInput @t（流式不能误报 32 MiB 的 TokenLength）；
+/// (b) `encodin` 截在 @20：TokenLength；(c) 声明结尾 `?>` 截在 `?`：TokenLength；
+/// (d) 同一位置只设 tot：TotalInput；(e) 注释里的 `--` 跨过 tot：TotalInput。
+#[test]
+fn d33_keyword_cut_agrees_on_all_paths() {
+    let d = ParserConfig::default();
+    let decl: &[u8] = b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><r/>";
+    for t in [6u64, 7, 12, 20, 33, 47] {
+        fail(
+            &format!("D33(a) tot={t}"),
+            decl,
+            &d.clone().with_max_total_input(t),
+            LimitKind::TotalInput,
+            t,
+            t + 1,
+            t,
+        );
+    }
+    fail(
+        "D33(b) tok=20 encodin",
+        b"<?xml version=\"1.0\" encodin=\"x\"?><r/>",
+        &d.clone().with_max_token_len(20),
+        LimitKind::TokenLength,
+        20,
+        21,
+        20,
+    );
+    fail(
+        "D33(c) tok=53 standalone ?>",
+        decl,
+        &d.clone().with_max_token_len(53),
+        LimitKind::TokenLength,
+        53,
+        54,
+        53,
+    );
+    fail(
+        "D33(c) tok=19 version ?>",
+        b"<?xml version='1.0'?>\n<?pi data?><r/>",
+        &d.clone().with_max_token_len(19),
+        LimitKind::TokenLength,
+        19,
+        20,
+        19,
+    );
+    fail(
+        "D33(d) tot=53",
+        decl,
+        &d.clone().with_max_total_input(53),
+        LimitKind::TotalInput,
+        53,
+        54,
+        53,
+    );
+    fail(
+        "D33(e) tot=10 注释 --",
+        b"<r><!-- a -- b --></r>",
+        &d.clone().with_max_total_input(10),
+        LimitKind::TotalInput,
+        10,
+        11,
+        10,
+    );
+}
+
 #[test]
 fn char_counted_limits_point_after_the_character() {
     // NameLength / TextLength / AttrValueLength：position = 越界字符之后（1/2/3/4 字节）
@@ -2040,4 +2236,635 @@ fn d28_default_cap_token_near_the_limit() {
     let streamed = count!(r);
     let mut r = Reader::from_bytes(d.as_bytes()).with_config(c);
     assert_eq!(streamed, count!(r), "默认上限下接近 32 MiB 的 token");
+}
+
+/// D34（R2c）：带前缀的 QName 按整个 QName 逐字符计 NameLength（L7），
+/// 一越过上限就报错：actual = 首次超过的长度，position = 越界字符之后；四条路径一致。
+/// 6894e02 上 from_bytes 分别计前缀和本地名、只在末尾检查总长（报得更晚、actual 偏大）。
+#[test]
+fn d34_prefixed_qname_counts_the_whole_name() {
+    let c6 = ParserConfig::default().with_max_name_len(6);
+    let c8 = ParserConfig::default().with_max_name_len(8);
+    fail(
+        "D34 xmlns:abcdefgh",
+        b"<d xmlns:abcdefgh=\"u\"/>",
+        &c6,
+        LimitKind::NameLength,
+        6,
+        7,
+        10,
+    );
+    fail(
+        "D34 xmlns:ab",
+        b"<d xmlns:ab=\"u\" ab:cdefghij=\"v\"/>",
+        &c6,
+        LimitKind::NameLength,
+        6,
+        7,
+        10,
+    );
+    fail(
+        "D34 属性 ab:cdefghij",
+        b"<d xmlns:ab=\"u\" ab:cdefghij=\"v\"/>",
+        &c8,
+        LimitKind::NameLength,
+        8,
+        9,
+        25,
+    );
+    fail(
+        "D34 元素 abc:defghij",
+        b"<abc:defghij xmlns:abc=\"u\"/>",
+        &c8,
+        LimitKind::NameLength,
+        8,
+        9,
+        10,
+    );
+    pass("D34 abc:defg = 8", b"<abc:defg xmlns:abc=\"u\"/>", &c8);
+    let (p, l) = ("p".repeat(600), "l".repeat(600));
+    let d = format!("<{p}:{l} xmlns:{p}=\"u\"/>");
+    fail(
+        "D34 默认配置 600:600",
+        d.as_bytes(),
+        &ParserConfig::default(),
+        LimitKind::NameLength,
+        1024,
+        1025,
+        1026,
+    );
+}
+
+/// D37（R2c，main 上即已存在）：文本里的 `>` 也计入 TextLength。
+/// 6894e02/main 的 from_bytes 文本快路径遇到 `>` 直接 continue，跳过长度检查，
+/// 一串 `>` 可以绕过 max_text_len。
+#[test]
+fn d37_gt_in_text_counts_toward_text_length() {
+    let c = ParserConfig::default().with_max_text_len(12);
+    let run = format!("<d>{}</d>", ">".repeat(30));
+    fail(
+        "D37 `>`×30",
+        run.as_bytes(),
+        &c,
+        LimitKind::TextLength,
+        12,
+        13,
+        16,
+    );
+    fail(
+        "D37 第 13 字节是 `>`",
+        b"<d>abcdefghijkl></d>",
+        &c,
+        LimitKind::TextLength,
+        12,
+        13,
+        16,
+    );
+    fail(
+        "D37 `>` 后还有文本",
+        b"<d>abcdefghijkl>mnop</d>",
+        &c,
+        LimitKind::TextLength,
+        12,
+        13,
+        16,
+    );
+    fail(
+        "D37 `]>`",
+        b"<d>abcdefghijk]></d>",
+        &c,
+        LimitKind::TextLength,
+        12,
+        13,
+        16,
+    );
+    fail(
+        "D37 EOF 前",
+        b"<d>abcdefghijkl>",
+        &c,
+        LimitKind::TextLength,
+        12,
+        13,
+        16,
+    );
+    pass("D37 = 12", b"<d>abcdefghijk></d>", &c);
+    let big = format!("<d>{}</d>", ">".repeat(5000));
+    fail(
+        "D37 text=1000 `>`×5000",
+        big.as_bytes(),
+        &ParserConfig::default().with_max_text_len(1000),
+        LimitKind::TextLength,
+        1000,
+        1001,
+        1004,
+    );
+}
+
+/// D36（Lead 13:56：只设部分限额时不得误报）：只设名字或文本上限、没设 max_token_len 时，
+/// 任何路径都不能报 TokenLength；按 L7 和字符口径写死期望（`:` 是 QName 的第 7 个字符）。
+#[test]
+fn d36_no_false_token_length_from_name_or_text_budget() {
+    let n6 = ParserConfig::default().with_max_name_len(6);
+    let t12 = ParserConfig::default().with_max_text_len(12);
+    type Case<'a> = (&'a [u8], &'a ParserConfig, LimitKind, u64, u64, u64);
+    let cases: [Case; 5] = [
+        (b"<abcdef:", &n6, LimitKind::NameLength, 6, 7, 8),
+        (b"<dxmlns:a", &n6, LimitKind::NameLength, 6, 7, 8),
+        (b"<d>abcdefghijkl>", &t12, LimitKind::TextLength, 12, 13, 16),
+        (
+            b"<d>abcdefghijkl></d>",
+            &t12,
+            LimitKind::TextLength,
+            12,
+            13,
+            16,
+        ),
+        (b"<d>wwwwwwr svo?>", &t12, LimitKind::TextLength, 12, 13, 16),
+    ];
+    for (d, c, kind, limit, actual, offset) in cases {
+        let label = format!("D36 {:?}", String::from_utf8_lossy(d));
+        all_chunkings(&label, d, c);
+        fail(&label, d, c, kind, limit, actual, offset);
+    }
+}
+
+/// D35（Lead 13:56：报 TokenLength，不解码越界字节）：max_token_len 的那个字节是任何
+/// 非法或不完整的 UTF-8 首字节时，注释、CDATA、PI、文本、属性值里都报 TokenLength 48/49，
+/// position = 越界的那个字节。
+#[test]
+fn d35_utf8_lead_at_token_cap_agrees_on_all_paths() {
+    let c = ParserConfig::default().with_max_token_len(48);
+    for (ctx, at) in d35_contexts() {
+        for bad in d35_bad_bytes() {
+            let d = d35_doc(ctx, at, bad);
+            let label = format!("D35 {ctx} {bad:02X?}");
+            all_chunkings(&label, &d, &c);
+            fail(&label, &d, &c, LimitKind::TokenLength, 48, 49, at as u64);
+        }
+    }
+}
+
+/// (前缀, 越界字节的 offset)：token 起点是 3（`<r>` 之后）或 0（开始标签）。
+fn d35_contexts() -> [(&'static str, usize); 5] {
+    [
+        ("<r><!--", 51),
+        ("<r><![CDATA[", 51),
+        ("<r><?p ", 51),
+        ("<r>", 51),
+        ("<r a=\"", 48),
+    ]
+}
+
+fn d35_bad_bytes() -> [&'static [u8]; 4] {
+    [&[0xE4, 0xB8], &[0xC0, 0x80], &[0xFF], &[0x80]]
+}
+
+fn d35_doc(ctx: &str, at: usize, bad: &[u8]) -> Vec<u8> {
+    let mut d = ctx.as_bytes().to_vec();
+    d.extend(std::iter::repeat(b'a').take(at - ctx.len()));
+    d.extend_from_slice(bad);
+    d.extend_from_slice(b"zzzz</r>");
+    d
+}
+
+// ───────────── R2c（4d7ebe2：限额检查改为每个 token 预算一次截止索引）─────────────
+
+/// 扫描用的轻量四路径：from_bytes、from_vec、逐字节、块长 7、3 种随机切块，结果必须相同。
+fn quick_paths(label: &str, d: &[u8], c: &ParserConfig) -> Snap {
+    let base = bytes(d, c);
+    assert_eq!(base, vec_path(d, c), "{label}：from_vec 与 from_bytes 不同");
+    let mut plans = vec![
+        ("逐字节".to_string(), Plan::Byte),
+        ("块长 7".to_string(), Plan::Schedule(vec![7])),
+    ];
+    for seed in 0..3 {
+        plans.push((
+            format!("随机 {seed}"),
+            Plan::Schedule(seeded_schedule(seed + 2000)),
+        ));
+    }
+    for (name, plan) in plans {
+        assert_same(
+            &format!("{label} [{name}]"),
+            &base,
+            &stream(d, c, plan, None).snap,
+        );
+    }
+    base
+}
+
+fn err_offset(s: &Snap) -> u64 {
+    match &s.end {
+        Err((_, p)) => p.offset,
+        Ok(()) => u64::MAX,
+    }
+}
+
+/// 按字节计的限额：position 就是需要的那个字节；按字符计的：position 在字符之后，需要的是前一个字节。
+/// 实体类限额（ExpandedBytes 等）的检测字节和 position 不同（O-1），返回 None。
+fn needed_byte(kind: LimitKind, offset: u64) -> Option<u64> {
+    match kind {
+        LimitKind::TotalInput | LimitKind::TokenLength | LimitKind::InternalSubsetLength => {
+            Some(offset)
+        }
+        LimitKind::TextLength | LimitKind::AttrValueLength | LimitKind::NameLength => {
+            Some(offset.saturating_sub(1))
+        }
+        _ => None,
+    }
+}
+
+/// 同一字节的优先级（Lead 13:56）：TotalInput > TokenLength > 按字符计的限额。
+fn priority(kind: LimitKind) -> u8 {
+    match kind {
+        LimitKind::TotalInput => 0,
+        LimitKind::TokenLength => 1,
+        LimitKind::TextLength | LimitKind::AttrValueLength | LimitKind::NameLength => 2,
+        _ => 1,
+    }
+}
+
+fn limit_end(s: &Snap) -> Option<(LimitKind, u64)> {
+    match &s.end {
+        Err((ErrorKind::SecurityLimit { kind, .. }, p)) => Some((*kind, p.offset)),
+        _ => None,
+    }
+}
+
+/// 两个限额同时设置时的期望（Lead 13:56 统一原则）：
+/// - 只有一边报了限额：结果就是那一边（另一边的 Syntax/Encoding 必然要读到更后面的字节）；
+/// - 两边都报限额：需要的字节更靠前的赢；同一字节按 TotalInput > TokenLength > 按字符计；
+///   InternalSubsetLength 与 TokenLength 同字节、以及实体类限额（O-1 另有用例）只要求是二者之一；
+/// - 两边都没报限额：两边相同，结果也相同。
+///
+/// 返回“同一字节、按优先级判定”的次数。
+fn earlier_wins(
+    label: &str,
+    d: &[u8],
+    a: &ParserConfig,
+    b: &ParserConfig,
+    both: &ParserConfig,
+) -> usize {
+    let sa = quick_paths(&format!("{label} 只设 A"), d, a);
+    let sb = quick_paths(&format!("{label} 只设 B"), d, b);
+    let s = quick_paths(&format!("{label} 都设"), d, both);
+    check_limit_shape(label, &s, both);
+    match (limit_end(&sa), limit_end(&sb)) {
+        (None, None) => {
+            assert_eq!(sa, sb, "{label}：两边都没报限额，结果应相同");
+            assert_eq!(s, sa, "{label}");
+        }
+        (Some(_), None) => assert_eq!(s, sa, "{label}：只有 A 报限额"),
+        (None, Some(_)) => assert_eq!(s, sb, "{label}：只有 B 报限额"),
+        (Some((ka, oa)), Some((kb, ob))) => match (needed_byte(ka, oa), needed_byte(kb, ob)) {
+            (Some(na), Some(nb)) if na != nb => {
+                let want = if na < nb { &sa } else { &sb };
+                assert_eq!(&s, want, "{label}：需要的字节 A {na} / B {nb}，先到的赢");
+            }
+            (Some(_), Some(_)) if priority(ka) != priority(kb) => {
+                let want = if priority(ka) < priority(kb) {
+                    &sa
+                } else {
+                    &sb
+                };
+                assert_eq!(
+                    &s, want,
+                    "{label}：同一字节，按优先级 TotalInput > TokenLength > 按字符计"
+                );
+                return 1;
+            }
+            _ => assert!(
+                s == sa || s == sb,
+                "{label}：结果应是二者之一，实际 {:?}",
+                s.end
+            ),
+        },
+    }
+    0
+}
+
+fn limit_docs() -> Vec<String> {
+    let mut v: Vec<String> = probe_cut_docs()
+        .into_iter()
+        .map(|(d, _)| d.to_string())
+        .collect();
+    v.push(format!("<r>{}</r>", "a".repeat(40)));
+    v.push(format!(
+        "<r a=\"{}\" b='{}'/>",
+        "v".repeat(20),
+        "w".repeat(20)
+    ));
+    v.push(format!(
+        "<r><!--{}--><?p {}?><![CDATA[{}]]></r>",
+        "c".repeat(12),
+        "d".repeat(12),
+        "e".repeat(12)
+    ));
+    v.push(
+        "<r>\u{e9}\u{20ac}\u{1f600}\u{e9}\u{20ac}\u{1f600}\u{e9}\u{20ac}\u{1f600}</r>".to_string(),
+    );
+    v
+}
+
+/// max_token_len 和 max_total_input 谁先到、两者恰好相等：t、u = 1..=48 全组合。
+/// 先到的赢；落在同一字节时报 TotalInput（Lead 13:56 裁定 1）。
+#[test]
+fn token_vs_total_input_earlier_wins() {
+    let d = ParserConfig::default();
+    let mut ties = 0;
+    for doc in limit_docs() {
+        let b = doc.as_bytes();
+        for t in 1..=48u64 {
+            for u in 1..=48u64 {
+                let label = format!("tok={t} tot={u} {doc:?}");
+                ties += earlier_wins(
+                    &label,
+                    b,
+                    &d.clone().with_max_token_len(t),
+                    &d.clone().with_max_total_input(u),
+                    &d.clone().with_max_token_len(t).with_max_total_input(u),
+                );
+            }
+        }
+    }
+    println!("token_vs_total_input_earlier_wins：同位置 {ties} 次");
+}
+
+/// 内部子集和实体展开的限额与 token/total 上限组合：同样要求“更早的那个赢”、四条路径一致。
+#[test]
+fn subset_and_entity_limits_with_token_and_total() {
+    let d = ParserConfig::default();
+    let docs = [
+        "<!DOCTYPE r [<!ENTITY a \"0123456789\"><!ENTITY b \"&a;&a;\"><!-- c --><?p d?>]><r>x&b;y&a;</r>".to_string(),
+        format!("<!DOCTYPE r [<!ENTITY a \"{}\">]><r a=\"&a;\">&a;&a;</r>", "x".repeat(30)),
+        "<!DOCTYPE r [<!ELEMENT r ANY><!ATTLIST r a CDATA \"dflt\">]><r/>".to_string(),
+    ];
+    type Mk = fn(u64) -> ParserConfig;
+    let others: [(&str, Mk); 4] = [
+        ("sub", |v| {
+            ParserConfig::default().with_max_internal_subset_len(v)
+        }),
+        ("exp", |v| {
+            ParserConfig::default().with_max_expanded_bytes(v)
+        }),
+        ("ents", |v| {
+            ParserConfig::default().with_max_entity_expansions(v / 8)
+        }),
+        ("text", |v| ParserConfig::default().with_max_text_len(v)),
+    ];
+    for doc in &docs {
+        let b = doc.as_bytes();
+        for (on, mk) in &others {
+            for v in (1..=96u64).step_by(5) {
+                for t in (1..=96u64).step_by(3) {
+                    for (cn, cap) in [
+                        ("tok", d.clone().with_max_token_len(t)),
+                        ("tot", d.clone().with_max_total_input(t)),
+                    ] {
+                        let o = mk(v);
+                        let mut both = o.clone();
+                        if cn == "tok" {
+                            both = both.with_max_token_len(t);
+                        } else {
+                            both = both.with_max_total_input(t);
+                        }
+                        earlier_wins(&format!("{on}={v} {cn}={t} {doc:?}"), b, &o, &cap, &both);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 限额取极大值（u64::MAX、u64::MAX-1、usize::MAX）不能溢出：结果与默认配置完全相同；
+/// 只设一个小上限、另一个取极大值时，结果与只设小上限相同。token 起点不在 0（前面有 1000 字节注释）。
+#[test]
+fn extreme_limits_do_not_overflow() {
+    let d = ParserConfig::default();
+    let mut docs = limit_docs();
+    docs.push(format!(
+        "<!--{}--><r>{}</r>",
+        "p".repeat(1000),
+        "q".repeat(100)
+    ));
+    let huge = [u64::MAX, u64::MAX - 1, usize::MAX as u64, u64::MAX / 2 + 1];
+    for doc in &docs {
+        let b = doc.as_bytes();
+        let base = all_chunkings(&format!("默认 {doc:?}"), b, &d);
+        for h in huge {
+            let all = d
+                .clone()
+                .with_max_token_len(h)
+                .with_max_total_input(h)
+                .with_max_internal_subset_len(h)
+                .with_max_text_len(h)
+                .with_max_expanded_bytes(h)
+                .with_max_entity_expansions(h)
+                .with_max_expansion_ratio(h)
+                .with_max_name_len(usize::MAX)
+                .with_max_depth(usize::MAX)
+                .with_max_attrs(usize::MAX)
+                .with_max_entity_depth(usize::MAX);
+            let s = all_chunkings(&format!("全部 {h} {doc:?}"), b, &all);
+            assert_eq!(s.end, base.end, "全部 {h} {doc:?}");
+            for small in [1u64, 5, 13, 40] {
+                let tok = d.clone().with_max_token_len(small);
+                let tot = d.clone().with_max_total_input(small);
+                let a = quick_paths("只设 tok", b, &tok);
+                let s = quick_paths("tok 小 tot 极大", b, &tok.clone().with_max_total_input(h));
+                assert_eq!(s, a, "tok={small} tot={h} {doc:?}");
+                let a = quick_paths("只设 tot", b, &tot);
+                let s = quick_paths("tot 小 tok 极大", b, &tot.clone().with_max_token_len(h));
+                assert_eq!(s, a, "tot={small} tok={h} {doc:?}");
+            }
+        }
+        // 0：只要求四条路径一致、形状正确
+        for c in [
+            d.clone().with_max_token_len(0),
+            d.clone().with_max_total_input(0),
+            d.clone().with_max_token_len(0).with_max_total_input(0),
+        ] {
+            let s = all_chunkings(&format!("0 {doc:?}"), b, &c);
+            check_limit_shape("0", &s, &c);
+        }
+    }
+}
+
+/// D38（R2c；Lead 13:56：内部子集长度和 token 上限都要及时报）。内部子集从 offset 13 开始。
+/// ①类型关键字 `CDATA` 被截在中间：sub=v 报 InternalSubsetLength v/v+1 @13+v；tok=t 报 TokenLength t/t+1 @t。
+/// ②上限落在默认值字面量里：InternalSubsetLength 37/38 @50（不能扫完字面量才报）。
+#[test]
+fn d38_attlist_in_subset_limits_agree() {
+    let doc = "<!DOCTYPE r [<!ELEMENT r ANY><!ATTLIST r a CDATA \"d\">]><r/>";
+    let d = ParserConfig::default();
+    for v in [30u64, 31, 32, 33] {
+        let c = d.clone().with_max_internal_subset_len(v);
+        all_chunkings(&format!("D38① sub={v}"), doc.as_bytes(), &c);
+        fail(
+            &format!("D38① sub={v}"),
+            doc.as_bytes(),
+            &c,
+            LimitKind::InternalSubsetLength,
+            v,
+            v + 1,
+            13 + v,
+        );
+    }
+    for t in [44u64, 45, 46] {
+        let c = d.clone().with_max_token_len(t);
+        all_chunkings(&format!("D38① tok={t}"), doc.as_bytes(), &c);
+        fail(
+            &format!("D38① tok={t}"),
+            doc.as_bytes(),
+            &c,
+            LimitKind::TokenLength,
+            t,
+            t + 1,
+            t,
+        );
+    }
+    for lit in ["d", "dxxxxx"] {
+        let doc = format!("<!DOCTYPE r [<!ELEMENT r ANY><!ATTLIST r a CDATA \"{lit}\">]><r/>");
+        fail(
+            &format!("D38② {lit}"),
+            doc.as_bytes(),
+            &d.clone().with_max_internal_subset_len(37),
+            LimitKind::InternalSubsetLength,
+            37,
+            38,
+            50,
+        );
+    }
+}
+
+/// O-1（Lead 13:56）：ExpandedBytes 与 TotalInput 按原始输入位置先到先报，位置相同时 TotalInput 优先。
+/// `&b;` 占 80..=82，ExpandedBytes 要读完 `;`（82）才能判定，position 报在 `&`（80）。
+/// tot ≤ 82：TotalInput @tot；tot ≥ 83：ExpandedBytes 1/6 @80。之前的 2 个事件相同。
+#[test]
+fn o1_expanded_bytes_vs_total_input() {
+    let doc = b"<!DOCTYPE r [<!ENTITY a \"0123456789\"><!ENTITY b \"&a;&a;\"><!-- c --><?p d?>]><r>x&b;y&a;</r>";
+    let exp = ParserConfig::default().with_max_expanded_bytes(1);
+    let s = all_chunkings("O-1 只设 exp", doc, &exp);
+    let (k, l, a, p) = limit_of("O-1 只设 exp", &s);
+    assert_eq!((k, l, a, p.offset), (LimitKind::ExpandedBytes, 1, 6, 80));
+    for t in [80u64, 81, 82] {
+        let c = exp.clone().with_max_total_input(t);
+        let got = all_chunkings(&format!("O-1 tot={t}"), doc, &c);
+        assert_eq!(got.events, s.events, "O-1 tot={t}：之前的事件");
+        fail(
+            &format!("O-1 tot={t}"),
+            doc,
+            &c,
+            LimitKind::TotalInput,
+            t,
+            t + 1,
+            t,
+        );
+    }
+    for t in [83u64, 84, 200] {
+        let c = exp.clone().with_max_total_input(t);
+        let got = all_chunkings(&format!("O-1 tot={t}"), doc, &c);
+        assert_eq!(got, s, "O-1 tot={t}：应与只设 exp 相同");
+    }
+}
+
+/// 三重触发（Lead 13:56 优先级）：`<r>` 之后的文本，第 13 个字节在 offset 15。
+/// max_text_len=12（需要 15）、max_token_len=12（越界字节 15）、max_total_input=15 同时落在 15：报 TotalInput。
+/// 去掉 tot：TokenLength 12/13 @15（TokenLength > 按字符计）；只设 text：TextLength 12/13 @16；
+/// text=12 + tot=16：TextLength 先到（需要的是 15）。
+#[test]
+fn triple_trigger_on_one_byte_reports_total_input() {
+    let doc = b"<r>abcdefghijklmnop</r>";
+    let d = ParserConfig::default();
+    let all3 = d
+        .clone()
+        .with_max_text_len(12)
+        .with_max_token_len(12)
+        .with_max_total_input(15);
+    fail("三重", doc, &all3, LimitKind::TotalInput, 15, 16, 15);
+    fail(
+        "tok+text",
+        doc,
+        &d.clone().with_max_text_len(12).with_max_token_len(12),
+        LimitKind::TokenLength,
+        12,
+        13,
+        15,
+    );
+    fail(
+        "tot+text",
+        doc,
+        &d.clone().with_max_text_len(12).with_max_total_input(15),
+        LimitKind::TotalInput,
+        15,
+        16,
+        15,
+    );
+    fail(
+        "只设 text",
+        doc,
+        &d.clone().with_max_text_len(12),
+        LimitKind::TextLength,
+        12,
+        13,
+        16,
+    );
+    fail(
+        "text + tot=16",
+        doc,
+        &d.clone().with_max_text_len(12).with_max_total_input(16),
+        LimitKind::TextLength,
+        12,
+        13,
+        16,
+    );
+}
+
+/// 完全不设限额时，同样的输入有另一种合法结果：D33/D35/D36/D38 的文档在默认配置下
+/// 报的是 Syntax 或 Encoding（或者通过），不能出现任何 SecurityLimit；四条路径一致。
+#[test]
+fn default_config_keeps_syntax_and_encoding_outcomes() {
+    let d = ParserConfig::default();
+    type Want = Option<(&'static str, u64)>;
+    let cases: Vec<(Vec<u8>, Want)> = vec![
+        (
+            b"<?xml version=\"1.0\" encodin=\"x\"?><r/>".to_vec(),
+            Some(("Syntax", 20)),
+        ),
+        (b"<r><!-- a -- b --></r>".to_vec(), Some(("Syntax", 10))),
+        (b"<abcdef:".to_vec(), Some(("Syntax", 8))),
+        (b"<dxmlns:a".to_vec(), Some(("Syntax", 9))),
+        (b"<d>abcdefghijkl>".to_vec(), Some(("Syntax", 16))),
+        (b"<d>wwwwwwr svo?>".to_vec(), Some(("Syntax", 16))),
+        (
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><r/>".to_vec(),
+            None,
+        ),
+        (
+            b"<!DOCTYPE r [<!ELEMENT r ANY><!ATTLIST r a CDATA \"d\">]><r/>".to_vec(),
+            None,
+        ),
+        (format!("<d>{}</d>", ">".repeat(30)).into_bytes(), None),
+    ];
+    let mut all = cases;
+    for (ctx, at) in d35_contexts() {
+        for bad in d35_bad_bytes() {
+            all.push((d35_doc(ctx, at, bad), Some(("Encoding", at as u64))));
+        }
+    }
+    for (doc, want) in all {
+        let label = format!("默认 {:?}", String::from_utf8_lossy(&doc));
+        let s = all_chunkings(&label, &doc, &d);
+        match (want, &s.end) {
+            (None, Ok(())) => {}
+            (Some((name, off)), Err((k, p))) => {
+                assert!(
+                    format!("{k:?}").starts_with(name) && p.offset == off,
+                    "{label}：应为 {name} @{off}，实际 {k:?} @{}",
+                    p.offset
+                );
+            }
+            (w, e) => panic!("{label}：应为 {w:?}，实际 {e:?}"),
+        }
+    }
 }

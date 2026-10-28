@@ -4,7 +4,10 @@
 //! 三方工作量尽量对齐：都遍历所有事件 / 节点，都取出全部属性值与文本（含实体解码）。
 //! 命名空间：purexml 和 roxmltree 都解析元素的命名空间；quick-xml 用普通 Reader，不解析命名空间（它的 NsReader 是另一套 API）。
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{
+    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
+};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// 配置型：中等嵌套、短文本、少量属性
@@ -126,6 +129,46 @@ fn purexml_reader_drain(x: &[u8]) -> usize {
     purexml_drain_reader!(purexml::Reader::from_reader(src).expect("purexml from_reader"))
 }
 
+/// from_vec 路径（v9，Lead 13:56：bench 补 from_vec 组）。
+///
+/// 257c900 没有 `Reader::from_vec`。这里用同名的 trait 关联函数兜底：有固有的
+/// `Reader::<Vec<u8>>::from_vec` 时，路径解析优先选固有函数；没有时才落到 trait 上，
+/// trait 版本只记一个标志并返回空的 `NoFromVec`。`has_from_vec()` 据此在运行时判断，
+/// 没有 from_vec 的版本不注册 `purexml-from_vec` 组（BASELINE.md：257c900 以 from_bytes 作对照）。
+/// 两个版本都能编译，不需要 cfg 或 Cargo 特性。
+static FROM_VEC_FALLBACK: AtomicBool = AtomicBool::new(false);
+
+struct NoFromVec;
+
+#[allow(dead_code)]
+impl NoFromVec {
+    fn read_event(&mut self) -> purexml::Result<Option<purexml::Event<'_>>> {
+        Ok(None)
+    }
+}
+
+#[allow(dead_code)] // 有固有 from_vec 的版本上不会用到
+trait FromVecFallback {
+    fn from_vec(input: Vec<u8>) -> NoFromVec;
+}
+
+impl<S> FromVecFallback for purexml::Reader<S> {
+    fn from_vec(_input: Vec<u8>) -> NoFromVec {
+        FROM_VEC_FALLBACK.store(true, Ordering::Relaxed);
+        NoFromVec
+    }
+}
+
+fn has_from_vec() -> bool {
+    let _probe = purexml::Reader::<Vec<u8>>::from_vec(Vec::new());
+    !FROM_VEC_FALLBACK.load(Ordering::Relaxed)
+}
+
+/// 输入的 `Vec` 由 `iter_batched` 在计时外复制好；计时内是 from_vec、读完全部事件、释放。
+fn purexml_vec_drain(v: Vec<u8>) -> usize {
+    purexml_drain_reader!(purexml::Reader::<Vec<u8>>::from_vec(v))
+}
+
 /// 测量参数可以用环境变量覆盖，默认值与 M1 相同（30 样本，预热 1 s，测量 2 s / 5 s）。
 /// M2 门槛测量用 `PXB_SAMPLES=50 PXB_WARMUP=2 PXB_MEAS_SMALL=5 PXB_MEAS_LARGE=10`。
 fn env_u64(key: &str, default: u64) -> u64 {
@@ -181,6 +224,10 @@ fn bench(c: &mut Criterion) {
         ("text-dense", text_dense),
         ("ns-dense", ns_dense),
     ];
+    let from_vec = has_from_vec();
+    if !from_vec {
+        eprintln!("purexml 没有 Reader::from_vec：不注册 purexml-from_vec 组（对照用 from_bytes）");
+    }
     for (size_name, size) in [("1KB", 1usize << 10), ("1MB", 1usize << 20)] {
         for (shape, make) in shapes {
             let input = make(size);
@@ -196,6 +243,25 @@ fn bench(c: &mut Criterion) {
             g.bench_with_input(BenchmarkId::new("purexml", input.len()), &input, |b, x| {
                 b.iter(|| purexml_drain(black_box(x.as_bytes())))
             });
+            // from_vec：1 KB 和 1 MB 各 4 组，和 from_bytes 一样计入 10% 门槛（v9）
+            if from_vec {
+                let batch = if size > 4096 {
+                    BatchSize::LargeInput
+                } else {
+                    BatchSize::SmallInput
+                };
+                g.bench_with_input(
+                    BenchmarkId::new("purexml-from_vec", input.len()),
+                    &input,
+                    |b, x| {
+                        b.iter_batched(
+                            || x.as_bytes().to_vec(),
+                            |v| purexml_vec_drain(black_box(v)),
+                            batch,
+                        )
+                    },
+                );
+            }
             // from_reader 只测 1 MB 档（M2 只记录，F-2）
             if size > 4096 {
                 g.bench_with_input(
