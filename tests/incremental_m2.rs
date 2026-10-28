@@ -3792,3 +3792,579 @@ fn bom_split_by_total_input_paths_agree() {
         );
     }
 }
+
+// ───────────── D40（Lead 13:28 裁定）：起始符、关键字截断与按字节计限额 ─────────────
+//
+// L0 关键字截断规则（同 D33、94d3c46 的序言 `<!DOCTYx`）：失配要读到某个字节（下称“证明字节”，
+// 通常就是失配字符本身）才能判定。按字节计的限额（TokenLength、InternalSubsetLength、TotalInput）
+// 的边界字节 ≤ 证明字节时，一律在边界字节上报限额（actual = limit + 1）；边界字节 > 证明字节时，
+// 结果与不设限额完全相同（关键字、起始符失配报 Syntax，位置在 `<!` 或 `<` 上）。
+// 四路径（from_bytes、from_vec、各种切块的 from_reader）硬断言完全相同。
+//
+// 39cc819 上的实况：内部子集里关键字失配时 from_bytes 不看限额，直接在 `<!` 报 Syntax；
+// 流式在边界字节恰好等于失配字节时也报 Syntax（应报限额）。fuzz 样本见
+// tests/data/fuzz-regressions/reader_1byte-crash-*.bin。
+
+struct D40Case {
+    ctx: &'static str,
+    label: String,
+    d: Vec<u8>,
+    /// 证明字节：读到它才能判定失配
+    proof: usize,
+    /// 当前 token 的起点（TokenLength 从这里计）
+    tok_start: usize,
+    /// 之前各 token 的最大长度；tok 小于它时更早的 token 先越界，这样的组合跳过
+    min_tok: usize,
+    /// 内部子集内容的起点（`[` 之后）；None：不在子集里，不测 InternalSubsetLength
+    sub_start: Option<usize>,
+    /// 不设限额时 Syntax 应报的位置；None 表示只要求结果是错误（位置由不设限额的解析给出）
+    syntax_at: Option<usize>,
+}
+
+const D40_SUBSET_INTROS: &[&[u8]] = &[
+    b"<!--",
+    b"<?",
+    b"<!ENTITY",
+    b"<!ELEMENT",
+    b"<!ATTLIST",
+    b"<!NOTATION",
+    b"<![",
+];
+const D40_PROLOG_INTROS: &[&[u8]] = &[b"<!DOCTYPE", b"<!--", b"<?"];
+const D40_CONTENT_INTROS: &[&[u8]] = &[b"<!--", b"<![CDATA[", b"<?", b"</"];
+
+/// `s` 仍是某个起始符的前缀（还不能判定失配），或者已经是完整的起始符
+fn d40_still_prefix(intros: &[&[u8]], s: &[u8]) -> bool {
+    intros.iter().any(|i| i.starts_with(s) || s.starts_with(i))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn d40_push(
+    out: &mut Vec<D40Case>,
+    ctx: &'static str,
+    pre: &[u8],
+    construct: &[u8],
+    proof_in: usize,
+    post: &[u8],
+    tok_start: usize,
+    min_tok: usize,
+    sub_start: Option<usize>,
+    syntax_at_start: bool,
+) {
+    let start = pre.len();
+    let mut d = pre.to_vec();
+    d.extend_from_slice(construct);
+    d.extend_from_slice(post);
+    out.push(D40Case {
+        ctx,
+        label: format!("{ctx} {:?}", String::from_utf8_lossy(&d)),
+        proof: start + proof_in,
+        d,
+        tok_start,
+        min_tok,
+        sub_start,
+        syntax_at: syntax_at_start.then_some(start),
+    });
+}
+
+/// 关键字 `<!` + kw：前缀长度 p = 0..len（kw[p] 换成失配字符）以及 p = len（完整关键字后跟非空白）
+#[allow(clippy::too_many_arguments)]
+fn d40_keyword(
+    out: &mut Vec<D40Case>,
+    ctx: &'static str,
+    intros: &[&[u8]],
+    pre: &[u8],
+    kw: &[u8],
+    post: &[u8],
+    tok_start: usize,
+    min_tok: usize,
+    sub_start: Option<usize>,
+    full: bool,
+) {
+    for p in 0..=kw.len() {
+        let ms: Vec<u8> = if p < kw.len() {
+            let all = [
+                b'x',
+                kw[p].to_ascii_lowercase(),
+                b' ',
+                b'>',
+                b'"',
+                b'[',
+                b'-',
+                b'?',
+                b'%',
+                b'\n',
+            ];
+            let n = if full { all.len() } else { 2 };
+            all[..n].to_vec()
+        } else if full {
+            vec![b'x', b'>', b'"', b'[', b'-', b'%']
+        } else {
+            vec![b'x']
+        };
+        for m in ms {
+            let mut c = b"<!".to_vec();
+            c.extend_from_slice(&kw[..p]);
+            c.push(m);
+            if p < kw.len() && (m == kw[p] || d40_still_prefix(intros, &c)) {
+                continue;
+            }
+            let proof = c.len() - 1;
+            d40_push(
+                out,
+                ctx,
+                pre,
+                &c,
+                proof,
+                post,
+                tok_start,
+                min_tok,
+                sub_start,
+                p < kw.len(),
+            );
+        }
+    }
+}
+
+fn d40_cases(full: bool) -> Vec<D40Case> {
+    let mut v = Vec::new();
+    let pads: &[&str] = if full {
+        &["", "<!ELEMENT r ANY>\n"]
+    } else {
+        &[""]
+    };
+    // ① 内部子集里的声明关键字（ELEMENT、ENTITY、ATTLIST、NOTATION）
+    for pad in pads {
+        let pre = format!("<!DOCTYPE r [{pad}");
+        for kw in [&b"ELEMENT"[..], b"ENTITY", b"ATTLIST", b"NOTATION"] {
+            d40_keyword(
+                &mut v,
+                "子集关键字",
+                D40_SUBSET_INTROS,
+                pre.as_bytes(),
+                kw,
+                b" r ANY>]><r/>",
+                0,
+                0,
+                Some(13),
+                full,
+            );
+        }
+    }
+    // ② 子集里的条件节：`<![` 在子集里一律非法，读到 `[` 即可判定（报在 `<!`）
+    for c in [
+        &b"<![INCLUDE[<!ELEMENT r ANY>]]>"[..],
+        b"<![IGNORE[ x ]]>",
+        b"<![ INCLUDE [ ]]>",
+        b"<![%e;[ ]]>",
+        b"<![CDATA[x]]>",
+    ] {
+        d40_push(
+            &mut v,
+            "子集条件节",
+            b"<!DOCTYPE r [",
+            c,
+            2,
+            b"]><r/>",
+            0,
+            0,
+            Some(13),
+            true,
+        );
+    }
+    // ③ 子集里的 `<!--`、`<?`、`<`
+    for (c, proof, at) in [
+        (&b"<!-x -->"[..], 3, true),
+        (b"<!- -->", 3, true),
+        (b"<!->", 3, true),
+        (b"<!-!-->", 3, true),
+        (b"<!x>", 2, true),
+        (b"<x>", 1, true),
+        (b"< x>", 1, true),
+        (b"<1>", 1, true),
+        (b"<? x?>", 2, false),
+        (b"<??>", 2, false),
+        (b"<?1?>", 2, false),
+        (b"<?>", 2, false),
+        (b"<?xml x?>", 5, false),
+        (b"<?XmL?>", 5, false),
+        (b"<!-- a -- b -->", 9, false),
+    ] {
+        d40_push(
+            &mut v,
+            "子集注释/PI/<",
+            b"<!DOCTYPE r [",
+            c,
+            proof,
+            b"]><r/>",
+            0,
+            0,
+            Some(13),
+            at,
+        );
+    }
+    // ④ 子集结尾 `]` 之后必须是（空白和）`>`；子集已结束，不测 InternalSubsetLength
+    for (c, proof) in [
+        (&b"]x"[..], 1),
+        (b"]]", 1),
+        (b"][", 1),
+        (b"]<", 1),
+        (b"] x", 2),
+        (b"]\n<", 2),
+    ] {
+        d40_push(
+            &mut v,
+            "子集结尾",
+            b"<!DOCTYPE r [<!ELEMENT r ANY>",
+            c,
+            proof,
+            b"<r/>",
+            0,
+            0,
+            None,
+            false,
+        );
+    }
+    // ⑤ 参数实体引用 `%name;`：读到 `%` 后的那个字节才能区分“引用”和“孤立的 %”
+    for c in [&b"%e;"[..], b"% e;", b"%;", b"%1;", b"%>"] {
+        d40_push(
+            &mut v,
+            "子集参数实体",
+            b"<!DOCTYPE r [<!ENTITY % e \"x\">",
+            c,
+            1,
+            b"]><r/>",
+            0,
+            0,
+            Some(13),
+            false,
+        );
+    }
+    // ⑥ 序言里的 `<!DOCTYPE`（94d3c46 已修，作为对照）
+    let ppads: &[(&str, usize)] = if full {
+        &[("", 0), ("<?p?>\n", 5)]
+    } else {
+        &[("", 0)]
+    };
+    for (pad, min_tok) in ppads {
+        d40_keyword(
+            &mut v,
+            "序言 DOCTYPE",
+            D40_PROLOG_INTROS,
+            pad.as_bytes(),
+            b"DOCTYPE",
+            b" r><r/>",
+            // PI 之后的空白不计入 DOCTYPE token（只有文档开头的空白/BOM 计入首个 token）
+            pad.len(),
+            *min_tok,
+            None,
+            full,
+        );
+    }
+    // ⑦ 内容里的 `<![CDATA[`（以及 `<!-` 失配）
+    let cpads: &[(&str, usize)] = if full {
+        &[("<r>", 3), ("<r><a/>", 4)]
+    } else {
+        &[("<r>", 3)]
+    };
+    for (pad, min_tok) in cpads {
+        let mut tmp = Vec::new();
+        d40_keyword(
+            &mut tmp,
+            "内容 CDATA",
+            D40_CONTENT_INTROS,
+            pad.as_bytes(),
+            b"[CDATA[",
+            b"x]]></r>",
+            pad.len(),
+            *min_tok,
+            None,
+            full,
+        );
+        // `<![CDATA[` 完整之后都是字符数据，p = len 不是失配
+        let cdata = format!("{pad}<![CDATA[");
+        tmp.retain(|c| !c.d.starts_with(cdata.as_bytes()));
+        v.extend(tmp);
+        d40_push(
+            &mut v,
+            "内容 CDATA",
+            pad.as_bytes(),
+            b"<!-x-->",
+            3,
+            b"</r>",
+            pad.len(),
+            *min_tok,
+            None,
+            true,
+        );
+    }
+    v
+}
+
+/// 路径：from_bytes、from_vec，以及流式：逐字节、块长 7、3 种随机切块、在边界字节和证明字节处切开；
+/// full 时再加每个切点、16 种随机切块、固定块长和 BufReader 容量。
+fn d40_paths(d: &[u8], c: &ParserConfig, cuts: &[usize], full: bool) -> Vec<(String, Snap)> {
+    let mut out = vec![
+        ("from_bytes".to_string(), bytes(d, c)),
+        ("from_vec".to_string(), vec_path(d, c)),
+    ];
+    let mut plans: Vec<(String, Plan, Option<usize>)> = vec![
+        ("逐字节".into(), Plan::Byte, None),
+        ("块长 7".into(), Plan::Schedule(vec![7]), None),
+    ];
+    let seeds = if full { 16 } else { 3 };
+    for seed in 0..seeds {
+        plans.push((
+            format!("随机 {seed}"),
+            Plan::Schedule(seeded_schedule(seed + 4000)),
+            None,
+        ));
+    }
+    let mut ks: Vec<usize> = cuts
+        .iter()
+        .copied()
+        .filter(|&k| k >= 1 && k < d.len())
+        .collect();
+    if full {
+        ks = (1..d.len()).collect();
+        for n in [1usize, 2, 3, 511, 512, 513, 8192, d.len().max(1)] {
+            plans.push((format!("块长 {n}"), Plan::Schedule(vec![n]), None));
+        }
+        for cap in [1usize, 2, 7, 64] {
+            plans.push((format!("BufReader {cap}"), Plan::Byte, Some(cap)));
+        }
+    }
+    for k in ks {
+        plans.push((format!("切在 {k}"), Plan::Cut(k), None));
+    }
+    for (name, plan, cap) in plans {
+        out.push((name, stream(d, c, plan, cap).snap));
+    }
+    out
+}
+
+fn d40_run(full: bool) -> (usize, Vec<String>, Vec<(String, usize, usize)>) {
+    let dflt = ParserConfig::default();
+    let mut fails = Vec::new();
+    let mut per_ctx: Vec<(String, usize, usize)> = Vec::new();
+    let mut n = 0;
+    for case in d40_cases(full) {
+        let D40Case {
+            ctx,
+            label,
+            d,
+            proof,
+            tok_start,
+            min_tok,
+            sub_start,
+            syntax_at,
+        } = &case;
+        let free = bytes(d, &dflt);
+        // 用例自检：不设限额时报错；只给到证明字节为止的前缀时 from_bytes 结果相同
+        // （截掉证明字节之后的部分不影响判定）。再少一个字节时文档在 EOF 处也是错的，
+        // 错误可能恰好相同，所以“最小性”不做机械检查，由构造保证（见各上下文的注释）。
+        let Err(_) = &free.end else {
+            panic!("{label}：不设限额应报错，实际通过");
+        };
+        if let Some(at) = syntax_at {
+            assert!(
+                matches!(&free.end, Err((ErrorKind::Syntax, p)) if p.offset == *at as u64),
+                "{label}：不设限额应在 {at} 报 Syntax，实际 {:?}",
+                free.end
+            );
+        }
+        assert_eq!(
+            bytes(&d[..=*proof], &dflt).end,
+            free.end,
+            "{label}：证明字节 {proof} 不足以判定"
+        );
+        let lo = proof.saturating_sub(3);
+        let hi = proof + 3;
+        let mut cfgs: Vec<(LimitKind, u64, usize, ParserConfig)> = Vec::new();
+        for cap in lo..=hi {
+            if cap >= *tok_start && cap - tok_start >= *min_tok {
+                let t = (cap - tok_start) as u64;
+                cfgs.push((
+                    LimitKind::TokenLength,
+                    t,
+                    cap,
+                    dflt.clone().with_max_token_len(t),
+                ));
+            }
+            if let Some(s) = sub_start {
+                if cap >= *s {
+                    let u = (cap - s) as u64;
+                    cfgs.push((
+                        LimitKind::InternalSubsetLength,
+                        u,
+                        cap,
+                        dflt.clone().with_max_internal_subset_len(u),
+                    ));
+                }
+            }
+            // 边界落在更早的 token 里时事件流不同，那是别的用例的事
+            if cap >= *tok_start {
+                cfgs.push((
+                    LimitKind::TotalInput,
+                    cap as u64,
+                    cap,
+                    dflt.clone().with_max_total_input(cap as u64),
+                ));
+            }
+        }
+        let slot = match per_ctx.iter().position(|x| x.0 == *ctx) {
+            Some(i) => i,
+            None => {
+                per_ctx.push((ctx.to_string(), 0, 0));
+                per_ctx.len() - 1
+            }
+        };
+        for (kind, limit, cap, c) in cfgs {
+            let want = if cap <= *proof {
+                Snap {
+                    events: free.events.clone(),
+                    end: Err((
+                        ErrorKind::SecurityLimit {
+                            kind,
+                            limit,
+                            actual: limit + 1,
+                        },
+                        position_after(&d[..cap]),
+                    )),
+                }
+            } else {
+                free.clone()
+            };
+            n += 1;
+            per_ctx[slot].1 += 1;
+            let bad: Vec<String> = d40_paths(d, &c, &[cap, *proof, proof + 1], full)
+                .into_iter()
+                .filter(|(_, s)| *s != want)
+                .map(|(p, s)| format!("{p}={:?}", s.end))
+                .collect();
+            if !bad.is_empty() {
+                per_ctx[slot].2 += 1;
+                fails.push(format!(
+                    "{label} {kind:?}={limit}（边界 {cap}，证明 {proof}）：应为 {:?}；不符的路径 {}/{}：{}",
+                    want.end,
+                    bad.len(),
+                    if full { "全部" } else { "取样" },
+                    bad.iter().take(3).cloned().collect::<Vec<_>>().join("；")
+                ));
+            }
+        }
+    }
+    (n, fails, per_ctx)
+}
+
+fn d40_report(name: &str, full: bool) {
+    let (n, fails, per_ctx) = d40_run(full);
+    println!("{name}：{n} 组（文档 × 限额 × 边界字节）");
+    for (ctx, total, bad) in &per_ctx {
+        println!("  {ctx}：{total} 组，不符 {bad}");
+    }
+    // PUREXML_D40_ALL=1 时列出全部不符项（分诊用）
+    let show = if std::env::var_os("PUREXML_D40_ALL").is_some() {
+        fails.len()
+    } else {
+        40
+    };
+    for f in fails.iter().take(show) {
+        println!("  ✗ {f}");
+    }
+    assert!(
+        fails.is_empty(),
+        "{name}：{} / {n} 组不符合 L0 关键字截断规则（前 40 条见上，PUREXML_D40_ALL=1 列出全部）",
+        fails.len()
+    );
+}
+
+#[test]
+fn d40_keyword_and_intro_cuts_vs_byte_limits_sampled() {
+    d40_report("d40_keyword_and_intro_cuts_vs_byte_limits_sampled", false);
+}
+
+#[test]
+#[ignore = "slow: 全部失配字符 × 两种前置 × 每个切点（四路径全切块），每轮 release --ignored 必跑"]
+fn d40_keyword_and_intro_cuts_vs_byte_limits() {
+    d40_report("d40_keyword_and_intro_cuts_vs_byte_limits", true);
+}
+
+/// reader_1byte 的 tight 配置（fuzz/fuzz_targets/common_reader.rs）
+fn d40_fuzz_tight() -> ParserConfig {
+    ParserConfig::default()
+        .with_max_token_len(48)
+        .with_max_internal_subset_len(40)
+        .with_max_text_len(12)
+        .with_max_name_len(6)
+        .with_max_total_input(512)
+}
+
+/// 四路径全切块：每个切点 + all_chunkings；全部与 from_bytes 相同，返回 from_bytes 的结果
+fn d40_every_cut(label: &str, d: &[u8], c: &ParserConfig) -> Snap {
+    let base = all_chunkings(label, d, c);
+    for k in 1..d.len() {
+        assert_same(
+            &format!("{label} [切在 {k}]"),
+            &base,
+            &stream(d, c, Plan::Cut(k), None).snap,
+        );
+    }
+    base
+}
+
+/// pr3f 重放发现的两个 reader_1byte 样本，libFuzzer 最小化到 51 字节（首字节 `\r` 选 tight 配置）。
+/// 边界字节 48 落在 `<!NOTA|t`、`<!NOTAT|t` 里，失配字节是 49：报 TokenLength 48/49 @48。
+#[test]
+fn d40_fuzz_minimal_repros() {
+    let c = d40_fuzz_tight();
+    let cases: [(&str, &[u8], u64, u64); 2] = [
+        (
+            "min-9318",
+            b"\r<!DOCTYPE r [\n<!ENTITY a \"\">\n<!ENTITY a \"\"><!NOTAt",
+            3,
+            20,
+        ),
+        (
+            "min-f0f2",
+            b"\r<!DOCTYPE r [<!ENTITY a \"\">\n<!ENTITY a \"\"><!NOTATt",
+            2,
+            21,
+        ),
+    ];
+    for (name, input, line, column) in cases {
+        assert_eq!(input[0] & 1, 1, "{name}：首字节应选 tight");
+        let d = &input[1..];
+        let s = d40_every_cut(&format!("D40 {name}"), d, &c);
+        assert!(s.events.is_empty(), "D40 {name}：不应有事件 {:?}", s.events);
+        let (k, l, a, p) = limit_of(name, &s);
+        assert_eq!(
+            (k, l, a, p.offset, p.line, p.column),
+            (LimitKind::TokenLength, 48, 49, 48, line, column),
+            "D40 {name}"
+        );
+    }
+}
+
+/// 原始 crash 样本按 reader_1byte 的语义重放（首字节选配置，其余是文档），四路径全切块硬断言。
+#[test]
+fn d40_fuzz_samples_replay_like_reader_1byte() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/fuzz-regressions");
+    for (file, off) in [
+        ("reader_1byte-crash-9318d3f4.bin", 61u64),
+        ("reader_1byte-crash-f0f243d8.bin", u64::MAX),
+    ] {
+        let input = std::fs::read(dir.join(file)).unwrap_or_else(|e| panic!("{file}：{e}"));
+        let c = if input[0] & 1 == 1 {
+            d40_fuzz_tight()
+        } else {
+            ParserConfig::default()
+        };
+        let s = d40_every_cut(&format!("D40 {file}"), &input[1..], &c);
+        let (k, l, a, p) = limit_of(file, &s);
+        assert_eq!((k, l, a), (LimitKind::TokenLength, 48, 49), "D40 {file}");
+        if off != u64::MAX {
+            assert_eq!(p.offset, off, "D40 {file}：position");
+        }
+    }
+}
