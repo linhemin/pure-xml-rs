@@ -2704,6 +2704,23 @@ impl Engine {
                 return Ok(RawStr::Owned(buf));
             }
             if comment && self.starts_with(input, b"--") {
+                // The first dash can already cross `max_text_len`. That limit
+                // does not need the second dash, so it wins over `--` syntax.
+                // Streaming probes on that dash and never shows the second one.
+                let crossing = if plain && on_main {
+                    (self.pos - start) as u64 + 1
+                } else {
+                    buf.len() as u64 + 1
+                };
+                if crossing > self.config.max_text_len {
+                    self.advance_one(input)?;
+                    return Err(self.limit(
+                        input,
+                        LimitKind::TextLength,
+                        self.config.max_text_len,
+                        crossing,
+                    ));
+                }
                 return Err(self.syntax("`--` is not allowed in a comment"));
             }
             if self.peek_byte(input).is_none() {

@@ -1247,3 +1247,21 @@ fn d40_other_markup_matches_the_armed_byte() {
     assert!(matches!(err.kind, ErrorKind::Syntax), "{:?}", err.kind);
     assert_eq!(err.offset, bad as u64);
 }
+
+/// A `--` whose first dash already crosses `max_text_len` is TextLength.
+/// The second dash is not required, and a short stream window does not have it.
+#[test]
+fn comment_dash_at_text_cap_is_text_length() {
+    let doc = b"<!--ssssssssss<!--sssssssssssssssssss";
+    let cfg = ParserConfig::default()
+        .with_max_text_len(12)
+        .with_max_token_len(48);
+    let snap = assert_all_paths("comment dash text cap", doc, &cfg);
+    assert_byte_limit(
+        "comment dash text cap",
+        &snap,
+        LimitKind::TextLength,
+        12,
+        17,
+    );
+}
