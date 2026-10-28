@@ -1156,17 +1156,32 @@ fn token_length_boundaries() {
         m + 1,
         5 + m,
     );
-    // prolog 里的 token 包含前导空白
+    // prolog 里的前导空白不计入下一个 token（Lead 10-28 11:53：token 从 `<` 起算）。
+    // 旧期望（空白计入，“10 空格 + 注释”共 m+1 字节时 @m 报 m/m+1）已作废：
+    // 这两个旧文档的注释只有 m-10、m-9 字节，现在都必须通过。
+    for extra in [0usize, 1] {
+        let d = format!(
+            "{}<!--{}--><r/>",
+            " ".repeat(10),
+            "c".repeat(m as usize - 17 + extra)
+        );
+        pass(
+            "TokenLength 前导空白 + 注释（旧口径的 m / m+1）",
+            d.as_bytes(),
+            &c,
+        );
+    }
+    // 注释本身正好 m 字节：通过；m+1：TokenLength m/m+1 @ 10 + m（token 起点 10 + limit）
     let d = format!(
         "{}<!--{}--><r/>",
         " ".repeat(10),
-        "c".repeat(m as usize - 17)
+        "c".repeat(m as usize - 7)
     );
     pass("TokenLength 前导空白 + 注释 = m", d.as_bytes(), &c);
     let d = format!(
         "{}<!--{}--><r/>",
         " ".repeat(10),
-        "c".repeat(m as usize - 16)
+        "c".repeat(m as usize - 6)
     );
     fail(
         "TokenLength 前导空白 + 注释 m+1",
@@ -1175,7 +1190,7 @@ fn token_length_boundaries() {
         LimitKind::TokenLength,
         m,
         m + 1,
-        m,
+        10 + m,
     );
     // 未闭合的长 token
     let d = format!("<doc><a b=\"{}", "&amp;".repeat(40));
@@ -3113,9 +3128,7 @@ fn default_config_keeps_syntax_and_encoding_outcomes() {
 /// 结果与把这 4 个字节换成 ASCII 的对照文档相同（kind、limit、actual、offset、事件；line/column
 /// 按本文档算），四路径全切块一致。
 ///
-/// 注意：解析器把 `<!DOCTYPE` 前面的序言空白（偏移 17 的 `\n`）算进 DOCTYPE token，起点是 17，
-/// 边界字节是 65；若起点按 `<!DOCTYPE`（18）算则是 66。绝对偏移 66 单独放在
-/// `c12c5a0_doctype_token_starts_at_markup`（#[ignore]，待 Lead 裁定 token 起点口径）。
+/// 绝对偏移 66（DOCTYPE token 从 `<` 起算，Lead 11:53 裁定）由 `c12c5a0_doctype_token_starts_at_markup` 断言。
 #[test]
 fn encoding_vs_byte_limit_c12c5a0_reports_token_length() {
     let d: &[u8] = C12C5A0;
@@ -3147,9 +3160,8 @@ fn encoding_vs_byte_limit_c12c5a0_reports_token_length() {
     );
 }
 
-/// 同一样本的绝对偏移：若 DOCTYPE token 从 `<!DOCTYPE`（18）起算，边界字节就是证明字节 02（66），
-/// 期望 TokenLength 48/49 @66（Lead 11:03 给出的期望值）。94d3c46 / 2431508 都报 @65（起点算到了
-/// 序言空白 17）。是否计入序言空白待 Lead 裁定，裁定后去掉 #[ignore] 或改期望。
+/// 同一样本的绝对偏移（Lead 11:53 裁定：DOCTYPE 前的序言空白不计入 DOCTYPE token，从 `<` 起算）：
+/// token 起点 18，边界字节 = 18 + 48 = 66，正好是证明非法的字节 02，报 TokenLength 48/49 @66。
 #[test]
 fn c12c5a0_doctype_token_starts_at_markup() {
     let d: &[u8] = C12C5A0;
@@ -3316,4 +3328,467 @@ fn encoding_vs_byte_limit_needed_byte_sampled() {
 fn encoding_vs_byte_limit_needed_byte() {
     let n = encoding_vs_byte_limit(all_chunkings);
     println!("encoding_vs_byte_limit_needed_byte：{n} 组");
+}
+
+// ───────────── token 起点：不计前导空白和前一 token 已消费的字节（Lead 11:53 裁定）─────────────
+
+const TL_XD: &str = "<?xml version=\"1.0\"?>";
+
+/// 文档 `d` 中 offset `off` 处的 Position：offset 按原始字节（含 BOM）；
+/// 行列不计 UTF-8 BOM（Lead 10-28 12:25 裁定：BOM 不占列，offset 3 是 1:1；
+/// 落在 BOM 中间，即 offset 0–2，一律报 1:1）。
+fn doc_position(d: &[u8], off: usize) -> Position {
+    if d.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        if off < 3 {
+            return Position {
+                line: 1,
+                column: 1,
+                offset: off as u64,
+            };
+        }
+        let mut p = position_after(&d[3..off]);
+        p.offset = off as u64;
+        p
+    } else {
+        position_after(&d[..off])
+    }
+}
+
+/// (类别, 用例名, token 之前的部分, 目标 token, token 之后的部分, 是否在元素内容里)。
+/// 目标 token 都 ≥ 40 字节，文档里其它 token（含空白文本）都远短于它，
+/// 所以 max_token_len = 目标长度 - 1 时只有目标 token 会越界。
+fn token_start_cases() -> Vec<(
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    bool,
+)> {
+    const DT: &str = "<!DOCTYPE r [<!ENTITY e \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\">]>";
+    const PI: &str = "<?pi xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx?>";
+    const CM: &str = "<!-- xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx -->";
+    const ST: &str = "<r a=\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\">";
+    const EM: &str = "<r a=\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"/>";
+    const STA: &str = "<a b=\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\">";
+    const EMA: &str = "<a b=\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"/>";
+    const ETR: &str = "</r                                       >";
+    const ETA: &str = "</a                                       >";
+    const CD: &str = "<![CDATA[xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]]>";
+    vec![
+        ("DOCTYPE", "XML 声明之后", TL_XD, DT, "<r/>", false),
+        ("DOCTYPE", "文档开头（无声明）", "", DT, "<r/>", false),
+        ("DOCTYPE", "序言注释之后", "<!--c-->", DT, "<r/>", false),
+        ("DOCTYPE", "序言 PI 之后", "<?p?>", DT, "<r/>", false),
+        (
+            "DOCTYPE",
+            "声明 + 注释之后",
+            "<?xml version=\"1.0\"?><!--c-->",
+            DT,
+            "<r/>",
+            false,
+        ),
+        ("PI", "序言：XML 声明之后", TL_XD, PI, "<r/>", false),
+        ("PI", "序言：文档开头（无声明）", "", PI, "<r/>", false),
+        (
+            "PI",
+            "序言：DOCTYPE 之后",
+            "<?xml version=\"1.0\"?><!DOCTYPE r>",
+            PI,
+            "<r/>",
+            false,
+        ),
+        ("PI", "尾声：根元素之后", "<r/>", PI, "", false),
+        ("PI", "尾声：注释之后", "<r/><!--c-->", PI, "", false),
+        ("PI", "元素内容里", "<r>", PI, "</r>", true),
+        ("注释", "序言：XML 声明之后", TL_XD, CM, "<r/>", false),
+        ("注释", "序言：文档开头（无声明）", "", CM, "<r/>", false),
+        (
+            "注释",
+            "序言：DOCTYPE 之后",
+            "<?xml version=\"1.0\"?><!DOCTYPE r>",
+            CM,
+            "<r/>",
+            false,
+        ),
+        ("注释", "尾声：根元素之后", "<r/>", CM, "", false),
+        ("注释", "尾声：PI 之后", "<r/><?p?>", CM, "", false),
+        ("注释", "元素内容里", "<r>", CM, "</r>", true),
+        ("起始标签", "根：XML 声明之后", TL_XD, ST, "</r>", false),
+        ("起始标签", "根：文档开头（无声明）", "", ST, "</r>", false),
+        (
+            "起始标签",
+            "根：DOCTYPE 之后",
+            "<?xml version=\"1.0\"?><!DOCTYPE r>",
+            ST,
+            "</r>",
+            false,
+        ),
+        (
+            "起始标签",
+            "根：序言注释之后",
+            "<!--c-->",
+            ST,
+            "</r>",
+            false,
+        ),
+        ("起始标签", "子元素", "<r>", STA, "</a></r>", true),
+        ("空元素", "根：XML 声明之后", TL_XD, EM, "", false),
+        ("空元素", "根：文档开头（无声明）", "", EM, "", false),
+        (
+            "空元素",
+            "根：DOCTYPE 之后",
+            "<?xml version=\"1.0\"?><!DOCTYPE r>",
+            EM,
+            "",
+            false,
+        ),
+        ("空元素", "子元素", "<r>", EMA, "</r>", true),
+        (
+            "空元素",
+            "子元素：前一兄弟之后",
+            "<r><b/>",
+            EMA,
+            "</r>",
+            true,
+        ),
+        ("结束标签", "根", "<r>", ETR, "", true),
+        ("结束标签", "根：子元素之后", "<r><b/>", ETR, "", true),
+        ("结束标签", "子元素", "<r><a>", ETA, "</r>", true),
+        ("CDATA", "元素内容里", "<r>", CD, "</r>", true),
+        ("CDATA", "子元素之后", "<r><b/>", CD, "</r>", true),
+        // Lead 10-28 12:07：BOM 不计入第一个 token（仍计入 TotalInput，偏移按原始字节）
+        ("DOCTYPE", "BOM 之后", "\u{FEFF}", DT, "<r/>", false),
+        (
+            "DOCTYPE",
+            "BOM + XML 声明之后",
+            "\u{FEFF}<?xml version=\"1.0\"?>",
+            DT,
+            "<r/>",
+            false,
+        ),
+        ("起始标签", "根：BOM 之后", "\u{FEFF}", ST, "</r>", false),
+        ("空元素", "根：BOM 之后", "\u{FEFF}", EM, "", false),
+        ("PI", "序言：BOM 之后", "\u{FEFF}", PI, "<r/>", false),
+        ("注释", "序言：BOM 之后", "\u{FEFF}", CM, "<r/>", false),
+        // 尾声：空白之后连续的注释、PI
+        ("注释", "尾声：注释之后", "<r/><!--c-->", CM, "", false),
+        ("PI", "尾声：PI 之后", "<r/><?p?>", PI, "", false),
+    ]
+}
+
+/// 前导部分：各种空白；元素内容里另加非空白文本、实体引用（前一 token 已消费的字节）。
+fn token_start_prefixes(in_content: bool) -> Vec<&'static str> {
+    let mut v = vec!["", " ", "\t", "\n", "\r\n", "  \t\n \r\n\t  \n"];
+    if in_content {
+        v.extend(["abc", "a\nb ", "&amp;", " x&lt;\n"]);
+    }
+    v
+}
+
+fn token_limit_outcome(s: &Snap) -> Option<(LimitKind, u64, u64)> {
+    match &s.end {
+        Err((
+            ErrorKind::SecurityLimit {
+                kind,
+                limit,
+                actual,
+            },
+            _,
+        )) => Some((*kind, *limit, *actual)),
+        _ => None,
+    }
+}
+
+/// 对每个用例 × 前导部分：
+/// - max_token_len = L（目标 token 长度）和 L+1：通过，结果与不设限额完全相同；
+/// - L-1：报 TokenLength L-1 / L，position = position_after(d[..起点 + L-1])（起点是目标 token 的 `<`）；
+/// - 对照：去掉前导部分的文档，在这三个上限下的判定（通过/失败、kind、limit、actual）相同；
+/// - TotalInput 仍按绝对字节：tot = 起点 + L-1 时报 TotalInput @起点 + L-1（前导部分计入）。
+///
+/// 每个组合单独 catch_unwind，最后列出全部失败的组合再 panic（硬断言，不放松）。
+fn token_length_excludes_prefix(paths: fn(&str, &[u8], &ParserConfig) -> Snap) -> usize {
+    let dflt = ParserConfig::default();
+    let mut fails: Vec<String> = Vec::new();
+    let mut n = 0;
+    for (kind, name, pre, tok, post, in_content) in token_start_cases() {
+        for ws in token_start_prefixes(in_content) {
+            n += 1;
+            let label = format!("{kind}·{name}·前导 {ws:?}");
+            let lbl = label.clone();
+            let dflt = dflt.clone();
+            let r = std::panic::catch_unwind(move || {
+                let mk = |w: &str| {
+                    let mut d = Vec::new();
+                    d.extend_from_slice(pre.as_bytes());
+                    d.extend_from_slice(w.as_bytes());
+                    d.extend_from_slice(tok.as_bytes());
+                    d.extend_from_slice(post.as_bytes());
+                    d
+                };
+                let d = mk(ws);
+                let ctl = mk("");
+                let start = pre.len() + ws.len();
+                let l = tok.len() as u64;
+                let free = paths(&format!("{lbl} 不设限额"), &d, &dflt);
+                assert_eq!(free.end, Ok(()), "{lbl}：文档本身应合法");
+                for t in [l - 1, l, l + 1] {
+                    let c = dflt.clone().with_max_token_len(t);
+                    let s = paths(&format!("{lbl} tok={t}"), &d, &c);
+                    let sc = paths(&format!("{lbl} tok={t} 对照（去掉前导）"), &ctl, &c);
+                    if t >= l {
+                        assert_eq!(s, free, "{lbl} tok={t}：token 长度 {l} ≤ 上限，应通过");
+                    } else {
+                        let at = start + (l - 1) as usize;
+                        let want = Err((
+                            ErrorKind::SecurityLimit {
+                                kind: LimitKind::TokenLength,
+                                limit: l - 1,
+                                actual: l,
+                            },
+                            doc_position(&d, at),
+                        ));
+                        assert_eq!(
+                            s.end, want,
+                            "{lbl} tok={t}：应在 token 起点 {start} + {t} = {at} 报 TokenLength {t}/{l}"
+                        );
+                    }
+                    assert_eq!(
+                        token_limit_outcome(&s),
+                        token_limit_outcome(&sc),
+                        "{lbl} tok={t}：与去掉前导部分的对照文档判定不同"
+                    );
+                }
+                let u = (start as u64) + l - 1;
+                let s = paths(
+                    &format!("{lbl} tot={u}"),
+                    &d,
+                    &dflt.clone().with_max_total_input(u),
+                );
+                assert_eq!(
+                    s.end,
+                    Err((
+                        ErrorKind::SecurityLimit {
+                            kind: LimitKind::TotalInput,
+                            limit: u,
+                            actual: u + 1,
+                        },
+                        doc_position(&d, u as usize),
+                    )),
+                    "{lbl} tot={u}：TotalInput 按绝对字节"
+                );
+            });
+            if let Err(e) = r {
+                let msg = e
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|x| x.to_string()))
+                    .unwrap_or_default();
+                fails.push(format!("{label}：{}", msg.lines().next().unwrap_or("")));
+            }
+        }
+    }
+    assert!(
+        fails.is_empty(),
+        "{} / {n} 组失败：\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+    n
+}
+
+#[test]
+fn token_length_excludes_consumed_prefix_and_leading_ws_sampled() {
+    let n = token_length_excludes_prefix(quick_paths);
+    println!("token_length_excludes_consumed_prefix_and_leading_ws_sampled：{n} 组");
+}
+
+#[test]
+#[ignore = "slow: 全切块版，每轮 release --ignored 必跑"]
+fn token_length_excludes_consumed_prefix_and_leading_ws() {
+    let n = token_length_excludes_prefix(all_chunkings);
+    println!("token_length_excludes_consumed_prefix_and_leading_ws：{n} 组");
+}
+
+// ---------------------------------------------------------------------------
+// Lead 10-28 12:07 最终裁定：序言、尾声里的空白和 BOM 都不计入任何 token；
+// token 一律从 `<` 起算；BOM 仍计入 TotalInput，偏移照常按原始字节。
+// 下面是写死绝对偏移的边界用例（-1 / = / +1），与上面的通用用例互为对照。
+// ---------------------------------------------------------------------------
+
+const BOM: &str = "\u{FEFF}";
+
+/// tok = l-1 报 TokenLength (l-1)/l @ start+l-1；tok = l、l+1 通过且与不设限额相同。
+/// 四路径全切块（all_chunkings）硬断言。
+#[track_caller]
+fn token_boundary_3(label: &str, d: &[u8], start: usize, l: usize) {
+    assert!(d[start] == b'<', "{label}：start {start} 不是 '<'");
+    let free = all_chunkings(&format!("{label} 不设限额"), d, &ParserConfig::default());
+    assert!(
+        free.end.is_ok(),
+        "{label}：文档本身应合法，实际 {:?}",
+        free.end
+    );
+    for t in [l, l + 1] {
+        let c = ParserConfig::default().with_max_token_len(t as u64);
+        let s = all_chunkings(&format!("{label} tok={t}"), d, &c);
+        assert_eq!(s, free, "{label} tok={t}：应通过，结果与不设限额相同");
+    }
+    let t = (l - 1) as u64;
+    let c = ParserConfig::default().with_max_token_len(t);
+    let s = all_chunkings(&format!("{label} tok={t}"), d, &c);
+    let at = start + l - 1;
+    assert_eq!(
+        s.end,
+        Err((
+            ErrorKind::SecurityLimit {
+                kind: LimitKind::TokenLength,
+                limit: t,
+                actual: t + 1,
+            },
+            doc_position(d, at),
+        )),
+        "{label} tok={t}：应在 token 起点 {start} + {t} = {at} 报 TokenLength {t}/{}",
+        t + 1
+    );
+}
+
+/// Lead 10-28 12:07：BOM 不计入第一个 token。
+#[test]
+fn bom_not_counted_in_first_token() {
+    let em = "<r a=\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"/>";
+    let d = format!("{BOM}{em}");
+    token_boundary_3("BOM + 根空元素", d.as_bytes(), 3, em.len());
+    let st = "<r a=\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\">";
+    let d = format!("{BOM}{st}</r>");
+    token_boundary_3("BOM + 根开始标签", d.as_bytes(), 3, st.len());
+    // 极小上限：BOM + `<r/>`，tok=4 通过，tok=3 在 `>`（offset 6）报 3/4
+    token_boundary_3("BOM + <r/>", format!("{BOM}<r/>").as_bytes(), 3, 4);
+    let dt = "<!DOCTYPE r [<!ENTITY e \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\">]>";
+    let d = format!("{BOM}{dt}<r/>");
+    token_boundary_3("BOM + DOCTYPE", d.as_bytes(), 3, dt.len());
+    // BOM + 空白 + DOCTYPE：空白也不计入
+    let d = format!("{BOM}\r\n \t{dt}<r/>");
+    token_boundary_3("BOM + 空白 + DOCTYPE", d.as_bytes(), 7, dt.len());
+    // BOM + XML 声明：声明从 `<` 起算（21 字节）
+    let xd = "<?xml version=\"1.0\"?>";
+    let d = format!("{BOM}{xd}<r/>");
+    token_boundary_3("BOM + XML 声明", d.as_bytes(), 3, xd.len());
+}
+
+/// Lead 10-28 12:07：BOM 仍计入 TotalInput，偏移按原始字节。
+#[test]
+fn bom_counted_in_total_input() {
+    let d = format!("{BOM}<r/>");
+    let d = d.as_bytes();
+    assert_eq!(d.len(), 7);
+    let free = all_chunkings("BOM tot 不设限额", d, &ParserConfig::default());
+    assert!(free.end.is_ok());
+    for t in [7u64, 8] {
+        let c = ParserConfig::default().with_max_total_input(t);
+        assert_eq!(
+            all_chunkings(&format!("BOM tot={t}"), d, &c),
+            free,
+            "tot={t}"
+        );
+    }
+    let dt = "<!DOCTYPE r [<!ENTITY e \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\">]>";
+    let d2 = format!("{BOM}{dt}<r/>");
+    let cases: Vec<(&str, &[u8], u64)> = vec![
+        ("BOM + <r/>", d, 3),
+        ("BOM + <r/>", d, 4),
+        ("BOM + <r/>", d, 6),
+        ("BOM + DOCTYPE", d2.as_bytes(), 3),
+        ("BOM + DOCTYPE", d2.as_bytes(), 10),
+        ("BOM + DOCTYPE", d2.as_bytes(), 3 + dt.len() as u64 - 1),
+    ];
+    for (label, d, t) in cases {
+        let c = ParserConfig::default().with_max_total_input(t);
+        let s = all_chunkings(&format!("{label} tot={t}"), d, &c);
+        assert_eq!(
+            s.end,
+            Err((
+                ErrorKind::SecurityLimit {
+                    kind: LimitKind::TotalInput,
+                    limit: t,
+                    actual: t + 1,
+                },
+                doc_position(d, t as usize),
+            )),
+            "{label} tot={t}：应在 offset {t} 报 TotalInput {t}/{}",
+            t + 1
+        );
+    }
+}
+
+/// Lead 10-28 12:07：尾声空白不计入其后的注释 / PI。
+#[test]
+fn epilog_ws_then_comment_or_pi_token_boundaries() {
+    let cm = "<!-- xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx -->";
+    let pi = "<?pi xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx?>";
+    for ws in [" ", "\t", "\n", "\r\n", "  \t\n \r\n\t  \n"] {
+        let w = ws.len();
+        let d = format!("<r/>{ws}{cm}");
+        token_boundary_3(
+            &format!("尾声 {ws:?} + 注释"),
+            d.as_bytes(),
+            4 + w,
+            cm.len(),
+        );
+        let d = format!("<r/>{ws}{pi}");
+        token_boundary_3(&format!("尾声 {ws:?} + PI"), d.as_bytes(), 4 + w, pi.len());
+        // 连续的 Misc：注释 + 空白 + PI、PI + 空白 + 注释
+        let d = format!("<r/>{ws}<!--c-->{ws}{pi}");
+        token_boundary_3(
+            &format!("尾声 注释 {ws:?} + PI"),
+            d.as_bytes(),
+            4 + w + 8 + w,
+            pi.len(),
+        );
+        let d = format!("<r/>{ws}<?p?>{ws}{cm}");
+        token_boundary_3(
+            &format!("尾声 PI {ws:?} + 注释"),
+            d.as_bytes(),
+            4 + w + 5 + w,
+            cm.len(),
+        );
+    }
+}
+
+/// D39（Lead 10-28 12:25 认可）：TotalInput 截在 BOM 中间或刚好截在 BOM 之后，
+/// 四路径 × 全切块都报 TotalInput t/t+1 @t，行列 1:1（BOM 不占列，BOM 中间也报 1:1），
+/// offset 按原始字节。tot = 0（配置允许）同理 @0 1:1；tot = 3 是 BOM 后第一个字节 @3 1:1。
+#[test]
+fn bom_split_by_total_input_paths_agree() {
+    let d = format!("{BOM}<r/>");
+    let d = d.as_bytes();
+    for t in [0u64, 1, 2, 3] {
+        let label = format!("BOM 中间 tot={t}");
+        let c = ParserConfig::default().with_max_total_input(t);
+        let s = all_chunkings(&label, d, &c);
+        assert!(s.events.is_empty(), "{label}：不应产出事件：{:?}", s.events);
+        let want = Position {
+            line: 1,
+            column: 1,
+            offset: t,
+        };
+        assert_eq!(
+            doc_position(d, t as usize),
+            want,
+            "{label}：doc_position 自检"
+        );
+        assert_eq!(
+            s.end,
+            Err((
+                ErrorKind::SecurityLimit {
+                    kind: LimitKind::TotalInput,
+                    limit: t,
+                    actual: t + 1,
+                },
+                want,
+            )),
+            "{label}：四路径都应报 TotalInput {t}/{} @{t}（1:1）",
+            t + 1
+        );
+    }
 }
