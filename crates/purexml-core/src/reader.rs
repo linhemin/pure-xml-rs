@@ -660,6 +660,22 @@ impl Engine {
         }
     }
 
+    fn scanner_poll_label(&self, input: &[u8]) -> String {
+        let start = self.token_origin.offset.saturating_sub(self.base) as usize;
+        if start > input.len() {
+            return format!("start {start} past window");
+        }
+        let content = matches!(self.phase, Phase::Content);
+        let doc_start = start == 0 && input.starts_with(&[0xEF, 0xBB, 0xBF]);
+        let mut framer = Framer::start(start, doc_start, content);
+        let shown: String = input.iter().take(16).map(|b| format!("{b:02x}")).collect();
+        match framer.poll(input, self.end_is_eof, &self.config) {
+            Poll::Probe { end } => format!("Probe end={end} content={content} [{shown}]"),
+            Poll::NeedMore => format!("NeedMore content={content} [{shown}]"),
+            Poll::Ready { eof } => format!("Ready eof={eof} content={content} [{shown}]"),
+        }
+    }
+
     /// Cursor sitting on the byte `index` bytes after `token_origin`.
     ///
     /// Index 0 is the first byte of the token. Scanning `index` bytes leaves
@@ -826,22 +842,23 @@ impl Engine {
     #[inline(never)]
     fn breach_at_cursor(&self, input: &[u8]) -> Error {
         let facts = self.limit_facts(None);
-        let decision = decide_limit(&facts).unwrap_or_else(|| {
-            let limit = self.config.max_token_len;
-            crate::limit::LimitDecision {
-                kind: LimitKind::TokenLength,
-                limit,
-                actual: limit.saturating_add(1),
-                offset: self.token_origin.offset.saturating_add(limit),
-            }
-        });
+        let Some(decision) = decide_limit(&facts) else {
+            debug_assert!(
+                false,
+                "breach_at_cursor with no exceeded cap (pos {}, stop {})",
+                self.pos, self.main_stop
+            );
+            return Error::new(ErrorKind::Syntax, self.pos_now(), "internal limit dispatch");
+        };
         if decision.kind == LimitKind::TokenLength {
             debug_assert!(
                 self.token_limit_matches_scanner(input),
-                "TokenLength: scanner and engine disagree (origin {:?}, pos {}, window {})",
+                "TokenLength: scanner and engine disagree (origin {:?}, pos {}, window {}, max {}, {})",
                 self.token_origin,
                 self.pos,
-                input.len()
+                input.len(),
+                self.config.max_token_len,
+                self.scanner_poll_label(input)
             );
         }
         self.error_from_decision(input, decision, self.pos_now())
@@ -982,11 +999,12 @@ impl Engine {
         self.skip_ws(input)?;
         if self.peek_byte(input).is_none() && self.frames.is_empty() {
             if !self.end_is_eof {
-                return Err(self.token_limit(input));
+                return Err(self.end_input(input, "unexpected end of input in the epilog"));
             }
             self.phase = Phase::Done;
             return Ok(None);
         }
+        self.breach_if_cut(input, &[b"<!--", b"<?"])?;
         if self.starts_with(input, b"<!--") {
             return Ok(Some(RawEvent::Comment(self.parse_comment(input)?)));
         }
@@ -1181,6 +1199,7 @@ impl Engine {
         self.skip_ws(input)?;
         let mut system_id = None;
         let mut public_id = None;
+        self.breach_if_cut(input, &[b"SYSTEM", b"PUBLIC"])?;
         if self.starts_with_token(input, b"SYSTEM") {
             self.advance_n(input, 6)?;
             self.expect_ws(input)?;
@@ -1411,6 +1430,7 @@ impl Engine {
     }
 
     fn parse_contentspec(&mut self, input: &[u8]) -> Result<()> {
+        self.breach_if_cut(input, &[b"EMPTY", b"ANY"])?;
         if self.starts_with_token(input, b"EMPTY") {
             self.advance_n(input, "EMPTY".len())?;
             return Ok(());
@@ -1680,6 +1700,7 @@ impl Engine {
     }
 
     fn parse_default_decl(&mut self, input: &[u8], cdata: bool) -> Result<Option<Arc<str>>> {
+        self.breach_if_cut(input, &[b"#REQUIRED", b"#IMPLIED", b"#FIXED"])?;
         if self.starts_with_token(input, b"#REQUIRED") {
             self.advance_n(input, "#REQUIRED".len())?;
             return Ok(None);
@@ -1719,6 +1740,7 @@ impl Engine {
         let _name = self.read_ncname_decl(input, "notation name")?;
         self.expect_ws(input)?;
         self.reject_dtd_pe(input)?;
+        self.breach_if_cut(input, &[b"SYSTEM", b"PUBLIC"])?;
         if self.starts_with_token(input, b"SYSTEM") {
             self.advance_n(input, "SYSTEM".len())?;
             self.expect_ws(input)?;
@@ -2431,8 +2453,23 @@ impl Engine {
                         i += n;
                     }
                     Err(()) => {
+                        let at = start + i;
+                        let width = match bytes.get(i).copied() {
+                            Some(0xC0..=0xDF) => 2,
+                            Some(0xE0..=0xEF) => 3,
+                            Some(0xF0..=0xF7) => 4,
+                            _ => 1,
+                        };
+                        if at >= self.main_stop {
+                            return self.stop_plain_scan(input, i);
+                        }
+                        if self.main_stop < at + width && self.main_stop < input.len() {
+                            return self.stop_plain_scan(input, self.main_stop - start);
+                        }
+                        // A short non-eof window is not the token cap. The
+                        // slow path, or a later byte, decides.
                         if self.cut_utf8(&bytes[i..]) {
-                            return Err(self.token_limit(input));
+                            return Ok(None);
                         }
                         self.advance_n(input, i)?;
                         return Err(self.encoding("malformed UTF-8"));
@@ -2665,6 +2702,7 @@ impl Engine {
     /// The caller still reports [`ErrorKind::ExternalEntityForbidden`]. A
     /// notation name that is not an NCName is [`ErrorKind::Syntax`] instead.
     fn scan_external_notation(&mut self, input: &[u8]) -> Result<()> {
+        self.breach_if_cut(input, &[b"SYSTEM", b"PUBLIC"])?;
         if self.starts_with_token(input, b"SYSTEM") {
             self.advance_n(input, 6)?;
             self.expect_ws(input)?;
@@ -3027,8 +3065,14 @@ impl Engine {
             Some(Ok(ch)) => Ok(Some(ch)),
             Some(Err(())) => {
                 let slice = self.current_bytes(input);
-                if self.cut_utf8(slice) {
-                    Err(self.token_limit(input))
+                if self.cursor_limited(input) {
+                    Err(self.breach_at_cursor(input))
+                } else if self.cut_utf8(slice) {
+                    if self.char_reaches_cap(input) {
+                        Err(self.land_and_breach(input))
+                    } else {
+                        Err(self.end_input(input, "unexpected end of input"))
+                    }
                 } else {
                     Err(self.encoding("malformed UTF-8"))
                 }
@@ -3054,8 +3098,14 @@ impl Engine {
             Some(Ok(value)) => Ok(value),
             Some(Err(())) => {
                 let slice = self.current_bytes(input);
-                if self.cut_utf8(slice) {
-                    Err(self.token_limit(input))
+                if self.cursor_limited(input) {
+                    Err(self.breach_at_cursor(input))
+                } else if self.cut_utf8(slice) {
+                    if self.char_reaches_cap(input) {
+                        Err(self.land_and_breach(input))
+                    } else {
+                        Err(self.end_input(input, "unexpected end of input"))
+                    }
                 } else {
                     Err(self.encoding("malformed UTF-8"))
                 }
@@ -3221,6 +3271,25 @@ impl Engine {
     fn stop_plain_scan(&mut self, input: &[u8], scanned: usize) -> Result<Option<RawStr>> {
         self.advance_n(input, scanned)?;
         Err(self.breach_at_cursor(input))
+    }
+
+    fn char_reaches_cap(&self, input: &[u8]) -> bool {
+        if !self.frames.is_empty() {
+            return false;
+        }
+        let rest = self.current_bytes(input);
+        let Some(&lead) = rest.first() else {
+            return false;
+        };
+        let width = match lead {
+            0x00..=0x7F => 1,
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => 1,
+        };
+        let cap = self.main_stop;
+        cap >= self.pos && cap < self.pos.saturating_add(width) && cap < input.len()
     }
 
     fn breach_if_cut(&mut self, input: &[u8], tokens: &[&[u8]]) -> Result<()> {

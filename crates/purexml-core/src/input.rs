@@ -473,6 +473,10 @@ impl Framer {
                         let width = match self.char_width(buf, eof) {
                             Ok(width) => width,
                             Err(done) => {
+                                if let Some(cut) = self.probe_char_cap(buf, config.max_token_len) {
+                                    self.state = State::Text { start, plain };
+                                    return cut;
+                                }
                                 self.state = State::Text { start, plain };
                                 return done;
                             }
@@ -641,6 +645,28 @@ impl Framer {
         }
     }
 
+    /// An incomplete UTF-8 character still counts. If the token cap byte is
+    /// one of the buffered bytes of that character, probe there instead of
+    /// waiting for the rest of the character.
+    fn probe_char_cap(&self, buf: &[u8], max_token: u64) -> Option<Poll> {
+        let &lead = buf.get(self.i)?;
+        let width = match lead {
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => 1,
+        };
+        let max = usize::try_from(max_token).unwrap_or(usize::MAX);
+        let cap = self.anchor.saturating_add(max);
+        if self.i <= cap && cap < self.i.saturating_add(width) && cap < buf.len() {
+            Some(Poll::Probe {
+                end: cap.saturating_add(1),
+            })
+        } else {
+            None
+        }
+    }
+
     /// Move to `dest` without reading past the token cap.
     ///
     /// Markup classification jumps over `<?`, `<!--`, and `<!DOCTYPE`.
@@ -725,6 +751,10 @@ impl Framer {
             let width = match self.char_width(buf, eof) {
                 Ok(width) => width,
                 Err(done) => {
+                    if let Some(cut) = self.probe_char_cap(buf, config.max_token_len) {
+                        self.remember_delimited(mark);
+                        return Some(cut);
+                    }
                     self.remember_delimited(mark);
                     return Some(done);
                 }
@@ -905,6 +935,10 @@ impl Framer {
                         let width = match self.char_width(buf, eof) {
                             Ok(width) => width,
                             Err(done) => {
+                                if let Some(cut) = self.probe_char_cap(buf, config.max_token_len) {
+                                    self.state = State::Pi(pi);
+                                    return Some(cut);
+                                }
                                 self.state = State::Pi(pi);
                                 return Some(done);
                             }
