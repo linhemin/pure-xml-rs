@@ -50,8 +50,9 @@ const SUBSET_MARKUP: &[&[u8]] = &[
     b"<!ELEMENT",
     b"<!ATTLIST",
     b"<!NOTATION",
-    b"<![INCLUDE[",
-    b"<![IGNORE[",
+    // `<![` is the whole decision. Bytes after `[` are not needed to know
+    // a conditional section is illegal in the internal subset.
+    b"<![",
 ];
 
 /// Streaming XML reader.

@@ -1060,8 +1060,6 @@ fn d40_subset_keyword_mismatch_respects_armed_byte() {
         ("ENTITY", "<!ENTITY"),
         ("ATTLIST", "<!ATTLIST"),
         ("NOTATION", "<!NOTATION"),
-        ("INCLUDE", "<![INCLUDE["),
-        ("IGNORE", "<![IGNORE["),
         ("comment", "<!--"),
         ("pi", "<?"),
     ];
@@ -1117,6 +1115,36 @@ fn d40_subset_keyword_mismatch_respects_armed_byte() {
                     &snap,
                     LimitKind::InternalSubsetLength,
                     subset_limit,
+                    cap as u64,
+                );
+            }
+        }
+    }
+
+    // `<![` is decided at the `[`. A cap after that byte is Syntax at `<!`.
+    for cond in [
+        "<![INCLUDE[<!ELEMENT r ANY>]]>",
+        "<![IGNORE[ x ]]>",
+        "<![CDATA[x]]>",
+    ] {
+        let doc = format!("{PRE}{cond}]><r/>");
+        let doc = doc.as_bytes();
+        let proof = start + 2;
+        for (which, cap) in [("before", proof + 1), ("at", proof), ("after", proof - 1)] {
+            let token = ParserConfig::default()
+                .with_max_token_len(cap as u64)
+                .with_max_internal_subset_len((proof + 8) as u64);
+            let snap = assert_all_paths(&format!("cond {cond} token {which}"), doc, &token);
+            if which == "before" {
+                let err = snap.err.unwrap();
+                assert!(matches!(err.kind, ErrorKind::Syntax), "{:?}", err.kind);
+                assert_eq!(err.offset, start as u64);
+            } else {
+                assert_byte_limit(
+                    &format!("cond token {which}"),
+                    &snap,
+                    LimitKind::TokenLength,
+                    cap as u64,
                     cap as u64,
                 );
             }
