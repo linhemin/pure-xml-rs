@@ -2470,6 +2470,7 @@ impl Engine {
                 if (i as u64) > self.config.max_text_len {
                     self.advance_n(input, i)?;
                     return Err(self.limit(
+                        input,
                         LimitKind::TextLength,
                         self.config.max_text_len,
                         i as u64,
