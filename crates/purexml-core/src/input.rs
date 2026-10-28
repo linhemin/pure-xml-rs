@@ -375,6 +375,11 @@ impl Framer {
                         continue;
                     }
                     self.anchor = self.i;
+                    // The first token byte counts, including when the cap is 0
+                    // and this byte itself is already past it.
+                    if let Err(done) = self.consider(buf, eof, config.max_token_len) {
+                        return done;
+                    }
                     if buf[self.i] == b'<' {
                         self.i += 1;
                         self.state = State::Lt { at: self.i - 1 };
