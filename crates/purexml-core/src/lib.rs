@@ -19,6 +19,8 @@
 mod config;
 mod error;
 mod event;
+mod input;
+mod limit;
 mod name;
 mod reader;
 mod rules;
@@ -28,14 +30,16 @@ mod writer;
 pub use config::{
     ParserConfig, DEFAULT_MAX_ATTRS, DEFAULT_MAX_DEPTH, DEFAULT_MAX_ENTITY_DEPTH,
     DEFAULT_MAX_ENTITY_EXPANSIONS, DEFAULT_MAX_EXPANDED_BYTES, DEFAULT_MAX_EXPANSION_RATIO,
-    DEFAULT_MAX_NAME_LEN, DEFAULT_MAX_TEXT_LEN, DEFAULT_MAX_TOTAL_INPUT,
-    EXPANSION_RATIO_FLOOR_BYTES,
+    DEFAULT_MAX_INTERNAL_SUBSET_LEN, DEFAULT_MAX_NAME_LEN, DEFAULT_MAX_TEXT_LEN,
+    DEFAULT_MAX_TOKEN_LEN, DEFAULT_MAX_TOTAL_INPUT, EXPANSION_RATIO_FLOOR_BYTES,
 };
 pub use error::{Error, ErrorKind, LimitKind, Position, Result};
 pub use event::{
     Attribute, Doctype, EmptyElement, EndElement, Event, Namespace, ProcessingInstruction, QName,
     StartElement, XmlDecl, XmlText, XMLNS_NAMESPACE, XML_NAMESPACE,
 };
+pub use input::IoInput;
+pub use limit::{decide_limit, LimitDecision, LimitFacts, MeasuredLimit};
 pub use reader::Reader;
 pub use writer::{escape_attribute, escape_text, WriteError, Writer};
 

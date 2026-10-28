@@ -160,3 +160,86 @@ Lead 2026-10-21 08:45 裁定 F-2：这一组 **只记录，不作门槛**，M4 �
 - 这组数字是 **M1 实现（读完再解析）** 的参考值，不代表 PR-B 的真正流式实现。PR-B 后每次都要在同一时段重测 from_bytes 和 from_reader，记录倍数，目标仍是 ≤ 1.3 倍，超过只报告、不阻塞。
 - 按“门槛只做同时段对比”的裁定，本表不和 R0 表的 from_bytes 数字直接比较。
 - 原始输出：`/workspace/purexml/m2-f2-bench-8c8f674-run{1,2,3}.txt`，日志 `m2-f2-bench.log`。
+
+## M2 R2 / R2b：PR-B 门槛（对 main 257c900，同时段交替 3 轮）
+
+方法和 R0 一样：release，`taskset -c 2-5`，`PXB_SAMPLES=50 PXB_WARMUP=2 PXB_MEAS_SMALL=5 PXB_MEAS_LARGE=10`，bench 源码都是 staging 的 `benches/baseline.rs`。数值是 criterion 的点估计（1 KB 组单位 µs，1 MB 组单位 ms）。门槛：from_bytes 慢超过 10% 阻塞，5–10% 警告。
+
+### R2b：d2944ce 对 257c900（10:36–11:12 上海时间）——**阻塞（D30）**
+
+| 组（from_bytes） | d2944ce 三轮 | 257c900 三轮 | 中位数变化 | 判定 |
+|---|---|---|---|---|
+| config 1 KB | 42.00 / 38.74 / 41.01 | 32.14 / 32.72 / 32.18 | +27.5% | 阻塞 |
+| attr-dense 1 KB | 55.03 / 52.27 / 53.99 | 49.97 / 48.96 / 50.36 | +8.0% | 警告 |
+| text-dense 1 KB | 28.80 / 28.00 / 27.83 | 24.46 / 23.71 / 24.05 | +16.4% | 阻塞 |
+| ns-dense 1 KB | 59.01 / 54.78 / 57.44 | 48.15 / 49.82 / 48.49 | +18.5% | 阻塞 |
+| config 1 MB | 39.34 / 37.33 / 39.39 | 30.07 / 29.35 / 30.13 | +30.8% | 阻塞 |
+| attr-dense 1 MB | 47.88 / 47.27 / 49.51 | 42.57 / 44.21 / 46.77 | +8.3% | 警告 |
+| text-dense 1 MB | 22.43 / 21.56 / 23.25 | 17.95 / 18.45 / 19.12 | +21.6% | 阻塞 |
+| ns-dense 1 MB | 51.09 / 51.14 / 52.74 | 41.67 / 42.12 / 45.15 | +21.4% | 阻塞 |
+
+- 噪声：对照库同一二进制的轮间漂移最大 17%（A 的 1 KB 组）和 10%（B 的 1 MB 组），比 R0 吵。阻塞组的回退在每一轮配对里都 ≥ 9.9%，最坏配对 +9.9% 到 +23.9%，而且 a09d599 那次更安静的测量结果相同，所以判定不变。D30 修复后要在安静时段重测。
+- from_reader / from_bytes（1 MB，中位数）：config 1.02、attr-dense 1.04、text-dense 1.06、ns-dense 1.02，都 ≤ 1.3 倍。from_reader 的绝对值比 257c900 慢 +10% 到 +29%。
+- 原始输出：`/workspace/purexml/m2b2-bench-{d2944ce,257c900}-run{1,2,3}.txt`。
+
+### R2（参考）：a09d599 对 257c900（09:57–10:32 上海时间）——已被 d2944ce 取代
+
+| 组 | a09d599 中位数 | 257c900 中位数 | 变化 |
+|---|---|---|---|
+| config 1 KB | 42.48 | 31.62 | +34.3% |
+| attr-dense 1 KB | 54.58 | 50.29 | +8.5% |
+| text-dense 1 KB | 26.66 | 23.63 | +12.8% |
+| ns-dense 1 KB | 58.75 | 48.04 | +22.3% |
+| config 1 MB | 39.93 | 30.22 | +32.2% |
+| attr-dense 1 MB | 48.53 | 44.41 | +9.3% |
+| text-dense 1 MB | 20.97 | 18.84 | +11.3% |
+| ns-dense 1 MB | 53.25 | 43.34 | +22.9% |
+
+- 同一二进制的轮间漂移 ≤ 6.0%。from_reader / from_bytes：1.02 / 1.01 / 1.06 / 1.02。原始输出：`m2b-bench-{a09d599,257c900}-run{1,2,3}.txt`。
+
+## M2 from_reader 新基线（PR-B 4d7ebe2，Lead 12:37 裁定 G-2）
+
+- **来由**：257c900 的 from_reader 是先把整个文档读入再按切片解析，和真正流式的实现没有可比性。所以从 v8 起，from_reader 不再和 257c900 比，以 4d7ebe2 为新基线。
+- **以后怎么比**：
+  - 每轮只记录 from_reader 相对**同一版、同一时段** from_bytes 的倍数：≤ 1.3 只记录；> 1.5 单独标出。
+  - 和本基线同时段 A/B 比较，只记录，不作门槛。
+- **测量条件**：
+  - 2026-10-21 13:06–13:54（上海时间，UTC+8），release，`taskset -c 2-5`，`PXB_SAMPLES=50`，`BufReader` 默认 8 KiB；
+  - 有效轮次是 run1、run3、run4。run2 被 box 挂起打断（4d7ebe2 那一轮用了 6 分 48 秒，正常约 5 分 45 秒；ns-dense 1 MB 测出 86 ms），已作废，原始输出移到 `bench-void/`。
+- **注意**：功能未通过（D33–D38），修复后这个基线要重录。
+
+| 组（1 MB） | from_reader 三轮（ms） | 中位数 | 同版 from_bytes 中位数（ms） | 倍数（三轮） | 中位倍数 |
+|---|---|---|---|---|---|
+| config | 40.25 / 39.41 / 40.60 | 40.25 | 29.64 | 1.358 / 1.333 / 1.368 | **1.358**（> 1.3，记录） |
+| attr-dense | 50.38 / 49.66 / 51.25 | 50.38 | 44.66 | 1.128 / 1.115 / 1.134 | 1.128 |
+| text-dense | 22.38 / 21.69 / 22.12 | 22.12 | 19.14 | 1.169 / 1.149 / 1.100 | 1.149 |
+| ns-dense | 52.95 / 52.05 / 51.85 | 52.05 | 42.88 | 1.235 / 1.205 / 1.237 | 1.235 |
+
+- 原始输出：`m2b4-bench-4d7ebe2-run{1,3,4}.txt`；解析结果：`m2b4-bench-result.txt`。
+- 和 d2944ce 比，from_reader 的绝对值几乎没变（config 约 40 ms）。倍数变大，是因为 from_bytes 去掉预扫描后快了 25% 左右。
+
+### R2c（参考）：from_bytes 4d7ebe2 对 257c900（同一批 3 轮）
+
+| 组 | 4d7ebe2 中位数 | 257c900 中位数 | 变化 |
+|---|---|---|---|
+| config 1 KB | 32.21 µs | 31.46 µs | +2.4% |
+| attr-dense 1 KB | 50.06 µs | 50.21 µs | −0.3% |
+| text-dense 1 KB | 25.55 µs | 23.43 µs | +9.1% |
+| ns-dense 1 KB | 48.16 µs | 48.42 µs | −0.5% |
+| config 1 MB | 29.64 ms | 29.81 ms | −0.6% |
+| attr-dense 1 MB | 44.66 ms | 44.39 ms | +0.6% |
+| text-dense 1 MB | 19.14 ms | 18.40 ms | +4.0% |
+| ns-dense 1 MB | 42.88 ms | 43.42 ms | −1.2% |
+
+## from_vec 组的口径（v9，Lead 13:56）
+
+- 新增 `*/purexml-from_vec` 共 8 组：1 KB 和 1 MB × config、attr-dense、text-dense、ns-dense。
+  - 计时外：`iter_batched` 复制好输入的 `Vec`（1 KB 用 `SmallInput`，1 MB 用 `LargeInput`）；
+  - 计时内：`Reader::from_vec`、读完全部事件、释放。
+  - 和 from_bytes 一样计入 10% 门槛。
+- **257c900 没有 `Reader::from_vec`**（`git grep "fn from_vec" 257c900` 无结果；4d7ebe2 在 `reader.rs:93`）。
+  - bench 用同名 trait 关联函数兜底：有固有 `Reader::<Vec<u8>>::from_vec` 时优先用固有函数，没有时落到 trait 上，只记一个标志。
+  - `has_from_vec()` 在运行时判断。没有时不注册该组，并打印「purexml 没有 Reader::from_vec」。
+  - 同一份 `baseline.rs` 在 257c900 和 4d7ebe2 上都能编译，clippy `-D warnings` 也干净，不需要 cfg 或 Cargo 特性。
+- **门槛对照**：from_vec 组对比 257c900 的 **from_bytes** 同名组（例如 `text-dense/1KB/purexml-from_vec` 对比 `text-dense/1KB/purexml`），同一时段 A/B 交替。
+- **还没有正式测量**：要等功能修完，在新 head 上找安静时段测。text-dense 1 KB（from_bytes 和 from_vec）如果仍然超过 10%，就算阻塞。

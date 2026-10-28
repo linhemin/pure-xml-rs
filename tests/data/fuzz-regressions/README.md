@@ -21,6 +21,8 @@
 | writer_roundtrip-crash-5c3a3134.bin | 同上（原始样本） | D23：PI 目标 `:ml` |
 | writer_roundtrip-crash-a7187392.bin | 同上（原始样本） | D23：DOCTYPE 名 `rYPE333:` |
 | writer_roundtrip-crash-fd3c5623.bin | 同上（原始样本） | D23：内容里的 PI 目标 `:p` |
+| reader_1byte-crash-9318d3f4.bin | M2 PR #3 r2c 轮 reader_1byte（6894e02 起即存在；原始样本 `fuzz-artifacts/r2c-6894e02/reader_1byte/crash-9318d3f4…`，122 字节，未最小化） | 真实缺陷 D40：内部子集 `<!NOTAt`（关键字前缀后失配），限额字节在失配字节之前时 from_bytes 报 Syntax、流式报 TokenLength。harness 语义（首字节选紧限额，`[1,1,1]` 块长）的断言见 `incremental_m2.rs::d40_fuzz_samples_replay_like_reader_1byte`（期望 TokenLength 48/49 @61）；最小复现 `d40_fuzz_minimal_repros`（min-9318，@48）。本文件的默认配置重放只要求两种入口一致 |
+| reader_1byte-crash-f0f243d8.bin | 同上（原始样本 `crash-f0f243d8…`，233 字节） | D40：内部子集 `<!NOTATt`；最小复现 min-f0f2（TokenLength 48/49 @48） |
 
 M1 测试轮：第 3 轮 parse、reader 各连续跑 900 秒（另有前两轮约 25 分钟，期间只有 box 暂停导致的假超时），没有发现真实的 crash / OOM / 超时。
 

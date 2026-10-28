@@ -17,6 +17,25 @@ pub const DEFAULT_MAX_TEXT_LEN: u64 = 16 * 1024 * 1024;
 /// Maximum original input size, in bytes.
 pub const DEFAULT_MAX_TOTAL_INPUT: u64 = 1024 * 1024 * 1024;
 
+/// Maximum raw byte length of one top-level token, from its first byte
+/// through its terminator, and excluding the one-byte lookahead.
+///
+/// A UTF-8 BOM and prolog or epilog whitespace are already consumed before
+/// the token. They count toward [`DEFAULT_MAX_TOTAL_INPUT`], not toward this
+/// cap. Whitespace inside content is a text token and does count. Offsets
+/// stay raw byte offsets; the BOM does not advance the column.
+///
+/// Checked on both [`crate::Reader::from_bytes`] and [`crate::Reader::from_reader`].
+/// A value smaller than [`DEFAULT_MAX_TEXT_LEN`] makes a long text node fail
+/// as [`crate::LimitKind::TokenLength`] before [`crate::LimitKind::TextLength`].
+/// Two bytes of CRLF become one normalized byte, so the default is twice the
+/// text cap; a token made only of CR LF can still hit the token cap first.
+pub const DEFAULT_MAX_TOKEN_LEN: u64 = 32 * 1024 * 1024;
+
+/// Maximum raw byte length of a DTD internal subset, counting bytes after
+/// `[` and before `]`.
+pub const DEFAULT_MAX_INTERNAL_SUBSET_LEN: u64 = 16 * 1024 * 1024;
+
 /// Maximum general-entity nesting depth. A reference in the document is depth 1.
 pub const DEFAULT_MAX_ENTITY_DEPTH: usize = 8;
 
@@ -71,7 +90,19 @@ pub struct ParserConfig {
     /// then, and the rest of the value is not buffered.
     pub max_text_len: u64,
     /// Maximum original document size in bytes.
+    ///
+    /// Reported only when parsing needs the byte at this offset. The position
+    /// is that byte and `actual` is `limit + 1`. [`crate::Reader::from_bytes`],
+    /// [`crate::Reader::from_vec`], and [`crate::Reader::from_reader`] all
+    /// follow that rule: a shorter document passes, and an error at an earlier
+    /// offset wins. Events for tokens that ended before the byte are yielded.
     pub max_total_input: u64,
+    /// Maximum raw byte length of one top-level token. See
+    /// [`DEFAULT_MAX_TOKEN_LEN`].
+    pub max_token_len: u64,
+    /// Maximum raw byte length of one internal DTD subset. See
+    /// [`DEFAULT_MAX_INTERNAL_SUBSET_LEN`].
+    pub max_internal_subset_len: u64,
     /// General-entity nesting cap. Depth 1 is a reference in the document.
     pub max_entity_depth: usize,
     /// How many general-entity expansions are allowed, counting repeats.
@@ -133,6 +164,18 @@ impl ParserConfig {
         self
     }
 
+    /// Replace the raw top-level token cap.
+    pub fn with_max_token_len(mut self, max_token_len: u64) -> Self {
+        self.max_token_len = max_token_len;
+        self
+    }
+
+    /// Replace the internal-subset cap.
+    pub fn with_max_internal_subset_len(mut self, max_internal_subset_len: u64) -> Self {
+        self.max_internal_subset_len = max_internal_subset_len;
+        self
+    }
+
     /// Replace the entity-depth cap.
     pub fn with_max_entity_depth(mut self, max_entity_depth: usize) -> Self {
         self.max_entity_depth = max_entity_depth;
@@ -166,6 +209,8 @@ impl Default for ParserConfig {
             max_name_len: DEFAULT_MAX_NAME_LEN,
             max_text_len: DEFAULT_MAX_TEXT_LEN,
             max_total_input: DEFAULT_MAX_TOTAL_INPUT,
+            max_token_len: DEFAULT_MAX_TOKEN_LEN,
+            max_internal_subset_len: DEFAULT_MAX_INTERNAL_SUBSET_LEN,
             max_entity_depth: DEFAULT_MAX_ENTITY_DEPTH,
             max_entity_expansions: DEFAULT_MAX_ENTITY_EXPANSIONS,
             max_expanded_bytes: DEFAULT_MAX_EXPANDED_BYTES,

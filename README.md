@@ -88,7 +88,9 @@ assert_eq!(
 | `DEFAULT_MAX_NAME_LEN` | 1024 字节 | `NameLength` |
 | `DEFAULT_MAX_TEXT_LEN` | 16 MiB | `TextLength`（单个文本节点） |
 | `DEFAULT_MAX_TEXT_LEN` | 16 MiB | `AttrValueLength`（规范化并展开之后的单个属性值；写入时逐字符检查，`actual` 是第一次超过上限时的长度，`limit` 就是 `max_text_len`） |
-| `DEFAULT_MAX_TOTAL_INPUT` | 1 GiB | `TotalInput` |
+| `DEFAULT_MAX_TOTAL_INPUT` | 1 GiB | `TotalInput`（`actual` 恒为 `limit + 1`，位置在越界的那个字节） |
+| `DEFAULT_MAX_TOKEN_LEN` | 32 MiB | `TokenLength`（一个顶层 token 的原始字节，从 token 的第一个字节到终止符，不含前瞻。序言/尾声空白和 UTF-8 BOM 不计入；它们仍计入 `TotalInput`，偏移按原始字节。`actual` 恒为 `limit + 1`，位置是越界的那个字节。切片和流式都检查） |
+| `DEFAULT_MAX_INTERNAL_SUBSET_LEN` | 16 MiB | `InternalSubsetLength`（内部子集 `[` 与 `]` 之间的原始字节；`actual` 是第一次超过时的长度，位置是越界的那个字节） |
 | `DEFAULT_MAX_ENTITY_DEPTH` | 8 | `EntityDepth`（文档中的引用算第 1 层，第 9 层失败） |
 | `DEFAULT_MAX_ENTITY_EXPANSIONS` | 10_000 | `EntityExpansions`（同一个实体的重复引用也计数；10_000 次可以，10_001 次失败） |
 | `DEFAULT_MAX_EXPANDED_BYTES` | 1 MiB | `ExpandedBytes` |
@@ -99,7 +101,7 @@ assert_eq!(
 
 - 分子：到目前为止，所有展开产生的替换文本字节数；每补上一个默认属性，都把它的名字字节和**完整值字节**加进分子。值虽然是一份共享的 `Arc<str>`，但和实体展开一样，每次都按完整长度计数。同一个大默认值用在很多元素上时，可能需要调高 `max_expansion_ratio`
 - 这些默认属性字节**不**计入 1 MiB 的 `ExpandedBytes`，也**不**计入实体展开次数
-- 分母：到目前为止已经消费的**原始输入**字节数（解析游标，不是整个缓冲区的长度，也不把替换文本算进分母）
+- 分母：到目前为止已经消费的**原始输入**字节数（解析游标 `base + pos`，不是整个缓冲区的长度，也不把替换文本算进分母）。切块方式不改变这个游标
 - 只有分子 **大于** 64 KiB 之后才比较
 - 若分子大于 `分母 * max_expansion_ratio`，错误为 `ExpansionRatio`。此时 `limit` 是当时允许的字节数（`已消费字节 * 比率`，乘法饱和），`actual` 是比率分子。分子用饱和加法，加到 `u64::MAX` 就停住，不会 panic
 - `max_expansion_ratio = 0`：分子一旦大于 64 KiB，允许量是 0，下一次展开或补默认属性就报 `ExpansionRatio`。不超过地板时仍然通过
@@ -128,9 +130,23 @@ assert_eq!(
 
 库的 MSRV 是 1.70，没有运行时依赖。`cargo test` 会编译 dev-dependencies：`quick-xml` 0.42 要求 Rust 1.86，测试代码里的 `Option::is_none_or` 要求 1.82。本仓库本地用 stable 1.99.1 跑测试、clippy 和 fmt。不要把 `quick-xml` 降到 0.39（有安全通告）。见 `CONTRIBUTING.md`。
 
+## 增量读取
+
+`Reader::from_reader` / `from_reader_with_config` 返回 `Result<Reader<IoInput<R>>>`（构造本身总是 `Ok`，真正的 I/O 和限额错误出现在 `read_event`）。`Reader::from_vec` 仍按整份缓冲区解析，规则与 `from_bytes` 相同。
+
+流式读取在交给解析器之前先划定**一个完整的顶层 token**（外加 1 字节前瞻，或真到 EOF）。不会从 token 起点重跑解析器，因此实体展开计数不会因为补数据而算两遍。文本节点不按读块拆开，事件序列与 `from_bytes` 一致。
+
+窗口大约是 `max_token_len` 再加一个 8 KiB 的读块，和文档总长无关。已经消费的前缀会压缩掉。`max_token_len` 小于 `max_text_len` 时，长文本会先碰到 `TokenLength`。只由 CR LF 组成的超长 token，规范化后的长度大约是原始长度的一半，默认 32 MiB 的 token 上限可能比 16 MiB 的文本上限更早触发。
+
+`max_total_input` 按位置判定，切片和流式相同：只有解析真正需要 offset = limit 的那个字节时才报 `TotalInput`。位置是这个字节，`actual` 恒为 `limit + 1`。在它之前已经完整结束的 token 会先产出事件；位置更靠前的错误优先，不会因为缓冲区更长就提前拒绝。流式窗口仍然大约是 `max_token_len` 再加一个读块，不会为了这条限制把后续输入全部读进来。
+
+I/O：`ErrorKind::Interrupted` 会一直重试。`WouldBlock` 和其他 I/O 错误变成 `ErrorKind::Io` 并熔断（之后每次 `read_event` 都返回同一个错误）。I/O 错误的 `offset` 是已经成功读入的原始字节数。`Ok(0)` 是 EOF，之后的字节不再读取。`read` 若声称读到的字节数大于缓冲区，报 `ErrorKind::Io`，不 panic。用户 reader 自己的 panic 会原样抛出。
+
+任何错误（语法、限额、编码、I/O）之后，切片和流式都会熔断。
+
 ## 留到 M2
 
-- DOM、XPath、校验和完整往返。`from_reader` 仍会把输入缓冲到 `max_total_input`。增量读取和 DOM 不在这一批改动里。
+- DOM、XPath、校验和完整往返。
 
 ### 编码
 
@@ -151,15 +167,15 @@ ErrorKind::Io
 
 LimitKind::EntityDepth | EntityExpansions | ExpandedBytes | ExpansionRatio
         | ElementDepth | Attributes | NameLength | TextLength
-        | TotalInput | AttrValueLength
+        | TotalInput | AttrValueLength | TokenLength | InternalSubsetLength
 ```
 
-列按 Unicode 标量值计数。展开过程中的错误位置指向原文档里最外层 `&`。
+列按 Unicode 标量值计数。按字节计数的 `TokenLength`、`TotalInput`、`InternalSubsetLength`，位置是越界字节本身。按字符计数的 `TextLength`、`AttrValueLength`、`NameLength`，位置是越过上限的那个字符之后的游标。展开过程中的错误位置指向原文档里最外层 `&`。
 
 ## 模块
 
 - `purexml`：门面，重新导出 core。
-- `purexml-core`：`config`（限制与 `ParserConfig`）、`error`、`event`、`reader`（拉取解析）、`writer`（转义写出）、`rules`（NCName、QName、命名空间绑定，Reader 和 Writer 共用）。名字字符类和实体良构检查是私有实现细节。
+- `purexml-core`：`config`（限制与 `ParserConfig`）、`error`、`event`、`reader`（拉取解析）、`input`（`IoInput` 与定界）、`writer`（转义写出）、`rules`（NCName、QName、命名空间绑定，Reader 和 Writer 共用）。名字字符类和实体良构检查是私有实现细节。
 
 ## 许可证
 

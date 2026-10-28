@@ -1,8 +1,9 @@
 //! Pull parser.
 //!
-//! [`Reader::read_event`] yields one [`Event`] at a time. The parser buffers a
-//! `BufRead` source up to `max_total_input` and then walks that buffer; it
-//! never opens a file or a socket itself.
+//! [`Reader::read_event`] yields one [`Event`] at a time. [`Reader::from_reader`]
+//! pulls a [`BufRead`] source one top-level token at a time; it never opens a
+//! file or a socket itself. [`Reader::from_bytes`] and [`Reader::from_vec`]
+//! walk a buffer that is already in memory.
 //!
 //! General-entity limits are enforced incrementally. The expansion-ratio
 //! numerator is cumulative replacement-text bytes plus, on every injected
@@ -21,14 +22,16 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::config::{ParserConfig, EXPANSION_RATIO_FLOOR_BYTES};
-use crate::error::{observe_byte, position_at, Error, ErrorKind, LimitKind, Position, Result};
+use crate::error::{observe_byte, Error, ErrorKind, LimitKind, Position, Result};
 use crate::event::{
     Attribute, Doctype, EmptyElement, EndElement, Event, Namespace, ProcessingInstruction, QName,
     StartElement, XmlDecl, XMLNS_NAMESPACE, XML_NAMESPACE,
 };
+use crate::input::{Framer, IoInput, Poll};
+use crate::limit::{decide_limit, LimitFacts, MeasuredLimit};
 use crate::name::{
     decode_utf8, is_name_char, is_name_start, is_ncname_char, is_ncname_start, is_pubid_char,
-    is_whitespace, is_xml_char,
+    is_whitespace, is_xml_char, utf8_invalid_index,
 };
 
 /// Hard cap on ELEMENT content-model nesting, applied together with `max_depth`.
@@ -38,14 +41,30 @@ use crate::name::{
 /// building an arbitrarily deep model.
 const MODEL_DEPTH_CEILING: usize = 1024;
 
+/// Subset markup introducers. A still-matching prefix of one of these is not
+/// Syntax while an armed byte-cap sits inside it.
+const SUBSET_MARKUP: &[&[u8]] = &[
+    b"<!--",
+    b"<?",
+    b"<!ENTITY",
+    b"<!ELEMENT",
+    b"<!ATTLIST",
+    b"<!NOTATION",
+    // `<![` is the whole decision. Bytes after `[` are not needed to know
+    // a conditional section is illegal in the internal subset.
+    b"<![",
+];
+
 /// Streaming XML reader.
 ///
 /// Construct with [`Reader::from_bytes`], [`Reader::from_str`], or
 /// [`Reader::from_reader`]. Pull events with [`Reader::read_event`].
 ///
-/// `S` is the input holder: `&[u8]` for borrowed bytes, `Vec<u8>` after a
-/// buffered read. Events borrow from that input when no normalization or
-/// entity expansion was required.
+/// `S` is the input holder: `&[u8]` or `Vec<u8>` for a whole document, or
+/// [`IoInput`] for a streaming [`BufRead`]. Events borrow from that input
+/// when no normalization or entity expansion was required.
+///
+/// After any error, later [`Reader::read_event`] calls return the same error.
 ///
 /// Entity-reference names are NCNames. `&a:b;` fails with
 /// [`ErrorKind::Syntax`] because of the colon. A well-formed name with no
@@ -56,6 +75,7 @@ const MODEL_DEPTH_CEILING: usize = 1024;
 pub struct Reader<S> {
     input: S,
     engine: Engine,
+    poison: Option<Error>,
 }
 
 impl<'a> Reader<&'a [u8]> {
@@ -67,6 +87,7 @@ impl<'a> Reader<&'a [u8]> {
         Self {
             input,
             engine: Engine::new(ParserConfig::default()),
+            poison: None,
         }
     }
 
@@ -80,79 +101,151 @@ impl<'a> Reader<&'a [u8]> {
 }
 
 impl Reader<Vec<u8>> {
-    /// Read `reader` until EOF, refusing input larger than the default
-    /// [`crate::DEFAULT_MAX_TOTAL_INPUT`].
+    /// Parse an owned buffer with the same rules as [`Reader::from_bytes`].
     ///
-    /// This only pulls bytes the caller already exposed through [`BufRead`].
-    /// System and public identifiers are never turned into I/O.
-    pub fn from_reader<R: BufRead>(reader: R) -> Result<Self> {
+    /// This does not stream. Use [`Reader::from_reader`] to bound memory by
+    /// the token cap instead of the document length.
+    pub fn from_vec(input: Vec<u8>) -> Self {
+        Self {
+            input,
+            engine: Engine::new(ParserConfig::default()),
+            poison: None,
+        }
+    }
+}
+
+impl<R: BufRead> Reader<IoInput<R>> {
+    /// Stream `reader` one top-level token at a time.
+    ///
+    /// The `Result` is always `Ok`. I/O errors and the total-input limit are
+    /// reported from [`Reader::read_event`], so existing `?` / `unwrap` call
+    /// sites keep compiling. The window stays near `max_token_len` plus one
+    /// read chunk, independent of the document length.
+    ///
+    /// `ErrorKind::Interrupted` is retried. `ErrorKind::WouldBlock` becomes
+    /// [`ErrorKind::Io`] and the reader stays failed: every later
+    /// `read_event` returns that error. The position of an I/O error is the
+    /// number of bytes successfully read so far (line and column match that
+    /// offset). `Ok(0)` is end of input.
+    ///
+    /// `max_total_input` is positional on every entry point. The error is
+    /// reported only when parsing needs the byte at that offset, with
+    /// `actual = limit + 1` and the position on that byte. Tokens that ended
+    /// before it are yielded first. An earlier error wins.
+    pub fn from_reader(reader: R) -> Result<Self> {
         Self::from_reader_with_config(reader, ParserConfig::default())
     }
 
     /// [`Reader::from_reader`] with an explicit limit set.
-    pub fn from_reader_with_config<R: BufRead>(
-        mut reader: R,
-        config: ParserConfig,
-    ) -> Result<Self> {
-        let mut buf = Vec::new();
-        let mut tmp = [0u8; 8192];
-        let mut line = 1u64;
-        let mut column = 1u64;
-        let mut offset = 0u64;
-        let mut cr_pending = false;
-        loop {
-            let n = reader.read(&mut tmp).map_err(|err| {
-                Error::new(
-                    ErrorKind::Io,
-                    Position {
-                        line,
-                        column,
-                        offset,
-                    },
-                    err.to_string(),
-                )
-            })?;
-            if n == 0 {
-                break;
-            }
-            let room = config.max_total_input.saturating_sub(buf.len() as u64) as usize;
-            if n > room {
-                let mut pos = Position {
-                    line,
-                    column,
-                    offset,
-                };
-                let mut cr = cr_pending;
-                for &b in &tmp[..room] {
-                    observe_byte(&mut pos, &mut cr, b);
-                }
-                return Err(Error::new(
-                    ErrorKind::SecurityLimit {
-                        kind: LimitKind::TotalInput,
-                        limit: config.max_total_input,
-                        actual: (buf.len() + n) as u64,
-                    },
-                    pos,
-                    "input exceeds max_total_input",
-                ));
-            }
-            for &b in &tmp[..n] {
-                let mut pos = Position {
-                    line,
-                    column,
-                    offset,
-                };
-                observe_byte(&mut pos, &mut cr_pending, b);
-                line = pos.line;
-                column = pos.column;
-                offset = pos.offset;
-            }
-            buf.extend_from_slice(&tmp[..n]);
-        }
+    pub fn from_reader_with_config(reader: R, config: ParserConfig) -> Result<Self> {
         Ok(Self {
-            input: buf,
+            input: IoInput::new(reader),
             engine: Engine::new(config),
+            poison: None,
         })
+    }
+
+    /// Replace the configuration. Call this before the first [`Reader::read_event`].
+    pub fn with_config(mut self, config: ParserConfig) -> Self {
+        if !self.engine.started {
+            self.engine.config = config;
+        }
+        self
+    }
+
+    /// Limits currently in force.
+    pub fn config(&self) -> &ParserConfig {
+        &self.engine.config
+    }
+
+    /// Cursor in the original input. During entity expansion this stays on the
+    /// bytes the parser has consumed from the document, not inside a
+    /// replacement text.
+    pub fn position(&self) -> Position {
+        self.engine.pos_now()
+    }
+
+    /// Capacity of the streaming window. For tests; not a stable metric.
+    #[doc(hidden)]
+    pub fn buffered_capacity(&self) -> usize {
+        self.input.capacity()
+    }
+
+    /// Pull the next event.
+    ///
+    /// `Ok(None)` is a clean end of input after the root element.
+    /// The returned event borrows `self`; drop it before the next call, or
+    /// take ownership with [`crate::event::XmlText::into_owned`].
+    ///
+    /// Text is not split to fit a read chunk: the event sequence matches
+    /// [`Reader::from_bytes`] on the same bytes. After an error, this returns
+    /// that same error.
+    pub fn read_event(&mut self) -> Result<Option<Event<'_>>> {
+        if let Some(err) = self.poison.clone() {
+            return Err(err);
+        }
+        let raw = match self.pull_raw() {
+            Ok(raw) => raw,
+            Err(err) => {
+                self.poison = Some(err.clone());
+                return Err(err);
+            }
+        };
+        let window = self.input.window();
+        Ok(raw.map(|raw| materialize(window, raw)))
+    }
+
+    fn pull_raw(&mut self) -> Result<Option<RawEvent>> {
+        let mut parked = None;
+        loop {
+            let probing = if self.engine.frames.is_empty() && self.engine.phase != Phase::Done {
+                let content = matches!(self.engine.phase, Phase::Content);
+                let doc_start = !self.engine.started;
+                let mut pos = self.engine.pos;
+                self.input
+                    .prepare(&mut pos, doc_start, content, &self.engine.config)?;
+                self.engine.pos = pos;
+                self.engine.base = self.input.base();
+                self.engine.end_is_eof = self.input.end_is_eof();
+                self.input.view_end().is_some()
+            } else {
+                false
+            };
+            let raw = {
+                let window = self.input.window();
+                self.engine.next_raw(window)
+            };
+            if self.engine.need_frame {
+                // An empty expansion, or a prolog/epilog whitespace run that
+                // filled the window, produced no event. Frame from the cursor
+                // and continue. Do not rewind: bytes already read stay read.
+                self.engine.need_frame = false;
+                let sig = (
+                    self.engine.base,
+                    self.engine.pos,
+                    self.input.buffered_len(),
+                    self.input.saw_eof(),
+                );
+                if parked == Some(sig) {
+                    return Err(self.engine.token_limit(self.input.window()));
+                }
+                parked = Some(sig);
+                continue;
+            }
+            let raw = raw?;
+            if probing && self.engine.frames.is_empty() && self.engine.token_started {
+                let origin = self
+                    .engine
+                    .token_origin
+                    .offset
+                    .saturating_sub(self.engine.base) as usize;
+                let consumed = self.engine.pos.saturating_sub(origin) as u64;
+                if consumed > self.engine.config.max_token_len {
+                    return Err(self.engine.token_limit(self.input.window()));
+                }
+            }
+            return Ok(raw);
+        }
     }
 }
 
@@ -176,14 +269,86 @@ impl<S: AsRef<[u8]>> Reader<S> {
         self.engine.pos_now()
     }
 
+    /// Byte length of the in-memory document. For tests; streaming readers
+    /// report the window capacity instead.
+    #[doc(hidden)]
+    pub fn buffered_capacity(&self) -> usize {
+        self.input.as_ref().len()
+    }
+
     /// Pull the next event.
     ///
     /// `Ok(None)` is a clean end of input after the root element.
     /// The returned event borrows `self`; drop it before the next call, or
     /// take ownership with [`crate::event::XmlText::into_owned`].
+    ///
+    /// After an error, this returns that same error.
+    #[inline]
     pub fn read_event(&mut self) -> Result<Option<Event<'_>>> {
-        let raw = self.engine.next_raw(self.input.as_ref())?;
-        Ok(raw.map(|raw| materialize(self.input.as_ref(), raw)))
+        if self.poison.is_some() {
+            return self.poisoned();
+        }
+        // The buffer is the whole document. There is no framer probe.
+        // `max_token_len` and `max_total_input` are the precomputed
+        // `main_stop` checked as main-input bytes are consumed.
+        let raw = {
+            self.engine.end_is_eof = true;
+            let input = self.input.as_ref();
+            self.engine.next_raw(input)
+        };
+        if self.engine.need_frame {
+            return self.read_slice_after_reframe();
+        }
+        self.finish_slice(raw)
+    }
+
+    #[inline]
+    fn finish_slice(&mut self, raw: Result<Option<RawEvent>>) -> Result<Option<Event<'_>>> {
+        match raw {
+            Ok(raw) => {
+                let input = self.input.as_ref();
+                Ok(raw.map(|raw| materialize(input, raw)))
+            }
+            Err(err) => {
+                self.poison = Some(err.clone());
+                Err(err)
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn poisoned(&mut self) -> Result<Option<Event<'_>>> {
+        Err(self.poison.clone().expect("poison"))
+    }
+
+    /// The previous `next_raw` finished an empty expansion and asked for a
+    /// new token start. Rare; kept out of the slice hot path.
+    #[cold]
+    #[inline(never)]
+    fn read_slice_after_reframe(&mut self) -> Result<Option<Event<'_>>> {
+        let mut parked = Some(self.engine.pos);
+        loop {
+            self.engine.need_frame = false;
+            let raw = {
+                self.engine.end_is_eof = true;
+                let input = self.input.as_ref();
+                self.engine.next_raw(input)
+            };
+            if self.engine.need_frame {
+                if parked == Some(self.engine.pos) {
+                    let err = {
+                        let input = self.input.as_ref();
+                        self.engine.token_limit(input)
+                    };
+                    self.poison = Some(err.clone());
+                    return Err(err);
+                }
+                parked = Some(self.engine.pos);
+                continue;
+            }
+            return self.finish_slice(raw);
+        }
     }
 }
 
@@ -346,7 +511,41 @@ enum RefOut {
 
 struct Engine {
     config: ParserConfig,
+    /// Absolute offset of `input[0]`. Always 0 for a slice.
+    base: u64,
     pos: usize,
+    /// When false, the end of the window is not the end of the document.
+    end_is_eof: bool,
+    /// Window index of the first internal-subset byte, after `[`.
+    subset_start: Option<usize>,
+    /// Position of the top-level token currently being parsed.
+    ///
+    /// Set in [`Self::begin_token`] on the first byte of the token. A UTF-8
+    /// BOM and prolog or epilog whitespace are consumed first and are not
+    /// part of this offset. Content whitespace is the text token, so it is.
+    token_origin: Position,
+    /// `false` while a BOM or prolog/epilog whitespace is still ahead of the
+    /// token. Total input still applies; the token cap does not.
+    token_started: bool,
+    /// `cr_pending` at `token_origin`, so a later byte position can be scanned.
+    token_cr: bool,
+    /// Main-input index where the current `next_raw` started parsing.
+    frame_anchor: usize,
+    /// The engine finished one main-input token and the next one is not framed.
+    need_frame: bool,
+    /// First main-input index that must not be consumed for this token.
+    /// The minimum of the token cap, `max_total_input`, and, while a subset
+    /// is open, the subset cap. The hot path compares against this once.
+    main_stop: usize,
+    /// First main-input index at absolute offset `max_total_input`.
+    total_stop: usize,
+    /// First main-input index past `max_token_len` from `token_origin`.
+    token_stop: usize,
+    /// Length of the window passed to the current `next_raw`.
+    ///
+    /// Lets [`Self::syntax`] see whether the cursor is a buffered cap byte
+    /// without taking the slice again.
+    window_len: usize,
     line: u64,
     column: u64,
     cr_pending: bool,
@@ -388,7 +587,19 @@ impl Engine {
     fn new(config: ParserConfig) -> Self {
         Self {
             config,
+            base: 0,
             pos: 0,
+            end_is_eof: true,
+            subset_start: None,
+            token_origin: Position::start(),
+            token_started: false,
+            token_cr: false,
+            frame_anchor: 0,
+            need_frame: false,
+            main_stop: usize::MAX,
+            total_stop: usize::MAX,
+            token_stop: usize::MAX,
+            window_len: 0,
             line: 1,
             column: 1,
             cr_pending: false,
@@ -445,8 +656,89 @@ impl Engine {
         Position {
             line: self.line,
             column: self.column,
-            offset: self.pos as u64,
+            offset: self.base + self.pos as u64,
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn token_limit(&self, input: &[u8]) -> Error {
+        self.breach_at_cursor(input)
+    }
+
+    /// The framer, started at `token_origin`, cuts this window on `max_token_len`.
+    ///
+    /// A `TokenLength` report whose cut is somewhere else means the scanner
+    /// and the engine do not agree on where the token ends.
+    fn token_limit_matches_scanner(&self, input: &[u8]) -> bool {
+        let start = self.token_origin.offset.saturating_sub(self.base) as usize;
+        if start > input.len() {
+            return false;
+        }
+        let content = matches!(self.phase, Phase::Content);
+        let doc_start = start == 0 && input.starts_with(&[0xEF, 0xBB, 0xBF]);
+        let mut framer = Framer::start(start, doc_start, content);
+        let cap_end = start
+            .saturating_add(self.config.max_token_len as usize)
+            .saturating_add(1);
+        match framer.poll(input, self.end_is_eof, &self.config) {
+            Poll::Probe { end } => end == cap_end,
+            Poll::NeedMore | Poll::Ready { .. } => false,
+        }
+    }
+
+    fn scanner_poll_label(&self, input: &[u8]) -> String {
+        let start = self.token_origin.offset.saturating_sub(self.base) as usize;
+        if start > input.len() {
+            return format!("start {start} past window");
+        }
+        let content = matches!(self.phase, Phase::Content);
+        let doc_start = start == 0 && input.starts_with(&[0xEF, 0xBB, 0xBF]);
+        let mut framer = Framer::start(start, doc_start, content);
+        let shown: String = input.iter().take(16).map(|b| format!("{b:02x}")).collect();
+        match framer.poll(input, self.end_is_eof, &self.config) {
+            Poll::Probe { end } => format!("Probe end={end} content={content} [{shown}]"),
+            Poll::NeedMore => format!("NeedMore content={content} [{shown}]"),
+            Poll::Ready { eof } => format!("Ready eof={eof} content={content} [{shown}]"),
+        }
+    }
+
+    /// Cursor sitting on the byte `index` bytes after `token_origin`.
+    ///
+    /// Index 0 is the first byte of the token. Scanning `index` bytes leaves
+    /// the position on the next byte, which is the one that makes a raw-byte
+    /// cap `index` overflow.
+    fn position_on_token_byte(&self, input: &[u8], index: u64) -> Position {
+        let start = self.token_origin.offset.saturating_sub(self.base) as usize;
+        if start > input.len() {
+            return self.token_origin;
+        }
+        let mut pos = self.token_origin;
+        let mut cr = self.token_cr;
+        let take = (index as usize).min(input.len().saturating_sub(start));
+        for &byte in &input[start..start + take] {
+            observe_byte(&mut pos, &mut cr, byte);
+        }
+        pos
+    }
+
+    /// The cursor is on a main-input byte that a byte-counted cap forbids.
+    fn cursor_limited(&self, input: &[u8]) -> bool {
+        self.frames.is_empty() && self.pos >= self.main_stop && self.pos < input.len()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn end_input(&self, input: &[u8], message: &str) -> Error {
+        // A name or text probe also ends the window. That is not a token cap.
+        if self.cursor_limited(input) {
+            return self.breach_at_cursor(input);
+        }
+        self.syntax(message)
+    }
+
+    fn cut_utf8(&self, rest: &[u8]) -> bool {
+        self.frames.is_empty() && !self.end_is_eof && crate::name::utf8_incomplete(rest)
     }
 
     fn err_pos(&self) -> Position {
@@ -456,22 +748,204 @@ impl Engine {
             .unwrap_or_else(|| self.pos_now())
     }
 
+    /// True when the next main-input byte is already inside an armed cap.
+    /// A Syntax or Encoding decision would have to read that byte.
+    fn on_armed_byte(&self) -> bool {
+        self.frames.is_empty() && self.pos >= self.main_stop && self.pos < self.window_len
+    }
+
+    #[cold]
+    #[inline(never)]
     fn syntax(&self, message: impl Into<String>) -> Error {
+        if self.on_armed_byte() {
+            return self.breach_without_window();
+        }
         Error::new(ErrorKind::Syntax, self.err_pos(), message)
     }
 
+    #[cold]
+    #[inline(never)]
     fn encoding(&self, message: impl Into<String>) -> Error {
+        if self.on_armed_byte() {
+            return self.breach_without_window();
+        }
         Error::new(ErrorKind::Encoding, self.err_pos(), message)
+    }
+
+    /// Malformed UTF-8 at `lead`. `proven_index` is the byte, relative to the
+    /// lead, that shows the sequence is illegal.
+    ///
+    /// [`decide_limit`] sees that proving offset. A byte cap at or before it
+    /// wins and is reported on the cap byte. Otherwise the error stays
+    /// [`ErrorKind::Encoding`] on the lead.
+    #[cold]
+    #[inline(never)]
+    fn utf8_against_limit(&self, input: &[u8], lead: u64, proven_index: usize) -> Error {
+        let needed = lead.saturating_add(proven_index as u64);
+        let mut facts = self.limit_facts(None);
+        facts.cursor = lead;
+        facts.encoding_needed = Some(needed);
+        if let Some(decision) = decide_limit(&facts) {
+            return self.error_from_decision(input, decision, self.pos_now());
+        }
+        let at = if self.base + self.pos as u64 == lead {
+            self.pos_now()
+        } else {
+            let index = lead.saturating_sub(self.token_origin.offset);
+            self.position_on_token_byte(input, index)
+        };
+        Error::new(ErrorKind::Encoding, at, "malformed UTF-8")
+    }
+
+    /// [`decide_limit`] at the cursor. Used when the window slice is not in hand.
+    /// The cursor is the offending byte, so the reported position is `pos_now`.
+    #[cold]
+    #[inline(never)]
+    fn breach_without_window(&self) -> Error {
+        let facts = self.limit_facts(None);
+        let here = self.pos_now();
+        let decision = decide_limit(&facts).unwrap_or(crate::limit::LimitDecision {
+            kind: LimitKind::TokenLength,
+            limit: self.config.max_token_len,
+            actual: self.config.max_token_len.saturating_add(1),
+            offset: here.offset,
+        });
+        let position = if decision.offset == here.offset {
+            here
+        } else {
+            Position {
+                line: here.line,
+                column: here.column,
+                offset: decision.offset,
+            }
+        };
+        self.limit_at(decision.kind, decision.limit, decision.actual, position)
     }
 
     fn external_at(&self, position: Position, message: impl Into<String>) -> Error {
         Error::new(ErrorKind::ExternalEntityForbidden, position, message)
     }
 
-    fn limit(&self, kind: LimitKind, limit: u64, actual: u64) -> Error {
-        self.limit_at(kind, limit, actual, self.err_pos())
+    #[cold]
+    #[inline(never)]
+    fn limit(&self, input: &[u8], kind: LimitKind, limit: u64, actual: u64) -> Error {
+        let pos = self.err_pos();
+        // Char-counted limits report the cursor after the character. The
+        // byte that was read is the one before that cursor.
+        let needed = match kind {
+            LimitKind::NameLength | LimitKind::TextLength | LimitKind::AttrValueLength => {
+                pos.offset.saturating_sub(1)
+            }
+            _ => pos.offset,
+        };
+        self.measured_limit(input, kind, limit, actual, pos, needed)
     }
 
+    /// Every security-limit error goes through [`decide_limit`].
+    ///
+    /// `hint` is the position the caller would report for `kind`. A byte cap
+    /// whose offending byte is earlier, or tied and higher priority, replaces
+    /// both the kind and the position.
+    #[cold]
+    #[inline(never)]
+    fn measured_limit(
+        &self,
+        input: &[u8],
+        kind: LimitKind,
+        limit: u64,
+        actual: u64,
+        hint: Position,
+        needed: u64,
+    ) -> Error {
+        let measured = MeasuredLimit {
+            kind,
+            limit,
+            actual,
+            offset: hint.offset,
+            needed,
+        };
+        let facts = self.limit_facts(Some(measured));
+        let decision = decide_limit(&facts).unwrap_or(crate::limit::LimitDecision {
+            kind,
+            limit,
+            actual,
+            offset: hint.offset,
+        });
+        self.error_from_decision(input, decision, hint)
+    }
+
+    fn limit_facts(&self, measured: Option<MeasuredLimit>) -> LimitFacts<'_> {
+        let on_main = self.frames.is_empty();
+        // Before the token starts, keep a token origin so TotalInput is still
+        // decided here, but put the token cap out of reach. The real origin is
+        // the first token byte, after the BOM and prolog/epilog whitespace.
+        let token_origin = if !on_main {
+            None
+        } else if self.token_started {
+            Some(self.token_origin.offset)
+        } else {
+            Some(u64::MAX)
+        };
+        LimitFacts {
+            config: &self.config,
+            cursor: self.base + self.pos as u64,
+            token_origin,
+            subset_start: if on_main {
+                self.subset_start.map(|start| self.base + start as u64)
+            } else {
+                None
+            },
+            measured,
+            encoding_needed: None,
+        }
+    }
+
+    /// The cursor is on the byte a byte-counted cap forbids.
+    #[cold]
+    #[inline(never)]
+    fn breach_at_cursor(&self, input: &[u8]) -> Error {
+        let facts = self.limit_facts(None);
+        let Some(decision) = decide_limit(&facts) else {
+            debug_assert!(
+                false,
+                "breach_at_cursor with no exceeded cap (pos {}, stop {})",
+                self.pos, self.main_stop
+            );
+            return Error::new(ErrorKind::Syntax, self.pos_now(), "internal limit dispatch");
+        };
+        if decision.kind == LimitKind::TokenLength {
+            debug_assert!(
+                self.token_limit_matches_scanner(input),
+                "TokenLength: scanner and engine disagree (origin {:?}, pos {}, window {}, max {}, {})",
+                self.token_origin,
+                self.pos,
+                input.len(),
+                self.config.max_token_len,
+                self.scanner_poll_label(input)
+            );
+        }
+        self.error_from_decision(input, decision, self.pos_now())
+    }
+
+    fn error_from_decision(
+        &self,
+        input: &[u8],
+        decision: crate::limit::LimitDecision,
+        hint: Position,
+    ) -> Error {
+        let position = if hint.offset == decision.offset {
+            hint
+        } else if self.base + self.pos as u64 == decision.offset {
+            self.pos_now()
+        } else {
+            let index = decision.offset.saturating_sub(self.token_origin.offset);
+            self.position_on_token_byte(input, index)
+        };
+        self.limit_at(decision.kind, decision.limit, decision.actual, position)
+    }
+
+    #[cold]
+    #[inline(never)]
     fn limit_at(&self, kind: LimitKind, limit: u64, actual: u64, position: Position) -> Error {
         Error::new(
             ErrorKind::SecurityLimit {
@@ -485,14 +959,28 @@ impl Engine {
     }
 
     fn next_raw(&mut self, input: &[u8]) -> Result<Option<RawEvent>> {
+        self.window_len = input.len();
+        if self.frames.is_empty() {
+            // The token cap starts at the first token byte, not at a BOM or
+            // at prolog/epilog whitespace. TotalInput stays armed.
+            self.suspend_token_limit();
+        }
         if let Some(err) = self.boundary_error.take() {
             return Err(err);
         }
         self.ensure_started(input)?;
+        if self.frames.is_empty() {
+            self.frame_anchor = self.pos;
+        }
         let result = match self.phase {
             Phase::Done => Ok(None),
             Phase::Prolog => self.next_prolog(input).map(Some),
-            Phase::Content => self.next_content(input).map(Some),
+            Phase::Content => {
+                if self.frames.is_empty() {
+                    self.begin_token(input)?;
+                }
+                self.next_content(input).map(Some)
+            }
             Phase::Epilog => self.next_epilog(input),
         };
         if let Some(err) = self.boundary_error.take() {
@@ -506,19 +994,14 @@ impl Engine {
             return Ok(());
         }
         self.started = true;
-        if input.len() as u64 > self.config.max_total_input {
-            let boundary = self.config.max_total_input as usize;
-            return Err(self.limit_at(
-                LimitKind::TotalInput,
-                self.config.max_total_input,
-                input.len() as u64,
-                position_at(input, boundary),
-            ));
-        }
         self.consume_bom(input)
     }
 
     fn consume_bom(&mut self, input: &[u8]) -> Result<()> {
+        // The sniff reads 4 bytes. A total-input cap inside that window is
+        // reported on the cap byte, before any Syntax decision. The BOM
+        // occupies no column, so offsets 0..=3 stay on line 1, column 1.
+        self.total_cuts_bom_sniff(input)?;
         if input.starts_with(&[0xEF, 0xBB, 0xBF]) {
             self.pos = 3;
             return Ok(());
@@ -542,12 +1025,14 @@ impl Engine {
         if self.at_document_start {
             self.at_document_start = false;
             if self.looks_like_xml_decl(input) {
+                self.begin_token(input)?;
                 return self.parse_xml_decl(input);
             }
         }
-        self.skip_ws(input)?;
+        self.skip_misc(input)?;
+        self.begin_token(input)?;
         match self.peek_byte(input) {
-            None => Err(self.syntax("document has no root element")),
+            None => Err(self.end_input(input, "document has no root element")),
             Some(b'<') => self.parse_prolog_markup(input),
             Some(_) => {
                 let _ = self.decode_at_cursor(input)?;
@@ -557,6 +1042,7 @@ impl Engine {
     }
 
     fn parse_prolog_markup(&mut self, input: &[u8]) -> Result<RawEvent> {
+        self.breach_if_cut(input, &[b"<!--", b"<?", b"<!DOCTYPE", b"</", b"<!"])?;
         if self.starts_with(input, b"<!--") {
             return Ok(RawEvent::Comment(self.parse_comment(input)?));
         }
@@ -576,11 +1062,16 @@ impl Engine {
     }
 
     fn next_epilog(&mut self, input: &[u8]) -> Result<Option<RawEvent>> {
-        self.skip_ws(input)?;
+        self.skip_misc(input)?;
         if self.peek_byte(input).is_none() && self.frames.is_empty() {
+            if !self.end_is_eof {
+                return Err(self.end_input(input, "unexpected end of input in the epilog"));
+            }
             self.phase = Phase::Done;
             return Ok(None);
         }
+        self.begin_token(input)?;
+        self.breach_if_cut(input, &[b"<!--", b"<?"])?;
         if self.starts_with(input, b"<!--") {
             return Ok(Some(RawEvent::Comment(self.parse_comment(input)?)));
         }
@@ -593,6 +1084,16 @@ impl Engine {
 
     fn next_content(&mut self, input: &[u8]) -> Result<RawEvent> {
         loop {
+            // Empty text (an entity that expands to nothing) does not produce
+            // an event, so this loop steps onto the next main-input token.
+            // Token start is recorded in `begin_token` on the next `next_raw`.
+            // Ask for a new frame so the next token is not counted as part of
+            // this one, and so a streaming window is not read as a one-byte
+            // lookahead.
+            if self.frames.is_empty() && self.pos != self.frame_anchor {
+                self.need_frame = true;
+                return Err(self.syntax("reframing"));
+            }
             self.pop_finished();
             match self.peek_byte(input) {
                 None => {
@@ -602,7 +1103,7 @@ impl Engine {
                         }));
                     }
                     if self.frames.is_empty() {
-                        return Err(self.syntax("unclosed element"));
+                        return Err(self.end_input(input, "unclosed element"));
                     }
                     self.force_pop_frame();
                 }
@@ -621,6 +1122,10 @@ impl Engine {
     }
 
     fn parse_content_markup(&mut self, input: &[u8]) -> Result<RawEvent> {
+        self.breach_if_cut(
+            input,
+            &[b"<!--", b"<?", b"<![CDATA[", b"</", b"<!DOCTYPE", b"<!"],
+        )?;
         if self.starts_with(input, b"<!--") {
             return Ok(RawEvent::Comment(self.parse_comment(input)?));
         }
@@ -668,6 +1173,12 @@ impl Engine {
         let mut encoding = None;
         let mut standalone = None;
         loop {
+            if self.prefix_cut(input, b"?>")
+                || self.prefix_cut(input, b"encoding")
+                || self.prefix_cut(input, b"standalone")
+            {
+                return Err(self.land_and_breach(input));
+            }
             let ws = self.skip_ws(input)?;
             if self.starts_with(input, b"?>") {
                 self.advance_n(input, 2)?;
@@ -685,6 +1196,9 @@ impl Engine {
                 self.expect_byte(input, b'=')?;
                 self.skip_ws(input)?;
                 let enc = self.read_quoted_plain(input)?;
+                if self.cursor_limited(input) {
+                    return Err(self.breach_at_cursor(input));
+                }
                 let enc_text = enc.as_str(input).to_string();
                 self.check_encoding(&enc_text)?;
                 encoding = Some(enc);
@@ -705,6 +1219,11 @@ impl Engine {
                         return Err(self.syntax(format!("invalid standalone value '{other}'")));
                     }
                 });
+            } else if self.prefix_cut(input, b"encoding")
+                || self.prefix_cut(input, b"standalone")
+                || self.prefix_cut(input, b"?>")
+            {
+                return Err(self.land_and_breach(input));
             } else {
                 return Err(self.syntax("unknown XML declaration attribute"));
             }
@@ -748,6 +1267,7 @@ impl Engine {
         self.skip_ws(input)?;
         let mut system_id = None;
         let mut public_id = None;
+        self.breach_if_cut(input, &[b"SYSTEM", b"PUBLIC"])?;
         if self.starts_with_token(input, b"SYSTEM") {
             self.advance_n(input, 6)?;
             self.expect_ws(input)?;
@@ -765,7 +1285,12 @@ impl Engine {
         if self.peek_byte(input) == Some(b'[') {
             has_internal_subset = true;
             self.advance_one(input)?;
-            self.parse_internal_subset(input)?;
+            self.subset_start = Some(self.pos);
+            self.rearm_main_stop();
+            let subset = self.parse_internal_subset(input);
+            self.subset_start = None;
+            self.rearm_main_stop();
+            subset?;
             self.expect_byte(input, b']')?;
             self.skip_ws(input)?;
         }
@@ -783,9 +1308,13 @@ impl Engine {
             self.skip_ws(input)?;
             match self.peek_byte(input) {
                 Some(b']') => return Ok(()),
-                None => return Err(self.syntax("unterminated internal subset")),
+                None => return Err(self.end_input(input, "unterminated internal subset")),
                 Some(_) => {}
             }
+            // Same cut as prolog markup: a keyword is not Syntax until the
+            // byte that proves the mismatch is in hand. If that byte is the
+            // armed cap, or past it, the cap wins.
+            self.breach_if_cut(input, SUBSET_MARKUP)?;
             if self.starts_with(input, b"<!--") {
                 let _ = self.parse_comment(input)?;
                 continue;
@@ -818,8 +1347,27 @@ impl Engine {
                     self.syntax("conditional sections are not allowed in the internal subset")
                 );
             }
+            // A probe can end on the byte that crosses `max_internal_subset_len`
+            // before a declaration keyword is complete (`<!ENT` is not `<!ENTITY`).
+            // Count those bytes so the subset cap wins over "invalid markup".
+            if self.subset_introducer_incomplete(input) {
+                while self.peek_byte(input).is_some() {
+                    self.advance_one(input)?;
+                }
+                return Err(self.end_input(input, "unterminated internal subset"));
+            }
             return Err(self.syntax("invalid markup in the internal subset"));
         }
+    }
+
+    /// True when the bytes at the cursor are a proper prefix of subset markup.
+    /// The window ended before the keyword could be recognized.
+    fn subset_introducer_incomplete(&mut self, input: &[u8]) -> bool {
+        let rest = self.current_bytes(input);
+        !rest.is_empty()
+            && SUBSET_MARKUP
+                .iter()
+                .any(|intro| intro.starts_with(rest) && rest.len() < intro.len())
     }
 
     fn parse_entity_decl(&mut self, input: &[u8]) -> Result<()> {
@@ -875,7 +1423,7 @@ impl Engine {
         let mut out = String::new();
         loop {
             let Some(b) = self.peek_byte(input) else {
-                return Err(self.syntax("unterminated entity value"));
+                return Err(self.end_input(input, "unterminated entity value"));
             };
             if b == quote {
                 self.advance_one(input)?;
@@ -915,11 +1463,26 @@ impl Engine {
     }
 
     fn percent_starts_name(&mut self, input: &[u8]) -> Result<bool> {
+        if self.current_bytes(input).first().copied() != Some(b'%') {
+            return Ok(false);
+        }
+        // The next character tells a reference from a stray '%'. If that
+        // character contains the armed cap, the cap wins, same as a keyword
+        // whose proving byte is the cap.
+        let width = {
+            let rest = self.current_bytes(input);
+            match rest.get(1).copied() {
+                Some(0xC0..=0xDF) => 2,
+                Some(0xE0..=0xEF) => 3,
+                Some(0xF0..=0xF7) => 4,
+                _ => 1,
+            }
+        };
+        if self.cap_in_lookahead(input, 1 + width) {
+            return Err(self.land_and_breach(input));
+        }
         let decoded = {
             let rest = self.current_bytes(input);
-            if rest.first().copied() != Some(b'%') {
-                return Ok(false);
-            }
             if rest.len() < 2 {
                 return Ok(false);
             }
@@ -927,7 +1490,15 @@ impl Engine {
         };
         match decoded {
             Ok((ch, _)) => Ok(is_name_start(ch)),
-            Err(()) => Err(self.encoding("malformed UTF-8")),
+            Err(()) => {
+                let rest = self.current_bytes(input);
+                if let Some(proven) = utf8_invalid_index(&rest[1..]) {
+                    let lead = self.base + self.pos as u64 + 1;
+                    Err(self.utf8_against_limit(input, lead, proven))
+                } else {
+                    Err(self.encoding("malformed UTF-8"))
+                }
+            }
         }
     }
 
@@ -945,6 +1516,7 @@ impl Engine {
     }
 
     fn parse_contentspec(&mut self, input: &[u8]) -> Result<()> {
+        self.breach_if_cut(input, &[b"EMPTY", b"ANY"])?;
         if self.starts_with_token(input, b"EMPTY") {
             self.advance_n(input, "EMPTY".len())?;
             return Ok(());
@@ -1017,7 +1589,7 @@ impl Engine {
         limit: usize,
     ) -> Result<()> {
         if depth > limit {
-            return Err(self.limit(LimitKind::ElementDepth, limit as u64, depth as u64));
+            return Err(self.limit(input, LimitKind::ElementDepth, limit as u64, depth as u64));
         }
         self.expect_byte(input, b'(')?;
         stack.push(ContentGroup {
@@ -1101,7 +1673,9 @@ impl Engine {
                     self.advance_one(input)?;
                     return Ok(());
                 }
-                None => return Err(self.syntax("unterminated attribute-list declaration")),
+                None => {
+                    return Err(self.end_input(input, "unterminated attribute-list declaration"))
+                }
                 Some(_) => {
                     if ws == 0 {
                         return Err(
@@ -1139,6 +1713,22 @@ impl Engine {
     }
 
     fn parse_att_type(&mut self, input: &[u8]) -> Result<bool> {
+        // A byte cap inside the type keyword is that cap, before "invalid type".
+        for token in [
+            b"CDATA".as_slice(),
+            b"IDREFS",
+            b"IDREF",
+            b"ID",
+            b"ENTITY",
+            b"ENTITIES",
+            b"NMTOKENS",
+            b"NMTOKEN",
+            b"NOTATION",
+        ] {
+            if self.prefix_cut(input, token) {
+                return Err(self.land_and_breach(input));
+            }
+        }
         if self.starts_with_token(input, b"CDATA") {
             self.advance_n(input, "CDATA".len())?;
             return Ok(true);
@@ -1196,6 +1786,7 @@ impl Engine {
     }
 
     fn parse_default_decl(&mut self, input: &[u8], cdata: bool) -> Result<Option<Arc<str>>> {
+        self.breach_if_cut(input, &[b"#REQUIRED", b"#IMPLIED", b"#FIXED"])?;
         if self.starts_with_token(input, b"#REQUIRED") {
             self.advance_n(input, "#REQUIRED".len())?;
             return Ok(None);
@@ -1235,6 +1826,7 @@ impl Engine {
         let _name = self.read_ncname_decl(input, "notation name")?;
         self.expect_ws(input)?;
         self.reject_dtd_pe(input)?;
+        self.breach_if_cut(input, &[b"SYSTEM", b"PUBLIC"])?;
         if self.starts_with_token(input, b"SYSTEM") {
             self.advance_n(input, "SYSTEM".len())?;
             self.expect_ws(input)?;
@@ -1317,7 +1909,7 @@ impl Engine {
             let charge = (name.len() as u64).saturating_add(value.len() as u64);
             self.ratio_bytes = self.ratio_bytes.saturating_add(charge);
             let position = self.err_pos();
-            self.check_expansion_ratio(position)?;
+            self.check_expansion_ratio(input, position)?;
             attrs.push((owned_qname(&name), RawStr::Shared(value)));
         }
         Ok(())
@@ -1382,6 +1974,7 @@ impl Engine {
                     let count = attrs.len() as u64 + 1;
                     if count > self.config.max_attrs as u64 {
                         return Err(self.limit(
+                            input,
                             LimitKind::Attributes,
                             self.config.max_attrs as u64,
                             count,
@@ -1405,7 +1998,7 @@ impl Engine {
                     let value = self.normalize_typed_attr(&elem_key, &attr_key, value, input);
                     attrs.push((name, value));
                 }
-                None => return Err(self.syntax("unterminated start tag")),
+                None => return Err(self.end_input(input, "unterminated start tag")),
             }
         }
     }
@@ -1458,6 +2051,7 @@ impl Engine {
         let new_depth = self.stack.len() + 1;
         if new_depth > self.config.max_depth {
             return Err(self.limit(
+                input,
                 LimitKind::ElementDepth,
                 self.config.max_depth as u64,
                 new_depth as u64,
@@ -1469,6 +2063,7 @@ impl Engine {
         self.add_default_attributes(input, &elem_key, &mut attrs)?;
         if attrs.len() as u64 > self.config.max_attrs as u64 {
             return Err(self.limit(
+                input,
                 LimitKind::Attributes,
                 self.config.max_attrs as u64,
                 attrs.len() as u64,
@@ -1697,7 +2292,7 @@ impl Engine {
             let at_base = self.frames.len() == base_depth;
             let Some(b) = self.peek_byte(input) else {
                 if at_base {
-                    return Err(self.syntax("unterminated attribute value"));
+                    return Err(self.end_input(input, "unterminated attribute value"));
                 }
                 self.force_pop_frame();
                 continue;
@@ -1716,7 +2311,7 @@ impl Engine {
                 }
                 match self.expand_ref(input)? {
                     RefOut::Char(ch) => {
-                        self.push_limited(&mut buf, ch, LimitKind::AttrValueLength)?
+                        self.push_limited(input, &mut buf, ch, LimitKind::AttrValueLength)?
                     }
                     RefOut::Pushed => {}
                 }
@@ -1728,17 +2323,17 @@ impl Engine {
             if plain && raw_special {
                 self.append_attr_prefix(&mut buf, input, start, mark)?;
                 plain = false;
-                self.push_limited(&mut buf, ch, LimitKind::AttrValueLength)?;
+                self.push_limited(input, &mut buf, ch, LimitKind::AttrValueLength)?;
             } else if plain {
                 // Still a borrow of the input. Stop at this character instead
                 // of waiting until the closing quote.
-                self.check_len(self.pos - start, LimitKind::AttrValueLength)?;
+                self.check_len(input, self.pos - start, LimitKind::AttrValueLength)?;
             } else {
-                self.push_limited(&mut buf, ch, LimitKind::AttrValueLength)?;
+                self.push_limited(input, &mut buf, ch, LimitKind::AttrValueLength)?;
             }
         }
         if plain {
-            self.check_len(self.pos - start - 1, LimitKind::AttrValueLength)?;
+            self.check_len(input, self.pos - start - 1, LimitKind::AttrValueLength)?;
             Ok(RawStr::Range(start..self.pos - 1))
         } else {
             Ok(RawStr::Owned(buf))
@@ -1764,6 +2359,7 @@ impl Engine {
                 accepted += ch.len_utf8();
                 if (accepted as u64) > self.config.max_text_len {
                     return Err(self.limit(
+                        input,
                         LimitKind::AttrValueLength,
                         self.config.max_text_len,
                         accepted as u64,
@@ -1783,6 +2379,7 @@ impl Engine {
     /// Returns `None` without consuming when the value needs the normalizing
     /// path. A value that crosses `max_text_len` fails at that byte: `actual`
     /// is the length then, and the rest of the value is not scanned.
+    #[inline]
     fn try_plain_attr(&mut self, input: &[u8], quote: u8) -> Result<Option<RawStr>> {
         if !self.frames.is_empty() || self.cr_pending {
             return Ok(None);
@@ -1790,15 +2387,19 @@ impl Engine {
         let start = self.pos;
         let bytes = &input[start..];
         let max = self.config.max_text_len;
+        let hard = self.main_stop.saturating_sub(start);
         let mut i = 0usize;
         while i < bytes.len() {
+            if i >= hard {
+                return self.stop_plain_scan(input, i);
+            }
             let byte = bytes[i];
             if byte == quote {
                 let len = i as u64;
                 self.column = self.column.saturating_add(len);
                 self.pos = start + i;
                 self.advance_one(input)?;
-                self.check_len(i, LimitKind::AttrValueLength)?;
+                self.check_len(input, i, LimitKind::AttrValueLength)?;
                 return Ok(Some(RawStr::Range(start..start + i)));
             }
             // XML 1.0 Char excludes C0 controls and U+007F. Those, references,
@@ -1810,7 +2411,7 @@ impl Engine {
             i += 1;
             if (i as u64) > max {
                 self.advance_n(input, i)?;
-                return Err(self.limit(LimitKind::AttrValueLength, max, i as u64));
+                return Err(self.limit(input, LimitKind::AttrValueLength, max, i as u64));
             }
         }
         Ok(None)
@@ -1833,6 +2434,9 @@ impl Engine {
             }
             let Some(b) = self.peek_byte(input) else {
                 if self.frames.is_empty() {
+                    if self.cursor_limited(input) || !self.end_is_eof {
+                        return Err(self.end_input(input, "unexpected end of input in text"));
+                    }
                     break;
                 }
                 self.force_pop_frame();
@@ -1845,7 +2449,9 @@ impl Engine {
             if b == b'&' {
                 brackets = 0;
                 match self.expand_ref(input)? {
-                    RefOut::Char(ch) => self.push_limited(&mut buf, ch, LimitKind::TextLength)?,
+                    RefOut::Char(ch) => {
+                        self.push_limited(input, &mut buf, ch, LimitKind::TextLength)?
+                    }
                     RefOut::Pushed => {
                         self.pop_finished();
                         if self.peek_byte(input) == Some(b'<') {
@@ -1856,7 +2462,7 @@ impl Engine {
                 continue;
             }
             let ch = self.consume_content_literal(input)?;
-            self.push_text(&mut buf, &mut brackets, ch)?;
+            self.push_text(input, &mut buf, &mut brackets, ch)?;
         }
         if buf.is_empty() {
             Ok(None)
@@ -1865,17 +2471,28 @@ impl Engine {
         }
     }
 
+    #[inline]
     fn try_plain_text(&mut self, input: &[u8]) -> Result<Option<RawStr>> {
         if !self.frames.is_empty() {
             return Ok(None);
         }
         let start = self.pos;
         let bytes = &input[start..];
+        let hard = self.main_stop.saturating_sub(start);
         let mut i = 0usize;
         let mut brackets = 0u8;
         while i < bytes.len() {
+            if i >= hard {
+                return self.stop_plain_scan(input, i);
+            }
             let b = bytes[i];
             if b == b'<' {
+                let at = start + i;
+                // `<` starts the next token, unless this byte itself is a
+                // total-input or subset cap.
+                if at >= self.total_stop || (self.subset_start.is_some() && at >= self.main_stop) {
+                    return self.stop_plain_scan(input, i);
+                }
                 break;
             }
             if b == b'&' || b == b'\r' {
@@ -1887,6 +2504,7 @@ impl Engine {
                 if (i as u64) > self.config.max_text_len {
                     self.advance_n(input, i)?;
                     return Err(self.limit(
+                        input,
                         LimitKind::TextLength,
                         self.config.max_text_len,
                         i as u64,
@@ -1904,6 +2522,7 @@ impl Engine {
                 if (i as u64) > self.config.max_text_len {
                     self.advance_n(input, i)?;
                     return Err(self.limit(
+                        input,
                         LimitKind::TextLength,
                         self.config.max_text_len,
                         i as u64,
@@ -1929,6 +2548,28 @@ impl Engine {
                         i += n;
                     }
                     Err(()) => {
+                        if let Some(proven) = utf8_invalid_index(&bytes[i..]) {
+                            let lead = self.base + (start + i) as u64;
+                            return Err(self.utf8_against_limit(input, lead, proven));
+                        }
+                        let at = start + i;
+                        let width = match bytes.get(i).copied() {
+                            Some(0xC0..=0xDF) => 2,
+                            Some(0xE0..=0xEF) => 3,
+                            Some(0xF0..=0xF7) => 4,
+                            _ => 1,
+                        };
+                        if at >= self.main_stop {
+                            return self.stop_plain_scan(input, i);
+                        }
+                        if self.main_stop < at + width && self.main_stop < input.len() {
+                            return self.stop_plain_scan(input, self.main_stop - start);
+                        }
+                        // A short non-eof window is not the token cap. The
+                        // slow path, or a later byte, decides.
+                        if self.cut_utf8(&bytes[i..]) {
+                            return Ok(None);
+                        }
                         self.advance_n(input, i)?;
                         return Err(self.encoding("malformed UTF-8"));
                     }
@@ -1936,8 +2577,25 @@ impl Engine {
             }
             if (i as u64) > self.config.max_text_len {
                 self.advance_n(input, i.min(bytes.len()))?;
-                return Err(self.limit(LimitKind::TextLength, self.config.max_text_len, i as u64));
+                return Err(self.limit(
+                    input,
+                    LimitKind::TextLength,
+                    self.config.max_text_len,
+                    i as u64,
+                ));
             }
+        }
+        let ended_on_markup = i < bytes.len() && bytes[i] == b'<';
+        if !ended_on_markup && !self.end_is_eof && self.frames.is_empty() {
+            if i == 0 {
+                return Ok(None);
+            }
+            if start + i >= self.main_stop {
+                return self.stop_plain_scan(input, i);
+            }
+            // The window ended before the armed cap. The slow path decides
+            // Syntax versus a real limit; this is not TokenLength by itself.
+            return Ok(None);
         }
         if i == 0 {
             return Ok(None);
@@ -1946,7 +2604,13 @@ impl Engine {
         Ok(Some(RawStr::Range(start..start + i)))
     }
 
-    fn push_text(&mut self, buf: &mut String, brackets: &mut u8, ch: char) -> Result<()> {
+    fn push_text(
+        &mut self,
+        input: &[u8],
+        buf: &mut String,
+        brackets: &mut u8,
+        ch: char,
+    ) -> Result<()> {
         if ch == ']' {
             *brackets = brackets.saturating_add(1).min(2);
         } else if ch == '>' && *brackets >= 2 {
@@ -1954,7 +2618,7 @@ impl Engine {
         } else {
             *brackets = 0;
         }
-        self.push_limited(buf, ch, LimitKind::TextLength)
+        self.push_limited(input, buf, ch, LimitKind::TextLength)
     }
 
     fn parse_comment(&mut self, input: &[u8]) -> Result<RawStr> {
@@ -2007,12 +2671,9 @@ impl Engine {
             Some(_) => {
                 return Err(self.syntax("expected whitespace after processing instruction target"));
             }
-            None => return Err(self.syntax("unterminated processing instruction")),
+            None => return Err(self.end_input(input, "unterminated processing instruction")),
         };
         self.expect_bytes(input, b"?>")?;
-        if let Some(RawStr::Owned(text)) = &data {
-            self.check_len(text.len(), LimitKind::TextLength)?;
-        }
         Ok(RawEvent::PI { target, data })
     }
 
@@ -2028,20 +2689,43 @@ impl Engine {
         let mut buf = String::new();
         let mut plain = on_main;
         loop {
+            if self.cursor_limited(input) || self.prefix_cut(input, marker) {
+                return Err(self.land_and_breach(input));
+            }
+            if comment && self.prefix_cut(input, b"--") {
+                return Err(self.land_and_breach(input));
+            }
             if self.starts_with(input, marker) {
                 let end = if self.frames.is_empty() { self.pos } else { 0 };
                 if plain && on_main {
-                    self.check_len(end.saturating_sub(start), LimitKind::TextLength)?;
+                    self.check_len(input, end.saturating_sub(start), LimitKind::TextLength)?;
                     return Ok(RawStr::Range(start..end));
                 }
-                self.check_len(buf.len(), LimitKind::TextLength)?;
+                self.check_len(input, buf.len(), LimitKind::TextLength)?;
                 return Ok(RawStr::Owned(buf));
             }
             if comment && self.starts_with(input, b"--") {
+                // The first dash can already cross `max_text_len`. That limit
+                // does not need the second dash, so it wins over `--` syntax.
+                // Streaming probes on that dash and never shows the second one.
+                let crossing = if plain && on_main {
+                    (self.pos - start) as u64 + 1
+                } else {
+                    buf.len() as u64 + 1
+                };
+                if crossing > self.config.max_text_len {
+                    self.advance_one(input)?;
+                    return Err(self.limit(
+                        input,
+                        LimitKind::TextLength,
+                        self.config.max_text_len,
+                        crossing,
+                    ));
+                }
                 return Err(self.syntax("`--` is not allowed in a comment"));
             }
             if self.peek_byte(input).is_none() {
-                return Err(self.syntax(eof_message));
+                return Err(self.end_input(input, eof_message));
             }
             let mark = self.pos;
             let raw_cr = self.peek_byte(input) == Some(b'\r') && self.frames.is_empty();
@@ -2054,10 +2738,10 @@ impl Engine {
             // that never closes still reports TextLength at the first overflow,
             // with `actual` equal to the length including that character.
             if plain {
-                self.check_len(self.pos - start, LimitKind::TextLength)?;
+                self.check_len(input, self.pos - start, LimitKind::TextLength)?;
             } else {
                 let new_len = buf.len() + ch.len_utf8();
-                self.check_len(new_len, LimitKind::TextLength)?;
+                self.check_len(input, new_len, LimitKind::TextLength)?;
                 buf.push(ch);
             }
         }
@@ -2092,7 +2776,7 @@ impl Engine {
         let mut plain = on_main;
         loop {
             let Some(b) = self.peek_byte(input) else {
-                return Err(self.syntax("unterminated quoted literal"));
+                return Err(self.end_input(input, "unterminated quoted literal"));
             };
             if b == quote {
                 self.advance_one(input)?;
@@ -2134,6 +2818,7 @@ impl Engine {
     /// The caller still reports [`ErrorKind::ExternalEntityForbidden`]. A
     /// notation name that is not an NCName is [`ErrorKind::Syntax`] instead.
     fn scan_external_notation(&mut self, input: &[u8]) -> Result<()> {
+        self.breach_if_cut(input, &[b"SYSTEM", b"PUBLIC"])?;
         if self.starts_with_token(input, b"SYSTEM") {
             self.advance_n(input, 6)?;
             self.expect_ws(input)?;
@@ -2155,18 +2840,26 @@ impl Engine {
     }
 
     fn read_qname(&mut self, input: &[u8]) -> Result<RawQName> {
-        let first = self.read_name(input, true)?;
+        // One running total across prefix, colon, and local name (L7).
+        let first = self.read_name_budget(input, true, 0)?;
+        if self.cursor_limited(input) {
+            return Err(self.breach_at_cursor(input));
+        }
         if self.peek_byte(input) == Some(b':') {
-            let prefix_len = first.byte_len();
-            self.advance_one(input)?;
-            let local = self.read_name(input, true)?;
-            let total = prefix_len + 1 + local.byte_len();
-            if total > self.config.max_name_len {
+            let with_colon = first.byte_len() + 1;
+            if with_colon > self.config.max_name_len {
+                self.advance_one(input)?;
                 return Err(self.limit(
+                    input,
                     LimitKind::NameLength,
                     self.config.max_name_len as u64,
-                    total as u64,
+                    with_colon as u64,
                 ));
+            }
+            self.advance_one(input)?;
+            let local = self.read_name_budget(input, true, with_colon)?;
+            if self.cursor_limited(input) {
+                return Err(self.breach_at_cursor(input));
             }
             if self.peek_byte(input) == Some(b':') {
                 return Err(self.syntax("invalid qualified name"));
@@ -2188,11 +2881,17 @@ impl Engine {
     }
 
     fn read_name(&mut self, input: &[u8], ncname: bool) -> Result<RawStr> {
+        self.read_name_budget(input, ncname, 0)
+    }
+
+    /// `prior` bytes of this QName are already accepted. They count toward
+    /// `max_name_len` and are not part of the returned slice.
+    fn read_name_budget(&mut self, input: &[u8], ncname: bool, prior: usize) -> Result<RawStr> {
         let on_main = self.frames.is_empty();
         let start = self.pos;
         let max = self.config.max_name_len;
         let Some(first) = self.peek_char(input)? else {
-            return Err(self.syntax("unexpected end of input in name"));
+            return Err(self.end_input(input, "unexpected end of input in name"));
         };
         let ok_start = if ncname {
             is_ncname_start(first)
@@ -2202,12 +2901,12 @@ impl Engine {
         if !ok_start {
             return Err(self.syntax(format!("invalid name start U+{:04X}", u32::from(first))));
         }
-        let mut total = first.len_utf8();
+        let mut total = prior + first.len_utf8();
+        self.consume_char(input)?;
         if total > max {
-            return Err(self.limit(LimitKind::NameLength, max as u64, total as u64));
+            return Err(self.limit(input, LimitKind::NameLength, max as u64, total as u64));
         }
         let mut owned = String::new();
-        self.consume_char(input)?;
         owned.push(first);
         while let Some(ch) = self.peek_char(input)? {
             let ok = if ncname {
@@ -2219,10 +2918,10 @@ impl Engine {
                 break;
             }
             let next = total + ch.len_utf8();
-            if next > max {
-                return Err(self.limit(LimitKind::NameLength, max as u64, next as u64));
-            }
             self.consume_char(input)?;
+            if next > max {
+                return Err(self.limit(input, LimitKind::NameLength, max as u64, next as u64));
+            }
             owned.push(ch);
             total = next;
         }
@@ -2250,7 +2949,7 @@ impl Engine {
         if let Some(ch) = predefined(&name) {
             return Ok(RefOut::Char(ch));
         }
-        self.push_entity(&name, origin)?;
+        self.push_entity(input, &name, origin)?;
         Ok(RefOut::Pushed)
     }
 
@@ -2297,7 +2996,7 @@ impl Engine {
         Ok(ch)
     }
 
-    fn push_entity(&mut self, name: &str, origin: Position) -> Result<()> {
+    fn push_entity(&mut self, input: &[u8], name: &str, origin: Position) -> Result<()> {
         let Some(&idx) = self.entity_index.get(name) else {
             return Err(Error::new(
                 ErrorKind::Syntax,
@@ -2313,27 +3012,26 @@ impl Engine {
             ));
         }
         let new_depth = self.entity_depth + 1;
+        let needed = (self.base + self.pos as u64).saturating_sub(1);
         if new_depth > self.config.max_entity_depth {
-            return Err(Error::new(
-                ErrorKind::SecurityLimit {
-                    kind: LimitKind::EntityDepth,
-                    limit: self.config.max_entity_depth as u64,
-                    actual: new_depth as u64,
-                },
+            return Err(self.measured_limit(
+                input,
+                LimitKind::EntityDepth,
+                self.config.max_entity_depth as u64,
+                new_depth as u64,
                 origin,
-                "entity nesting depth exceeded",
+                needed,
             ));
         }
         self.expansion_count += 1;
         if self.expansion_count > self.config.max_entity_expansions {
-            return Err(Error::new(
-                ErrorKind::SecurityLimit {
-                    kind: LimitKind::EntityExpansions,
-                    limit: self.config.max_entity_expansions,
-                    actual: self.expansion_count,
-                },
+            return Err(self.measured_limit(
+                input,
+                LimitKind::EntityExpansions,
+                self.config.max_entity_expansions,
+                self.expansion_count,
                 origin,
-                "entity expansion count exceeded",
+                needed,
             ));
         }
         if !self.entity_wf[idx] {
@@ -2344,14 +3042,13 @@ impl Engine {
                     return Err(Error::new(ErrorKind::Syntax, origin, message));
                 }
                 Err(crate::wf::WfFail::TooDeep { limit, actual }) => {
-                    return Err(Error::new(
-                        ErrorKind::SecurityLimit {
-                            kind: LimitKind::ElementDepth,
-                            limit,
-                            actual,
-                        },
+                    return Err(self.measured_limit(
+                        input,
+                        LimitKind::ElementDepth,
+                        limit,
+                        actual,
                         origin,
-                        "element nesting in entity replacement text exceeded",
+                        needed,
                     ));
                 }
             }
@@ -2360,17 +3057,16 @@ impl Engine {
         self.expanded_bytes += repl_len;
         self.ratio_bytes = self.ratio_bytes.saturating_add(repl_len);
         if self.expanded_bytes > self.config.max_expanded_bytes {
-            return Err(Error::new(
-                ErrorKind::SecurityLimit {
-                    kind: LimitKind::ExpandedBytes,
-                    limit: self.config.max_expanded_bytes,
-                    actual: self.expanded_bytes,
-                },
+            return Err(self.measured_limit(
+                input,
+                LimitKind::ExpandedBytes,
+                self.config.max_expanded_bytes,
+                self.expanded_bytes,
                 origin,
-                "expanded byte cap exceeded",
+                needed,
             ));
         }
-        self.check_expansion_ratio(origin)?;
+        self.check_expansion_ratio(input, origin)?;
         self.entity_depth = new_depth;
         self.open_entities.push(idx);
         self.frames.push(Frame {
@@ -2383,9 +3079,9 @@ impl Engine {
         Ok(())
     }
 
-    fn check_expansion_ratio(&self, position: Position) -> Result<()> {
+    fn check_expansion_ratio(&self, input: &[u8], position: Position) -> Result<()> {
         if self.ratio_bytes > EXPANSION_RATIO_FLOOR_BYTES {
-            let consumed = self.pos as u64;
+            let consumed = self.base + self.pos as u64;
             // `u64::MAX` disables the check even when nothing has been
             // consumed yet: `0 * u64::MAX` would otherwise stay 0.
             let allowed = if self.config.max_expansion_ratio == u64::MAX {
@@ -2394,34 +3090,36 @@ impl Engine {
                 consumed.saturating_mul(self.config.max_expansion_ratio)
             };
             if self.ratio_bytes > allowed {
-                return Err(Error::new(
-                    ErrorKind::SecurityLimit {
-                        kind: LimitKind::ExpansionRatio,
-                        limit: allowed,
-                        actual: self.ratio_bytes,
-                    },
+                return Err(self.measured_limit(
+                    input,
+                    LimitKind::ExpansionRatio,
+                    allowed,
+                    self.ratio_bytes,
                     position,
-                    format!(
-                        "expansion ratio exceeded after consuming {consumed} input bytes (cap {})",
-                        self.config.max_expansion_ratio
-                    ),
+                    position.offset,
                 ));
             }
         }
         Ok(())
     }
 
-    fn push_limited(&mut self, buf: &mut String, ch: char, kind: LimitKind) -> Result<()> {
+    fn push_limited(
+        &mut self,
+        input: &[u8],
+        buf: &mut String,
+        ch: char,
+        kind: LimitKind,
+    ) -> Result<()> {
         let new_len = buf.len() + ch.len_utf8();
-        self.check_len(new_len, kind)?;
+        self.check_len(input, new_len, kind)?;
         buf.push(ch);
         Ok(())
     }
 
-    fn check_len(&self, len: usize, kind: LimitKind) -> Result<()> {
+    fn check_len(&self, input: &[u8], len: usize, kind: LimitKind) -> Result<()> {
         let actual = len as u64;
         if actual > self.config.max_text_len {
-            Err(self.limit(kind, self.config.max_text_len, actual))
+            Err(self.limit(input, kind, self.config.max_text_len, actual))
         } else {
             Ok(())
         }
@@ -2467,6 +3165,9 @@ impl Engine {
 
     fn peek_char(&mut self, input: &[u8]) -> Result<Option<char>> {
         self.pop_finished();
+        if self.cursor_limited(input) {
+            return Err(self.breach_at_cursor(input));
+        }
         let decoded = {
             let slice = self.current_bytes(input);
             if slice.is_empty() {
@@ -2478,12 +3179,31 @@ impl Engine {
         match decoded {
             None => Ok(None),
             Some(Ok(ch)) => Ok(Some(ch)),
-            Some(Err(())) => Err(self.encoding("malformed UTF-8")),
+            Some(Err(())) => {
+                let slice = self.current_bytes(input);
+                if self.cursor_limited(input) {
+                    Err(self.breach_at_cursor(input))
+                } else if self.cut_utf8(slice) {
+                    if self.char_reaches_cap(input) {
+                        Err(self.land_and_breach(input))
+                    } else {
+                        Err(self.end_input(input, "unexpected end of input"))
+                    }
+                } else if let Some(proven) = utf8_invalid_index(slice) {
+                    let lead = self.base + self.pos as u64;
+                    Err(self.utf8_against_limit(input, lead, proven))
+                } else {
+                    Err(self.encoding("malformed UTF-8"))
+                }
+            }
         }
     }
 
     fn decode_at_cursor(&mut self, input: &[u8]) -> Result<(char, usize)> {
         self.pop_finished();
+        if self.cursor_limited(input) {
+            return Err(self.breach_at_cursor(input));
+        }
         let decoded = {
             let slice = self.current_bytes(input);
             if slice.is_empty() {
@@ -2493,9 +3213,25 @@ impl Engine {
             }
         };
         match decoded {
-            None => Err(self.syntax("unexpected end of input")),
+            None => Err(self.end_input(input, "unexpected end of input")),
             Some(Ok(value)) => Ok(value),
-            Some(Err(())) => Err(self.encoding("malformed UTF-8")),
+            Some(Err(())) => {
+                let slice = self.current_bytes(input);
+                if self.cursor_limited(input) {
+                    Err(self.breach_at_cursor(input))
+                } else if self.cut_utf8(slice) {
+                    if self.char_reaches_cap(input) {
+                        Err(self.land_and_breach(input))
+                    } else {
+                        Err(self.end_input(input, "unexpected end of input"))
+                    }
+                } else if let Some(proven) = utf8_invalid_index(slice) {
+                    let lead = self.base + self.pos as u64;
+                    Err(self.utf8_against_limit(input, lead, proven))
+                } else {
+                    Err(self.encoding("malformed UTF-8"))
+                }
+            }
         }
     }
 
@@ -2506,7 +3242,7 @@ impl Engine {
                 Ok(b)
             }
             Some(_) => Err(self.syntax("expected a quoted literal")),
-            None => Err(self.syntax("unexpected end of input")),
+            None => Err(self.end_input(input, "unexpected end of input")),
         }
     }
 
@@ -2516,11 +3252,14 @@ impl Engine {
             Some(b) => {
                 Err(self.syntax(format!("expected '{}', found U+{b:02X}", expected as char)))
             }
-            None => Err(self.syntax("unexpected end of input")),
+            None => Err(self.end_input(input, "unexpected end of input")),
         }
     }
 
     fn expect_bytes(&mut self, input: &[u8], pattern: &[u8]) -> Result<()> {
+        if self.prefix_cut(input, pattern) {
+            return Err(self.land_and_breach(input));
+        }
         if self.starts_with(input, pattern) {
             self.advance_n(input, pattern.len())
         } else {
@@ -2529,6 +3268,9 @@ impl Engine {
     }
 
     fn expect_token(&mut self, input: &[u8], token: &[u8]) -> Result<()> {
+        if self.prefix_cut(input, token) {
+            return Err(self.land_and_breach(input));
+        }
         if self.starts_with_token(input, token) {
             self.advance_n(input, token.len())
         } else {
@@ -2544,6 +3286,7 @@ impl Engine {
         }
     }
 
+    #[inline]
     fn skip_ws(&mut self, input: &[u8]) -> Result<usize> {
         let mut count = 0usize;
         while let Some(b) = self.peek_byte(input) {
@@ -2576,6 +3319,7 @@ impl Engine {
         self.current_bytes(input).get(offset).copied()
     }
 
+    #[inline]
     fn peek_byte(&mut self, input: &[u8]) -> Option<u8> {
         if self.halt {
             return None;
@@ -2587,6 +3331,7 @@ impl Engine {
         self.current_bytes(input).first().copied()
     }
 
+    #[inline]
     fn current_bytes<'a>(&'a self, input: &'a [u8]) -> &'a [u8] {
         if let Some(frame) = self.frames.last() {
             let bytes = self.entities[frame.entity_idx].as_bytes();
@@ -2598,6 +3343,7 @@ impl Engine {
         }
     }
 
+    #[inline]
     fn advance_n(&mut self, input: &[u8], n: usize) -> Result<()> {
         for _ in 0..n {
             self.advance_one(input)?;
@@ -2605,21 +3351,261 @@ impl Engine {
         Ok(())
     }
 
-    fn advance_one(&mut self, input: &[u8]) -> Result<()> {
-        self.pop_finished();
-        if self.frames.is_empty() {
-            let b = input
-                .get(self.pos)
-                .copied()
-                .ok_or_else(|| self.syntax("unexpected end of input"))?;
-            self.observe(b);
-            self.pos += 1;
-        } else if let Some(frame) = self.frames.last_mut() {
-            frame.pos += 1;
+    /// UTF-8 BOM sniff. A cap before the 4th byte wins, through [`decide_limit`].
+    ///
+    /// `pos` lands on the offending byte. Columns do not move: a BOM byte
+    /// never advances the column, and the first byte after it is column 1.
+    fn total_cuts_bom_sniff(&mut self, input: &[u8]) -> Result<()> {
+        const SNIFF: usize = 4;
+        const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+        if self.total_stop >= SNIFF || self.total_stop >= input.len() {
+            return Ok(());
+        }
+        let have = input.len().min(BOM.len());
+        if have == 0 || !BOM.starts_with(&input[..have]) {
+            return Ok(());
+        }
+        self.pos = self.total_stop;
+        self.line = 1;
+        self.column = 1;
+        self.cr_pending = false;
+        Err(self.breach_at_cursor(input))
+    }
+
+    /// Drop the token cap while a BOM or prolog/epilog whitespace is ahead.
+    ///
+    /// [`Self::main_stop`] stays on the total-input cap, so those bytes are
+    /// still one compare on the hot path. [`Self::begin_token`] puts the
+    /// token cap back on the first byte of the token.
+    fn suspend_token_limit(&mut self) {
+        self.token_started = false;
+        self.token_stop = usize::MAX;
+        self.total_stop = self.total_stop_index();
+        self.rearm_main_stop();
+    }
+
+    /// The next byte is the first byte of a top-level token.
+    ///
+    /// A token that starts on the total-input cap reports that cap before
+    /// any markup is peeked.
+    fn begin_token(&mut self, input: &[u8]) -> Result<()> {
+        self.token_started = true;
+        self.token_origin = self.pos_now();
+        self.token_cr = self.cr_pending;
+        self.arm_main_limits();
+        if self.frames.is_empty() && self.pos >= self.total_stop && self.pos < input.len() {
+            return Err(self.breach_at_cursor(input));
         }
         Ok(())
     }
 
+    /// Prolog/epilog `S`. Not part of the following token.
+    ///
+    /// A non-eof window that ends inside the run asks for another frame so
+    /// the streaming reader can discard the prefix and keep reading.
+    fn skip_misc(&mut self, input: &[u8]) -> Result<()> {
+        self.skip_ws(input)?;
+        if self.peek_byte(input).is_none() && !self.end_is_eof && self.frames.is_empty() {
+            self.need_frame = true;
+            return Err(self.syntax("reframing"));
+        }
+        Ok(())
+    }
+
+    fn total_stop_index(&self) -> usize {
+        if self.config.max_total_input <= self.base {
+            0
+        } else {
+            u64_as_index(self.config.max_total_input - self.base)
+        }
+    }
+
+    /// Recompute the main-input cursor ceiling from `token_origin`.
+    ///
+    /// One compare against [`Self::main_stop`] replaces a per-byte
+    /// `max_token_len` / `max_total_input` calculation. The ceiling is an
+    /// index into the current buffer; `prepare` updates `base` before the
+    /// next token arms this again.
+    fn arm_main_limits(&mut self) {
+        let origin = self.token_origin.offset.saturating_sub(self.base);
+        let token_room = u64_as_index(self.config.max_token_len);
+        let token_stop = u64_as_index(origin).saturating_add(token_room);
+        self.token_stop = token_stop;
+        self.total_stop = self.total_stop_index();
+        self.rearm_main_stop();
+    }
+
+    /// `main_stop` is the first index a byte-counted cap forbids.
+    fn rearm_main_stop(&mut self) {
+        let mut stop = self.token_stop.min(self.total_stop);
+        if let Some(start) = self.subset_start {
+            let subset = start.saturating_add(u64_as_index(self.config.max_internal_subset_len));
+            stop = stop.min(subset);
+        }
+        self.main_stop = stop;
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn main_limit_error(&self, input: &[u8]) -> Error {
+        self.breach_at_cursor(input)
+    }
+
+    /// `scanned` bytes of a plain run fit. The next byte is past `main_stop`.
+    #[cold]
+    #[inline(never)]
+    fn stop_plain_scan(&mut self, input: &[u8], scanned: usize) -> Result<Option<RawStr>> {
+        self.advance_n(input, scanned)?;
+        Err(self.breach_at_cursor(input))
+    }
+
+    fn char_reaches_cap(&self, input: &[u8]) -> bool {
+        if !self.frames.is_empty() {
+            return false;
+        }
+        let rest = self.current_bytes(input);
+        let Some(&lead) = rest.first() else {
+            return false;
+        };
+        let width = match lead {
+            0x00..=0x7F => 1,
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => 1,
+        };
+        let cap = self.main_stop;
+        cap >= self.pos && cap < self.pos.saturating_add(width) && cap < input.len()
+    }
+
+    fn breach_if_cut(&mut self, input: &[u8], tokens: &[&[u8]]) -> Result<()> {
+        if tokens.iter().any(|token| self.prefix_cut(input, token)) {
+            Err(self.land_and_breach(input))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The next `needed` bytes include the armed cap, so a decision that
+    /// must read them would consume the forbidden byte.
+    fn cap_in_lookahead(&self, input: &[u8], needed: usize) -> bool {
+        if !self.frames.is_empty() || needed == 0 {
+            return false;
+        }
+        let cap = self.main_stop;
+        cap >= self.pos && cap < self.pos.saturating_add(needed) && cap < input.len()
+    }
+
+    /// Bytes strictly before the armed cap are a proper prefix of `pattern`,
+    /// so deciding the keyword would read the forbidden byte.
+    fn prefix_cut(&self, input: &[u8], pattern: &[u8]) -> bool {
+        if !self.frames.is_empty() {
+            return false;
+        }
+        let cap = self.main_stop;
+        if cap < self.pos || cap >= input.len() {
+            return false;
+        }
+        let have = cap - self.pos;
+        if have >= pattern.len() {
+            return false;
+        }
+        pattern.starts_with(&input[self.pos..cap])
+    }
+
+    /// Move onto the armed byte and report whichever cap it belongs to.
+    #[cold]
+    #[inline(never)]
+    fn land_and_breach(&mut self, input: &[u8]) -> Error {
+        if self.pos < self.main_stop {
+            let skip = self.main_stop - self.pos;
+            if self.advance_n(input, skip).is_err() {
+                return self.breach_at_cursor(input);
+            }
+        }
+        self.breach_at_cursor(input)
+    }
+
+    #[inline]
+    fn advance_one(&mut self, input: &[u8]) -> Result<()> {
+        self.pop_finished();
+        if let Some(frame) = self.frames.last_mut() {
+            frame.pos += 1;
+            return Ok(());
+        }
+        // One predicted compare. The default caps sit far past a normal
+        // document, so this branch is not taken on the slice hot path.
+        if self.pos >= self.main_stop {
+            return self.advance_at_stop(input);
+        }
+        if self.subset_start.is_some() {
+            return self.advance_main_subset(input);
+        }
+        let b = input
+            .get(self.pos)
+            .copied()
+            .ok_or_else(|| self.end_input(input, "unexpected end of input"))?;
+        self.observe(b);
+        self.pos += 1;
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn advance_at_stop(&mut self, input: &[u8]) -> Result<()> {
+        if self.pos >= input.len() {
+            return Err(self.end_input(input, "unexpected end of input"));
+        }
+        // `]` closes an exactly-full subset and is not subset content.
+        if self.subset_closer(input) {
+            let byte = input[self.pos];
+            self.observe(byte);
+            self.pos += 1;
+            self.subset_start = None;
+            self.rearm_main_stop();
+            return Ok(());
+        }
+        Err(self.main_limit_error(input))
+    }
+
+    fn subset_closer(&self, input: &[u8]) -> bool {
+        let Some(start) = self.subset_start else {
+            return false;
+        };
+        let subset_stop = start.saturating_add(u64_as_index(self.config.max_internal_subset_len));
+        self.pos == subset_stop
+            && self.pos < self.token_stop
+            && self.pos < self.total_stop
+            && input.get(self.pos) == Some(&b']')
+    }
+
+    /// Byte inside an internal subset. The length cap is not on the content path.
+    #[inline(never)]
+    fn advance_main_subset(&mut self, input: &[u8]) -> Result<()> {
+        let b = input
+            .get(self.pos)
+            .copied()
+            .ok_or_else(|| self.end_input(input, "unexpected end of input"))?;
+        let at_byte = self.pos_now();
+        self.observe(b);
+        self.pos += 1;
+        if let Some(start) = self.subset_start {
+            let len = (self.pos - start) as u64;
+            if len > self.config.max_internal_subset_len {
+                return Err(self.measured_limit(
+                    input,
+                    LimitKind::InternalSubsetLength,
+                    self.config.max_internal_subset_len,
+                    len,
+                    at_byte,
+                    at_byte.offset,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
     fn observe(&mut self, byte: u8) {
         let mut position = self.pos_now();
         observe_byte(&mut position, &mut self.cr_pending, byte);
@@ -2664,6 +3650,10 @@ impl Engine {
             self.open_entities.pop();
         }
     }
+}
+
+fn u64_as_index(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
 }
 
 fn flatten_qname(input: &[u8], name: RawQName) -> RawStr {

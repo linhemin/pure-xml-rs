@@ -7,15 +7,21 @@ use common::{run_guarded, Guarded, SOFT_CAP};
 use std::path::Path;
 use std::time::Duration;
 
-fn drain<S: AsRef<[u8]>>(mut r: purexml::Reader<S>) -> (Vec<String>, Option<String>) {
-    let mut evs = Vec::new();
-    loop {
-        match r.read_event() {
-            Ok(Some(e)) => evs.push(format!("{e:?}")),
-            Ok(None) => return (evs, None),
-            Err(e) => return (evs, Some(format!("{:?}@{:?}", e.kind, e.position))),
-        }
-    }
+/// `from_reader` returns `Reader<IoInput<R>>`, whose events borrow the reader.
+/// A closure cannot hand that borrow back out.
+macro_rules! drain {
+    ($reader:expr) => {{
+        let reader = &mut $reader;
+        let mut evs = Vec::new();
+        let end = loop {
+            match reader.read_event() {
+                Ok(Some(e)) => evs.push(format!("{e:?}")),
+                Ok(None) => break None,
+                Err(e) => break Some(format!("{:?}@{:?}", e.kind, e.position)),
+            }
+        };
+        (evs, end)
+    }};
 }
 
 #[test]
@@ -32,12 +38,13 @@ fn fuzz_regressions() {
         let name = p.file_name().unwrap().to_string_lossy().to_string();
         let data = std::fs::read(&p).unwrap();
         match run_guarded(&name, Duration::from_secs(2), move || {
-            let a = drain(purexml::Reader::from_bytes(&data));
+            let mut bytes = purexml::Reader::from_bytes(&data);
+            let a = drain!(bytes);
             for cap in [1usize, 7, 64] {
-                let r =
+                let mut streamed =
                     purexml::Reader::from_reader(std::io::BufReader::with_capacity(cap, &data[..]))
                         .expect("from_reader 读内存切片不应失败");
-                assert_eq!(a, drain(r), "from_reader(cap={cap}) 结果不同");
+                assert_eq!(a, drain!(streamed), "from_reader(cap={cap}) 结果不同");
             }
         }) {
             Guarded::Done { peak_bytes, .. } => {
