@@ -378,23 +378,34 @@ impl Framer {
                     }
                 }
                 State::Lt { at } => match classify_lt(buf, at, eof) {
-                    LtKind::NeedMore => return Poll::NeedMore,
+                    LtKind::NeedMore => {
+                        if let Some(done) = self.buffered_token_cap(buf, config.max_token_len) {
+                            return done;
+                        }
+                        return Poll::NeedMore;
+                    }
                     LtKind::Comment => {
-                        self.i = at + 4;
+                        if let Err(done) = self.take_jump(buf, eof, config.max_token_len, at + 4) {
+                            return done;
+                        }
                         self.state = State::Comment {
                             body: self.i,
                             plain: true,
                         };
                     }
                     LtKind::CData => {
-                        self.i = at + 9;
+                        if let Err(done) = self.take_jump(buf, eof, config.max_token_len, at + 9) {
+                            return done;
+                        }
                         self.state = State::CData {
                             body: self.i,
                             plain: true,
                         };
                     }
                     LtKind::Doctype => {
-                        self.i = at + 9;
+                        if let Err(done) = self.take_jump(buf, eof, config.max_token_len, at + 9) {
+                            return done;
+                        }
                         self.state = State::Doctype(Doc {
                             quote: None,
                             subset: None,
@@ -402,7 +413,9 @@ impl Framer {
                         });
                     }
                     LtKind::Pi => {
-                        self.i = at + 2;
+                        if let Err(done) = self.take_jump(buf, eof, config.max_token_len, at + 2) {
+                            return done;
+                        }
                         self.state = State::Pi(Pi {
                             stage: PiStage::Target,
                             target: self.i,
@@ -414,15 +427,21 @@ impl Framer {
                         });
                     }
                     LtKind::EndTag => {
-                        self.i = at + 2;
+                        if let Err(done) = self.take_jump(buf, eof, config.max_token_len, at + 2) {
+                            return done;
+                        }
                         self.state = State::Tag(Tag::named());
                     }
                     LtKind::StartTag => {
-                        self.i = at + 1;
+                        if let Err(done) = self.take_jump(buf, eof, config.max_token_len, at + 1) {
+                            return done;
+                        }
                         self.state = State::Tag(Tag::named());
                     }
                     LtKind::Bang => {
-                        self.i = at + 2;
+                        if let Err(done) = self.take_jump(buf, eof, config.max_token_len, at + 2) {
+                            return done;
+                        }
                         self.state = State::Bang;
                     }
                 },
@@ -608,6 +627,50 @@ impl Framer {
         Ok(())
     }
 
+    /// The token-cap byte is already in `buf`, including inside an unfinished
+    /// ASCII marker. Waiting for the rest of the marker would hide that cut.
+    fn buffered_token_cap(&self, buf: &[u8], max_token: u64) -> Option<Poll> {
+        let max = usize::try_from(max_token).unwrap_or(usize::MAX);
+        let cap = self.anchor.saturating_add(max);
+        if self.i <= cap && cap < buf.len() {
+            Some(Poll::Probe {
+                end: cap.saturating_add(1),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Move to `dest` without reading past the token cap.
+    ///
+    /// Markup classification jumps over `<?`, `<!--`, and `<!DOCTYPE`.
+    /// Those bytes still count. If the jump would land past the cap, the
+    /// offending byte is a probe cut.
+    fn take_jump(
+        &mut self,
+        buf: &[u8],
+        eof: bool,
+        max_token: u64,
+        dest: usize,
+    ) -> std::result::Result<(), Poll> {
+        let max = usize::try_from(max_token).unwrap_or(usize::MAX);
+        let cap = self.anchor.saturating_add(max);
+        if dest > cap {
+            if cap < buf.len() {
+                return Err(Poll::Probe {
+                    end: cap.saturating_add(1),
+                });
+            }
+            return Err(if eof {
+                Poll::Ready { eof: true }
+            } else {
+                Poll::NeedMore
+            });
+        }
+        self.i = dest;
+        Ok(())
+    }
+
     fn consume_one(
         &mut self,
         buf: &[u8],
@@ -639,6 +702,14 @@ impl Framer {
             return None;
         }
         if !eof && proper_prefix_at(buf, self.i, mark.marker) {
+            if let Err(done) = self.consider(buf, eof, config.max_token_len) {
+                self.remember_delimited(mark);
+                return Some(done);
+            }
+            if let Some(done) = self.buffered_token_cap(buf, config.max_token_len) {
+                self.remember_delimited(mark);
+                return Some(done);
+            }
             self.remember_delimited(mark);
             return Some(Poll::NeedMore);
         }
@@ -725,6 +796,14 @@ impl Framer {
             && !eof
             && proper_prefix_at(buf, self.i, b"?>")
         {
+            if let Err(done) = self.consider(buf, eof, config.max_token_len) {
+                self.state = State::Pi(pi);
+                return Some(done);
+            }
+            if let Some(done) = self.buffered_token_cap(buf, config.max_token_len) {
+                self.state = State::Pi(pi);
+                return Some(done);
+            }
             self.state = State::Pi(pi);
             return Some(Poll::NeedMore);
         }
@@ -1032,6 +1111,14 @@ impl Framer {
                     return None;
                 }
                 if !eof && proper_prefix_at(buf, self.i, b"-->") {
+                    if let Err(done) = self.consider(buf, eof, config.max_token_len) {
+                        self.state = State::Doctype(doc);
+                        return Some(done);
+                    }
+                    if let Some(done) = self.buffered_token_cap(buf, config.max_token_len) {
+                        self.state = State::Doctype(doc);
+                        return Some(done);
+                    }
                     self.state = State::Doctype(doc);
                     return Some(Poll::NeedMore);
                 }
@@ -1048,6 +1135,14 @@ impl Framer {
                     return None;
                 }
                 if !eof && proper_prefix_at(buf, self.i, b"?>") {
+                    if let Err(done) = self.consider(buf, eof, config.max_token_len) {
+                        self.state = State::Doctype(doc);
+                        return Some(done);
+                    }
+                    if let Some(done) = self.buffered_token_cap(buf, config.max_token_len) {
+                        self.state = State::Doctype(doc);
+                        return Some(done);
+                    }
                     self.state = State::Doctype(doc);
                     return Some(Poll::NeedMore);
                 }
@@ -1079,6 +1174,14 @@ impl Framer {
                         && (proper_prefix_at(buf, self.i, b"<!--")
                             || proper_prefix_at(buf, self.i, b"<?"))
                     {
+                        if let Err(done) = self.consider(buf, eof, config.max_token_len) {
+                            self.state = State::Doctype(doc);
+                            return Some(done);
+                        }
+                        if let Some(done) = self.buffered_token_cap(buf, config.max_token_len) {
+                            self.state = State::Doctype(doc);
+                            return Some(done);
+                        }
                         self.state = State::Doctype(doc);
                         return Some(Poll::NeedMore);
                     }

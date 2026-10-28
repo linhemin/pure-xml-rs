@@ -28,6 +28,7 @@ use crate::event::{
     StartElement, XmlDecl, XMLNS_NAMESPACE, XML_NAMESPACE,
 };
 use crate::input::{Framer, IoInput, Poll};
+use crate::limit::{decide_limit, LimitFacts, MeasuredLimit};
 use crate::name::{
     decode_utf8, is_name_char, is_name_start, is_ncname_char, is_ncname_start, is_pubid_char,
     is_whitespace, is_xml_char,
@@ -507,12 +508,18 @@ struct Engine {
     /// The engine finished one main-input token and the next one is not framed.
     need_frame: bool,
     /// First main-input index that must not be consumed for this token.
-    /// The minimum of the token cap and `max_total_input`.
+    /// The minimum of the token cap, `max_total_input`, and, while a subset
+    /// is open, the subset cap. The hot path compares against this once.
     main_stop: usize,
     /// First main-input index at absolute offset `max_total_input`.
     total_stop: usize,
     /// First main-input index past `max_token_len` from `token_origin`.
     token_stop: usize,
+    /// Length of the window passed to the current `next_raw`.
+    ///
+    /// Lets [`Self::syntax`] see whether the cursor is a buffered cap byte
+    /// without taking the slice again.
+    window_len: usize,
     line: u64,
     column: u64,
     cr_pending: bool,
@@ -565,6 +572,7 @@ impl Engine {
             main_stop: usize::MAX,
             total_stop: usize::MAX,
             token_stop: usize::MAX,
+            window_len: 0,
             line: 1,
             column: 1,
             cr_pending: false,
@@ -628,20 +636,7 @@ impl Engine {
     #[cold]
     #[inline(never)]
     fn token_limit(&self, input: &[u8]) -> Error {
-        let limit = self.config.max_token_len;
-        debug_assert!(
-            self.token_limit_matches_scanner(input),
-            "TokenLength: scanner and engine disagree (origin {:?}, pos {}, window {})",
-            self.token_origin,
-            self.pos,
-            input.len()
-        );
-        self.limit_at(
-            LimitKind::TokenLength,
-            limit,
-            limit.saturating_add(1),
-            self.position_on_token_byte(input, limit),
-        )
+        self.breach_at_cursor(input)
     }
 
     /// The framer, started at `token_origin`, cuts this window on `max_token_len`.
@@ -684,19 +679,19 @@ impl Engine {
         pos
     }
 
-    /// End of the main window on a probe or an unfinished stream token.
-    fn at_window_end(&self, input: &[u8]) -> bool {
-        self.frames.is_empty() && !self.end_is_eof && self.pos >= input.len()
+    /// The cursor is on a main-input byte that a byte-counted cap forbids.
+    fn cursor_limited(&self, input: &[u8]) -> bool {
+        self.frames.is_empty() && self.pos >= self.main_stop && self.pos < input.len()
     }
 
     #[cold]
     #[inline(never)]
     fn end_input(&self, input: &[u8], message: &str) -> Error {
-        if self.at_window_end(input) {
-            self.token_limit(input)
-        } else {
-            self.syntax(message)
+        // A name or text probe also ends the window. That is not a token cap.
+        if self.cursor_limited(input) {
+            return self.breach_at_cursor(input);
         }
+        self.syntax(message)
     }
 
     fn cut_utf8(&self, rest: &[u8]) -> bool {
@@ -710,16 +705,53 @@ impl Engine {
             .unwrap_or_else(|| self.pos_now())
     }
 
+    /// True when the next main-input byte is already inside an armed cap.
+    /// A Syntax or Encoding decision would have to read that byte.
+    fn on_armed_byte(&self) -> bool {
+        self.frames.is_empty() && self.pos >= self.main_stop && self.pos < self.window_len
+    }
+
     #[cold]
     #[inline(never)]
     fn syntax(&self, message: impl Into<String>) -> Error {
+        if self.on_armed_byte() {
+            return self.breach_without_window();
+        }
         Error::new(ErrorKind::Syntax, self.err_pos(), message)
     }
 
     #[cold]
     #[inline(never)]
     fn encoding(&self, message: impl Into<String>) -> Error {
+        if self.on_armed_byte() {
+            return self.breach_without_window();
+        }
         Error::new(ErrorKind::Encoding, self.err_pos(), message)
+    }
+
+    /// [`decide_limit`] at the cursor. Used when the window slice is not in hand.
+    /// The cursor is the offending byte, so the reported position is `pos_now`.
+    #[cold]
+    #[inline(never)]
+    fn breach_without_window(&self) -> Error {
+        let facts = self.limit_facts(None);
+        let here = self.pos_now();
+        let decision = decide_limit(&facts).unwrap_or(crate::limit::LimitDecision {
+            kind: LimitKind::TokenLength,
+            limit: self.config.max_token_len,
+            actual: self.config.max_token_len.saturating_add(1),
+            offset: here.offset,
+        });
+        let position = if decision.offset == here.offset {
+            here
+        } else {
+            Position {
+                line: here.line,
+                column: here.column,
+                offset: decision.offset,
+            }
+        };
+        self.limit_at(decision.kind, decision.limit, decision.actual, position)
     }
 
     fn external_at(&self, position: Position, message: impl Into<String>) -> Error {
@@ -728,8 +760,108 @@ impl Engine {
 
     #[cold]
     #[inline(never)]
-    fn limit(&self, kind: LimitKind, limit: u64, actual: u64) -> Error {
-        self.limit_at(kind, limit, actual, self.err_pos())
+    fn limit(&self, input: &[u8], kind: LimitKind, limit: u64, actual: u64) -> Error {
+        let pos = self.err_pos();
+        // Char-counted limits report the cursor after the character. The
+        // byte that was read is the one before that cursor.
+        let needed = match kind {
+            LimitKind::NameLength | LimitKind::TextLength | LimitKind::AttrValueLength => {
+                pos.offset.saturating_sub(1)
+            }
+            _ => pos.offset,
+        };
+        self.measured_limit(input, kind, limit, actual, pos, needed)
+    }
+
+    /// Every security-limit error goes through [`decide_limit`].
+    ///
+    /// `hint` is the position the caller would report for `kind`. A byte cap
+    /// whose offending byte is earlier, or tied and higher priority, replaces
+    /// both the kind and the position.
+    #[cold]
+    #[inline(never)]
+    fn measured_limit(
+        &self,
+        input: &[u8],
+        kind: LimitKind,
+        limit: u64,
+        actual: u64,
+        hint: Position,
+        needed: u64,
+    ) -> Error {
+        let measured = MeasuredLimit {
+            kind,
+            limit,
+            actual,
+            offset: hint.offset,
+            needed,
+        };
+        let facts = self.limit_facts(Some(measured));
+        let decision = decide_limit(&facts).unwrap_or(crate::limit::LimitDecision {
+            kind,
+            limit,
+            actual,
+            offset: hint.offset,
+        });
+        self.error_from_decision(input, decision, hint)
+    }
+
+    fn limit_facts(&self, measured: Option<MeasuredLimit>) -> LimitFacts<'_> {
+        let on_main = self.frames.is_empty();
+        LimitFacts {
+            config: &self.config,
+            cursor: self.base + self.pos as u64,
+            token_origin: on_main.then_some(self.token_origin.offset),
+            subset_start: if on_main {
+                self.subset_start.map(|start| self.base + start as u64)
+            } else {
+                None
+            },
+            measured,
+        }
+    }
+
+    /// The cursor is on the byte a byte-counted cap forbids.
+    #[cold]
+    #[inline(never)]
+    fn breach_at_cursor(&self, input: &[u8]) -> Error {
+        let facts = self.limit_facts(None);
+        let decision = decide_limit(&facts).unwrap_or_else(|| {
+            let limit = self.config.max_token_len;
+            crate::limit::LimitDecision {
+                kind: LimitKind::TokenLength,
+                limit,
+                actual: limit.saturating_add(1),
+                offset: self.token_origin.offset.saturating_add(limit),
+            }
+        });
+        if decision.kind == LimitKind::TokenLength {
+            debug_assert!(
+                self.token_limit_matches_scanner(input),
+                "TokenLength: scanner and engine disagree (origin {:?}, pos {}, window {})",
+                self.token_origin,
+                self.pos,
+                input.len()
+            );
+        }
+        self.error_from_decision(input, decision, self.pos_now())
+    }
+
+    fn error_from_decision(
+        &self,
+        input: &[u8],
+        decision: crate::limit::LimitDecision,
+        hint: Position,
+    ) -> Error {
+        let position = if hint.offset == decision.offset {
+            hint
+        } else if self.base + self.pos as u64 == decision.offset {
+            self.pos_now()
+        } else {
+            let index = decision.offset.saturating_sub(self.token_origin.offset);
+            self.position_on_token_byte(input, index)
+        };
+        self.limit_at(decision.kind, decision.limit, decision.actual, position)
     }
 
     #[cold]
@@ -747,6 +879,7 @@ impl Engine {
     }
 
     fn next_raw(&mut self, input: &[u8]) -> Result<Option<RawEvent>> {
+        self.window_len = input.len();
         if self.frames.is_empty() {
             self.token_origin = self.pos_now();
             self.token_cr = self.cr_pending;
@@ -762,7 +895,7 @@ impl Engine {
         // The byte at offset `max_total_input` is needed as soon as a token
         // starts on it, including when the epilog only peeks at it.
         if self.frames.is_empty() && self.pos >= self.total_stop && self.pos < input.len() {
-            return Err(self.total_input_limit());
+            return Err(self.breach_at_cursor(input));
         }
         let result = match self.phase {
             Phase::Done => Ok(None),
@@ -826,6 +959,7 @@ impl Engine {
     }
 
     fn parse_prolog_markup(&mut self, input: &[u8]) -> Result<RawEvent> {
+        self.breach_if_cut(input, &[b"<!--", b"<?", b"<!DOCTYPE", b"</", b"<!"])?;
         if self.starts_with(input, b"<!--") {
             return Ok(RawEvent::Comment(self.parse_comment(input)?));
         }
@@ -902,6 +1036,10 @@ impl Engine {
     }
 
     fn parse_content_markup(&mut self, input: &[u8]) -> Result<RawEvent> {
+        self.breach_if_cut(
+            input,
+            &[b"<!--", b"<?", b"<![CDATA[", b"</", b"<!DOCTYPE", b"<!"],
+        )?;
         if self.starts_with(input, b"<!--") {
             return Ok(RawEvent::Comment(self.parse_comment(input)?));
         }
@@ -949,6 +1087,12 @@ impl Engine {
         let mut encoding = None;
         let mut standalone = None;
         loop {
+            if self.prefix_cut(input, b"?>")
+                || self.prefix_cut(input, b"encoding")
+                || self.prefix_cut(input, b"standalone")
+            {
+                return Err(self.land_and_breach(input));
+            }
             let ws = self.skip_ws(input)?;
             if self.starts_with(input, b"?>") {
                 self.advance_n(input, 2)?;
@@ -966,6 +1110,9 @@ impl Engine {
                 self.expect_byte(input, b'=')?;
                 self.skip_ws(input)?;
                 let enc = self.read_quoted_plain(input)?;
+                if self.cursor_limited(input) {
+                    return Err(self.breach_at_cursor(input));
+                }
                 let enc_text = enc.as_str(input).to_string();
                 self.check_encoding(&enc_text)?;
                 encoding = Some(enc);
@@ -986,13 +1133,11 @@ impl Engine {
                         return Err(self.syntax(format!("invalid standalone value '{other}'")));
                     }
                 });
-            } else if self.cut_keyword(input, b"encoding")
-                || self.cut_keyword(input, b"standalone")
-                || self.cut_keyword(input, b"?>")
+            } else if self.prefix_cut(input, b"encoding")
+                || self.prefix_cut(input, b"standalone")
+                || self.prefix_cut(input, b"?>")
             {
-                // The probe ended inside the next keyword. That is the token
-                // cap, not an unknown attribute name.
-                return Err(self.token_limit(input));
+                return Err(self.land_and_breach(input));
             } else {
                 return Err(self.syntax("unknown XML declaration attribute"));
             }
@@ -1054,8 +1199,10 @@ impl Engine {
             has_internal_subset = true;
             self.advance_one(input)?;
             self.subset_start = Some(self.pos);
+            self.rearm_main_stop();
             let subset = self.parse_internal_subset(input);
             self.subset_start = None;
+            self.rearm_main_stop();
             subset?;
             self.expect_byte(input, b']')?;
             self.skip_ws(input)?;
@@ -1336,7 +1483,7 @@ impl Engine {
         limit: usize,
     ) -> Result<()> {
         if depth > limit {
-            return Err(self.limit(LimitKind::ElementDepth, limit as u64, depth as u64));
+            return Err(self.limit(input, LimitKind::ElementDepth, limit as u64, depth as u64));
         }
         self.expect_byte(input, b'(')?;
         stack.push(ContentGroup {
@@ -1460,6 +1607,22 @@ impl Engine {
     }
 
     fn parse_att_type(&mut self, input: &[u8]) -> Result<bool> {
+        // A byte cap inside the type keyword is that cap, before "invalid type".
+        for token in [
+            b"CDATA".as_slice(),
+            b"IDREFS",
+            b"IDREF",
+            b"ID",
+            b"ENTITY",
+            b"ENTITIES",
+            b"NMTOKENS",
+            b"NMTOKEN",
+            b"NOTATION",
+        ] {
+            if self.prefix_cut(input, token) {
+                return Err(self.land_and_breach(input));
+            }
+        }
         if self.starts_with_token(input, b"CDATA") {
             self.advance_n(input, "CDATA".len())?;
             return Ok(true);
@@ -1638,7 +1801,7 @@ impl Engine {
             let charge = (name.len() as u64).saturating_add(value.len() as u64);
             self.ratio_bytes = self.ratio_bytes.saturating_add(charge);
             let position = self.err_pos();
-            self.check_expansion_ratio(position)?;
+            self.check_expansion_ratio(input, position)?;
             attrs.push((owned_qname(&name), RawStr::Shared(value)));
         }
         Ok(())
@@ -1703,6 +1866,7 @@ impl Engine {
                     let count = attrs.len() as u64 + 1;
                     if count > self.config.max_attrs as u64 {
                         return Err(self.limit(
+                            input,
                             LimitKind::Attributes,
                             self.config.max_attrs as u64,
                             count,
@@ -1779,6 +1943,7 @@ impl Engine {
         let new_depth = self.stack.len() + 1;
         if new_depth > self.config.max_depth {
             return Err(self.limit(
+                input,
                 LimitKind::ElementDepth,
                 self.config.max_depth as u64,
                 new_depth as u64,
@@ -1790,6 +1955,7 @@ impl Engine {
         self.add_default_attributes(input, &elem_key, &mut attrs)?;
         if attrs.len() as u64 > self.config.max_attrs as u64 {
             return Err(self.limit(
+                input,
                 LimitKind::Attributes,
                 self.config.max_attrs as u64,
                 attrs.len() as u64,
@@ -2037,7 +2203,7 @@ impl Engine {
                 }
                 match self.expand_ref(input)? {
                     RefOut::Char(ch) => {
-                        self.push_limited(&mut buf, ch, LimitKind::AttrValueLength)?
+                        self.push_limited(input, &mut buf, ch, LimitKind::AttrValueLength)?
                     }
                     RefOut::Pushed => {}
                 }
@@ -2049,17 +2215,17 @@ impl Engine {
             if plain && raw_special {
                 self.append_attr_prefix(&mut buf, input, start, mark)?;
                 plain = false;
-                self.push_limited(&mut buf, ch, LimitKind::AttrValueLength)?;
+                self.push_limited(input, &mut buf, ch, LimitKind::AttrValueLength)?;
             } else if plain {
                 // Still a borrow of the input. Stop at this character instead
                 // of waiting until the closing quote.
-                self.check_len(self.pos - start, LimitKind::AttrValueLength)?;
+                self.check_len(input, self.pos - start, LimitKind::AttrValueLength)?;
             } else {
-                self.push_limited(&mut buf, ch, LimitKind::AttrValueLength)?;
+                self.push_limited(input, &mut buf, ch, LimitKind::AttrValueLength)?;
             }
         }
         if plain {
-            self.check_len(self.pos - start - 1, LimitKind::AttrValueLength)?;
+            self.check_len(input, self.pos - start - 1, LimitKind::AttrValueLength)?;
             Ok(RawStr::Range(start..self.pos - 1))
         } else {
             Ok(RawStr::Owned(buf))
@@ -2085,6 +2251,7 @@ impl Engine {
                 accepted += ch.len_utf8();
                 if (accepted as u64) > self.config.max_text_len {
                     return Err(self.limit(
+                        input,
                         LimitKind::AttrValueLength,
                         self.config.max_text_len,
                         accepted as u64,
@@ -2124,7 +2291,7 @@ impl Engine {
                 self.column = self.column.saturating_add(len);
                 self.pos = start + i;
                 self.advance_one(input)?;
-                self.check_len(i, LimitKind::AttrValueLength)?;
+                self.check_len(input, i, LimitKind::AttrValueLength)?;
                 return Ok(Some(RawStr::Range(start..start + i)));
             }
             // XML 1.0 Char excludes C0 controls and U+007F. Those, references,
@@ -2136,7 +2303,7 @@ impl Engine {
             i += 1;
             if (i as u64) > max {
                 self.advance_n(input, i)?;
-                return Err(self.limit(LimitKind::AttrValueLength, max, i as u64));
+                return Err(self.limit(input, LimitKind::AttrValueLength, max, i as u64));
             }
         }
         Ok(None)
@@ -2159,8 +2326,8 @@ impl Engine {
             }
             let Some(b) = self.peek_byte(input) else {
                 if self.frames.is_empty() {
-                    if !self.end_is_eof {
-                        return Err(self.token_limit(input));
+                    if self.cursor_limited(input) || !self.end_is_eof {
+                        return Err(self.end_input(input, "unexpected end of input in text"));
                     }
                     break;
                 }
@@ -2174,7 +2341,9 @@ impl Engine {
             if b == b'&' {
                 brackets = 0;
                 match self.expand_ref(input)? {
-                    RefOut::Char(ch) => self.push_limited(&mut buf, ch, LimitKind::TextLength)?,
+                    RefOut::Char(ch) => {
+                        self.push_limited(input, &mut buf, ch, LimitKind::TextLength)?
+                    }
                     RefOut::Pushed => {
                         self.pop_finished();
                         if self.peek_byte(input) == Some(b'<') {
@@ -2185,7 +2354,7 @@ impl Engine {
                 continue;
             }
             let ch = self.consume_content_literal(input)?;
-            self.push_text(&mut buf, &mut brackets, ch)?;
+            self.push_text(input, &mut buf, &mut brackets, ch)?;
         }
         if buf.is_empty() {
             Ok(None)
@@ -2210,6 +2379,12 @@ impl Engine {
             }
             let b = bytes[i];
             if b == b'<' {
+                let at = start + i;
+                // `<` starts the next token, unless this byte itself is a
+                // total-input or subset cap.
+                if at >= self.total_stop || (self.subset_start.is_some() && at >= self.main_stop) {
+                    return self.stop_plain_scan(input, i);
+                }
                 break;
             }
             if b == b'&' || b == b'\r' {
@@ -2221,6 +2396,7 @@ impl Engine {
                 if (i as u64) > self.config.max_text_len {
                     self.advance_n(input, i)?;
                     return Err(self.limit(
+                        input,
                         LimitKind::TextLength,
                         self.config.max_text_len,
                         i as u64,
@@ -2265,7 +2441,12 @@ impl Engine {
             }
             if (i as u64) > self.config.max_text_len {
                 self.advance_n(input, i.min(bytes.len()))?;
-                return Err(self.limit(LimitKind::TextLength, self.config.max_text_len, i as u64));
+                return Err(self.limit(
+                    input,
+                    LimitKind::TextLength,
+                    self.config.max_text_len,
+                    i as u64,
+                ));
             }
         }
         let ended_on_markup = i < bytes.len() && bytes[i] == b'<';
@@ -2273,7 +2454,12 @@ impl Engine {
             if i == 0 {
                 return Ok(None);
             }
-            return Err(self.token_limit(input));
+            if start + i >= self.main_stop {
+                return self.stop_plain_scan(input, i);
+            }
+            // The window ended before the armed cap. The slow path decides
+            // Syntax versus a real limit; this is not TokenLength by itself.
+            return Ok(None);
         }
         if i == 0 {
             return Ok(None);
@@ -2282,7 +2468,13 @@ impl Engine {
         Ok(Some(RawStr::Range(start..start + i)))
     }
 
-    fn push_text(&mut self, buf: &mut String, brackets: &mut u8, ch: char) -> Result<()> {
+    fn push_text(
+        &mut self,
+        input: &[u8],
+        buf: &mut String,
+        brackets: &mut u8,
+        ch: char,
+    ) -> Result<()> {
         if ch == ']' {
             *brackets = brackets.saturating_add(1).min(2);
         } else if ch == '>' && *brackets >= 2 {
@@ -2290,7 +2482,7 @@ impl Engine {
         } else {
             *brackets = 0;
         }
-        self.push_limited(buf, ch, LimitKind::TextLength)
+        self.push_limited(input, buf, ch, LimitKind::TextLength)
     }
 
     fn parse_comment(&mut self, input: &[u8]) -> Result<RawStr> {
@@ -2361,13 +2553,19 @@ impl Engine {
         let mut buf = String::new();
         let mut plain = on_main;
         loop {
+            if self.cursor_limited(input) || self.prefix_cut(input, marker) {
+                return Err(self.land_and_breach(input));
+            }
+            if comment && self.prefix_cut(input, b"--") {
+                return Err(self.land_and_breach(input));
+            }
             if self.starts_with(input, marker) {
                 let end = if self.frames.is_empty() { self.pos } else { 0 };
                 if plain && on_main {
-                    self.check_len(end.saturating_sub(start), LimitKind::TextLength)?;
+                    self.check_len(input, end.saturating_sub(start), LimitKind::TextLength)?;
                     return Ok(RawStr::Range(start..end));
                 }
-                self.check_len(buf.len(), LimitKind::TextLength)?;
+                self.check_len(input, buf.len(), LimitKind::TextLength)?;
                 return Ok(RawStr::Owned(buf));
             }
             if comment && self.starts_with(input, b"--") {
@@ -2387,10 +2585,10 @@ impl Engine {
             // that never closes still reports TextLength at the first overflow,
             // with `actual` equal to the length including that character.
             if plain {
-                self.check_len(self.pos - start, LimitKind::TextLength)?;
+                self.check_len(input, self.pos - start, LimitKind::TextLength)?;
             } else {
                 let new_len = buf.len() + ch.len_utf8();
-                self.check_len(new_len, LimitKind::TextLength)?;
+                self.check_len(input, new_len, LimitKind::TextLength)?;
                 buf.push(ch);
             }
         }
@@ -2488,18 +2686,26 @@ impl Engine {
     }
 
     fn read_qname(&mut self, input: &[u8]) -> Result<RawQName> {
-        let first = self.read_name(input, true)?;
+        // One running total across prefix, colon, and local name (L7).
+        let first = self.read_name_budget(input, true, 0)?;
+        if self.cursor_limited(input) {
+            return Err(self.breach_at_cursor(input));
+        }
         if self.peek_byte(input) == Some(b':') {
-            let prefix_len = first.byte_len();
-            self.advance_one(input)?;
-            let local = self.read_name(input, true)?;
-            let total = prefix_len + 1 + local.byte_len();
-            if total > self.config.max_name_len {
+            let with_colon = first.byte_len() + 1;
+            if with_colon > self.config.max_name_len {
+                self.advance_one(input)?;
                 return Err(self.limit(
+                    input,
                     LimitKind::NameLength,
                     self.config.max_name_len as u64,
-                    total as u64,
+                    with_colon as u64,
                 ));
+            }
+            self.advance_one(input)?;
+            let local = self.read_name_budget(input, true, with_colon)?;
+            if self.cursor_limited(input) {
+                return Err(self.breach_at_cursor(input));
             }
             if self.peek_byte(input) == Some(b':') {
                 return Err(self.syntax("invalid qualified name"));
@@ -2521,6 +2727,12 @@ impl Engine {
     }
 
     fn read_name(&mut self, input: &[u8], ncname: bool) -> Result<RawStr> {
+        self.read_name_budget(input, ncname, 0)
+    }
+
+    /// `prior` bytes of this QName are already accepted. They count toward
+    /// `max_name_len` and are not part of the returned slice.
+    fn read_name_budget(&mut self, input: &[u8], ncname: bool, prior: usize) -> Result<RawStr> {
         let on_main = self.frames.is_empty();
         let start = self.pos;
         let max = self.config.max_name_len;
@@ -2535,10 +2747,10 @@ impl Engine {
         if !ok_start {
             return Err(self.syntax(format!("invalid name start U+{:04X}", u32::from(first))));
         }
-        let mut total = first.len_utf8();
+        let mut total = prior + first.len_utf8();
         self.consume_char(input)?;
         if total > max {
-            return Err(self.limit(LimitKind::NameLength, max as u64, total as u64));
+            return Err(self.limit(input, LimitKind::NameLength, max as u64, total as u64));
         }
         let mut owned = String::new();
         owned.push(first);
@@ -2554,7 +2766,7 @@ impl Engine {
             let next = total + ch.len_utf8();
             self.consume_char(input)?;
             if next > max {
-                return Err(self.limit(LimitKind::NameLength, max as u64, next as u64));
+                return Err(self.limit(input, LimitKind::NameLength, max as u64, next as u64));
             }
             owned.push(ch);
             total = next;
@@ -2583,7 +2795,7 @@ impl Engine {
         if let Some(ch) = predefined(&name) {
             return Ok(RefOut::Char(ch));
         }
-        self.push_entity(&name, origin)?;
+        self.push_entity(input, &name, origin)?;
         Ok(RefOut::Pushed)
     }
 
@@ -2630,7 +2842,7 @@ impl Engine {
         Ok(ch)
     }
 
-    fn push_entity(&mut self, name: &str, origin: Position) -> Result<()> {
+    fn push_entity(&mut self, input: &[u8], name: &str, origin: Position) -> Result<()> {
         let Some(&idx) = self.entity_index.get(name) else {
             return Err(Error::new(
                 ErrorKind::Syntax,
@@ -2646,27 +2858,26 @@ impl Engine {
             ));
         }
         let new_depth = self.entity_depth + 1;
+        let needed = (self.base + self.pos as u64).saturating_sub(1);
         if new_depth > self.config.max_entity_depth {
-            return Err(Error::new(
-                ErrorKind::SecurityLimit {
-                    kind: LimitKind::EntityDepth,
-                    limit: self.config.max_entity_depth as u64,
-                    actual: new_depth as u64,
-                },
+            return Err(self.measured_limit(
+                input,
+                LimitKind::EntityDepth,
+                self.config.max_entity_depth as u64,
+                new_depth as u64,
                 origin,
-                "entity nesting depth exceeded",
+                needed,
             ));
         }
         self.expansion_count += 1;
         if self.expansion_count > self.config.max_entity_expansions {
-            return Err(Error::new(
-                ErrorKind::SecurityLimit {
-                    kind: LimitKind::EntityExpansions,
-                    limit: self.config.max_entity_expansions,
-                    actual: self.expansion_count,
-                },
+            return Err(self.measured_limit(
+                input,
+                LimitKind::EntityExpansions,
+                self.config.max_entity_expansions,
+                self.expansion_count,
                 origin,
-                "entity expansion count exceeded",
+                needed,
             ));
         }
         if !self.entity_wf[idx] {
@@ -2677,14 +2888,13 @@ impl Engine {
                     return Err(Error::new(ErrorKind::Syntax, origin, message));
                 }
                 Err(crate::wf::WfFail::TooDeep { limit, actual }) => {
-                    return Err(Error::new(
-                        ErrorKind::SecurityLimit {
-                            kind: LimitKind::ElementDepth,
-                            limit,
-                            actual,
-                        },
+                    return Err(self.measured_limit(
+                        input,
+                        LimitKind::ElementDepth,
+                        limit,
+                        actual,
                         origin,
-                        "element nesting in entity replacement text exceeded",
+                        needed,
                     ));
                 }
             }
@@ -2693,17 +2903,16 @@ impl Engine {
         self.expanded_bytes += repl_len;
         self.ratio_bytes = self.ratio_bytes.saturating_add(repl_len);
         if self.expanded_bytes > self.config.max_expanded_bytes {
-            return Err(Error::new(
-                ErrorKind::SecurityLimit {
-                    kind: LimitKind::ExpandedBytes,
-                    limit: self.config.max_expanded_bytes,
-                    actual: self.expanded_bytes,
-                },
+            return Err(self.measured_limit(
+                input,
+                LimitKind::ExpandedBytes,
+                self.config.max_expanded_bytes,
+                self.expanded_bytes,
                 origin,
-                "expanded byte cap exceeded",
+                needed,
             ));
         }
-        self.check_expansion_ratio(origin)?;
+        self.check_expansion_ratio(input, origin)?;
         self.entity_depth = new_depth;
         self.open_entities.push(idx);
         self.frames.push(Frame {
@@ -2716,7 +2925,7 @@ impl Engine {
         Ok(())
     }
 
-    fn check_expansion_ratio(&self, position: Position) -> Result<()> {
+    fn check_expansion_ratio(&self, input: &[u8], position: Position) -> Result<()> {
         if self.ratio_bytes > EXPANSION_RATIO_FLOOR_BYTES {
             let consumed = self.base + self.pos as u64;
             // `u64::MAX` disables the check even when nothing has been
@@ -2727,34 +2936,36 @@ impl Engine {
                 consumed.saturating_mul(self.config.max_expansion_ratio)
             };
             if self.ratio_bytes > allowed {
-                return Err(Error::new(
-                    ErrorKind::SecurityLimit {
-                        kind: LimitKind::ExpansionRatio,
-                        limit: allowed,
-                        actual: self.ratio_bytes,
-                    },
+                return Err(self.measured_limit(
+                    input,
+                    LimitKind::ExpansionRatio,
+                    allowed,
+                    self.ratio_bytes,
                     position,
-                    format!(
-                        "expansion ratio exceeded after consuming {consumed} input bytes (cap {})",
-                        self.config.max_expansion_ratio
-                    ),
+                    position.offset,
                 ));
             }
         }
         Ok(())
     }
 
-    fn push_limited(&mut self, buf: &mut String, ch: char, kind: LimitKind) -> Result<()> {
+    fn push_limited(
+        &mut self,
+        input: &[u8],
+        buf: &mut String,
+        ch: char,
+        kind: LimitKind,
+    ) -> Result<()> {
         let new_len = buf.len() + ch.len_utf8();
-        self.check_len(new_len, kind)?;
+        self.check_len(input, new_len, kind)?;
         buf.push(ch);
         Ok(())
     }
 
-    fn check_len(&self, len: usize, kind: LimitKind) -> Result<()> {
+    fn check_len(&self, input: &[u8], len: usize, kind: LimitKind) -> Result<()> {
         let actual = len as u64;
         if actual > self.config.max_text_len {
-            Err(self.limit(kind, self.config.max_text_len, actual))
+            Err(self.limit(input, kind, self.config.max_text_len, actual))
         } else {
             Ok(())
         }
@@ -2800,6 +3011,9 @@ impl Engine {
 
     fn peek_char(&mut self, input: &[u8]) -> Result<Option<char>> {
         self.pop_finished();
+        if self.cursor_limited(input) {
+            return Err(self.breach_at_cursor(input));
+        }
         let decoded = {
             let slice = self.current_bytes(input);
             if slice.is_empty() {
@@ -2824,6 +3038,9 @@ impl Engine {
 
     fn decode_at_cursor(&mut self, input: &[u8]) -> Result<(char, usize)> {
         self.pop_finished();
+        if self.cursor_limited(input) {
+            return Err(self.breach_at_cursor(input));
+        }
         let decoded = {
             let slice = self.current_bytes(input);
             if slice.is_empty() {
@@ -2868,33 +3085,25 @@ impl Engine {
     }
 
     fn expect_bytes(&mut self, input: &[u8], pattern: &[u8]) -> Result<()> {
+        if self.prefix_cut(input, pattern) {
+            return Err(self.land_and_breach(input));
+        }
         if self.starts_with(input, pattern) {
             self.advance_n(input, pattern.len())
-        } else if self.cut_keyword(input, pattern) {
-            Err(self.token_limit(input))
         } else {
             Err(self.syntax(format!("expected {}", String::from_utf8_lossy(pattern))))
         }
     }
 
     fn expect_token(&mut self, input: &[u8], token: &[u8]) -> Result<()> {
+        if self.prefix_cut(input, token) {
+            return Err(self.land_and_breach(input));
+        }
         if self.starts_with_token(input, token) {
             self.advance_n(input, token.len())
-        } else if self.cut_keyword(input, token) {
-            Err(self.token_limit(input))
         } else {
             Err(self.syntax(format!("expected {}", String::from_utf8_lossy(token))))
         }
-    }
-
-    /// The window ends on a proper prefix of `token`. A streaming probe cut
-    /// the token at `max_token_len` before the keyword was complete.
-    fn cut_keyword(&self, input: &[u8], token: &[u8]) -> bool {
-        if self.end_is_eof || !self.frames.is_empty() {
-            return false;
-        }
-        let rest = self.current_bytes(input);
-        !rest.is_empty() && rest.len() < token.len() && token.starts_with(rest)
     }
 
     fn expect_ws(&mut self, input: &[u8]) -> Result<()> {
@@ -2987,41 +3196,69 @@ impl Engine {
         };
         self.token_stop = token_stop;
         self.total_stop = total_stop;
-        self.main_stop = token_stop.min(total_stop);
+        self.rearm_main_stop();
     }
 
-    #[cold]
-    #[inline(never)]
-    fn total_input_limit(&self) -> Error {
-        let limit = self.config.max_total_input;
-        self.limit_at(
-            LimitKind::TotalInput,
-            limit,
-            limit.saturating_add(1),
-            self.pos_now(),
-        )
+    /// `main_stop` is the first index a byte-counted cap forbids.
+    fn rearm_main_stop(&mut self) {
+        let mut stop = self.token_stop.min(self.total_stop);
+        if let Some(start) = self.subset_start {
+            let subset = start.saturating_add(u64_as_index(self.config.max_internal_subset_len));
+            stop = stop.min(subset);
+        }
+        self.main_stop = stop;
     }
 
     #[cold]
     #[inline(never)]
     fn main_limit_error(&self, input: &[u8]) -> Error {
-        if self.pos >= self.total_stop {
-            self.total_input_limit()
-        } else {
-            self.token_limit(input)
-        }
+        self.breach_at_cursor(input)
     }
 
     /// `scanned` bytes of a plain run fit. The next byte is past `main_stop`.
     #[cold]
     #[inline(never)]
     fn stop_plain_scan(&mut self, input: &[u8], scanned: usize) -> Result<Option<RawStr>> {
-        if self.pos.saturating_add(scanned) >= self.total_stop {
-            self.advance_n(input, scanned)?;
-            Err(self.total_input_limit())
+        self.advance_n(input, scanned)?;
+        Err(self.breach_at_cursor(input))
+    }
+
+    fn breach_if_cut(&mut self, input: &[u8], tokens: &[&[u8]]) -> Result<()> {
+        if tokens.iter().any(|token| self.prefix_cut(input, token)) {
+            Err(self.land_and_breach(input))
         } else {
-            Err(self.token_limit(input))
+            Ok(())
         }
+    }
+
+    /// Bytes strictly before the armed cap are a proper prefix of `pattern`,
+    /// so deciding the keyword would read the forbidden byte.
+    fn prefix_cut(&self, input: &[u8], pattern: &[u8]) -> bool {
+        if !self.frames.is_empty() {
+            return false;
+        }
+        let cap = self.main_stop;
+        if cap < self.pos || cap >= input.len() {
+            return false;
+        }
+        let have = cap - self.pos;
+        if have >= pattern.len() {
+            return false;
+        }
+        pattern.starts_with(&input[self.pos..cap])
+    }
+
+    /// Move onto the armed byte and report whichever cap it belongs to.
+    #[cold]
+    #[inline(never)]
+    fn land_and_breach(&mut self, input: &[u8]) -> Error {
+        if self.pos < self.main_stop {
+            let skip = self.main_stop - self.pos;
+            if self.advance_n(input, skip).is_err() {
+                return self.breach_at_cursor(input);
+            }
+        }
+        self.breach_at_cursor(input)
     }
 
     #[inline]
@@ -3054,7 +3291,27 @@ impl Engine {
         if self.pos >= input.len() {
             return Err(self.end_input(input, "unexpected end of input"));
         }
+        // `]` closes an exactly-full subset and is not subset content.
+        if self.subset_closer(input) {
+            let byte = input[self.pos];
+            self.observe(byte);
+            self.pos += 1;
+            self.subset_start = None;
+            self.rearm_main_stop();
+            return Ok(());
+        }
         Err(self.main_limit_error(input))
+    }
+
+    fn subset_closer(&self, input: &[u8]) -> bool {
+        let Some(start) = self.subset_start else {
+            return false;
+        };
+        let subset_stop = start.saturating_add(u64_as_index(self.config.max_internal_subset_len));
+        self.pos == subset_stop
+            && self.pos < self.token_stop
+            && self.pos < self.total_stop
+            && input.get(self.pos) == Some(&b']')
     }
 
     /// Byte inside an internal subset. The length cap is not on the content path.
@@ -3070,11 +3327,13 @@ impl Engine {
         if let Some(start) = self.subset_start {
             let len = (self.pos - start) as u64;
             if len > self.config.max_internal_subset_len {
-                return Err(self.limit_at(
+                return Err(self.measured_limit(
+                    input,
                     LimitKind::InternalSubsetLength,
                     self.config.max_internal_subset_len,
                     len,
                     at_byte,
+                    at_byte.offset,
                 ));
             }
         }

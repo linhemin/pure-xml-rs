@@ -20,6 +20,7 @@ mod config;
 mod error;
 mod event;
 mod input;
+mod limit;
 mod name;
 mod reader;
 mod rules;
@@ -38,6 +39,7 @@ pub use event::{
     StartElement, XmlDecl, XmlText, XMLNS_NAMESPACE, XML_NAMESPACE,
 };
 pub use input::IoInput;
+pub use limit::{decide_limit, LimitDecision, LimitFacts, MeasuredLimit};
 pub use reader::Reader;
 pub use writer::{escape_attribute, escape_text, WriteError, Writer};
 
