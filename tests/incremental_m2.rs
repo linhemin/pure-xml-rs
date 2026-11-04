@@ -4368,3 +4368,307 @@ fn d40_fuzz_samples_replay_like_reader_1byte() {
         }
     }
 }
+
+// ───────────────── 注释 `--`、PI `?>`、CDATA `]]>` 与 max_text_len（PR #3 0be42f1） ─────────────────
+//
+// 口径（M1 起注释、CDATA、PI 的内容就受 TextLength 约束，tests/data/attacks/README.md；PR-A D26 改为“首次超过”）：
+// - 内容按字节计长度，position 按字符计限额规则取越界字符之后，actual = 含该字符的长度。
+// - 一个字符要等到证明它不是结束标记（`-->`、`?>`、`]]>`）的开头时才算内容：普通字符只要它自己；
+//   与结束标记首字节相同的字符，要读到第一个与结束标记失配的字节（`]x` 是 +1，`]]x` 是 +2）。
+//   注释里的 `--`：第三个字节不是 `>` 时，第一个 `-` 算内容（与 CDATA 的 `]]x` 相同），
+//   它若越过 max_text_len 报 TextLength，否则在第一个 `-` 处报 Syntax；判定字节都是第三个字节。
+// - 按字节计的上限（TokenLength、TotalInput）落在判定字节上或之前时报该上限（L0），否则报上面的结果。
+// 0be42f1 之前：内容恰好 = max_text_len 后接 `--x` 时 from_bytes 报 Syntax、流式报 TextLength。
+
+struct TermCase {
+    ctx: &'static str,
+    label: String,
+    d: Vec<u8>,
+    tok_start: usize,
+    body_start: usize,
+    marker: &'static [u8],
+    comment: bool,
+    pre_len: usize,
+}
+
+/// (结果, 判定字节, 注释 token 结束位置（只在正常结束时有）)
+fn term_oracle(t: &TermCase, m: u64) -> (End, usize, Option<usize>) {
+    let d = &t.d;
+    let lcp = |i: usize, p: &[u8]| d[i..].iter().zip(p).take_while(|(a, b)| a == b).count();
+    let mut i = t.body_start;
+    let mut n: u64 = 0;
+    loop {
+        if d[i..].starts_with(t.marker) {
+            let end = i + t.marker.len();
+            return (Ok(()), end - 1, Some(end));
+        }
+        if t.comment && d[i..].starts_with(b"--") {
+            let proof = i + 2;
+            if n + 1 > m {
+                return (
+                    Err((
+                        ErrorKind::SecurityLimit {
+                            kind: LimitKind::TextLength,
+                            limit: m,
+                            actual: n + 1,
+                        },
+                        doc_position(d, i + 1),
+                    )),
+                    proof,
+                    None,
+                );
+            }
+            return (Err((ErrorKind::Syntax, doc_position(d, i))), proof, None);
+        }
+        let w = match d[i] {
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => 1,
+        };
+        let mut proof = i + w - 1;
+        proof = proof.max(i + lcp(i, t.marker).min(t.marker.len() - 1));
+        if t.comment {
+            proof = proof.max(i + lcp(i, b"--").min(1));
+        }
+        n += w as u64;
+        if n > m {
+            return (
+                Err((
+                    ErrorKind::SecurityLimit {
+                        kind: LimitKind::TextLength,
+                        limit: m,
+                        actual: n,
+                    },
+                    doc_position(d, i + w),
+                )),
+                proof,
+                None,
+            );
+        }
+        i += w;
+    }
+}
+
+fn term_cases(which: &str) -> Vec<TermCase> {
+    let mut v = Vec::new();
+    let mut add = |ctx: &'static str,
+                   pre: &str,
+                   intro: &str,
+                   body: String,
+                   post: &str,
+                   marker: &'static [u8],
+                   comment: bool| {
+        let d = format!("{pre}{intro}{body}{post}").into_bytes();
+        v.push(TermCase {
+            ctx,
+            label: format!("{ctx} {:?}", String::from_utf8_lossy(&d)),
+            tok_start: pre.len(),
+            body_start: pre.len() + intro.len(),
+            marker,
+            comment,
+            pre_len: pre.len(),
+            d,
+        });
+    };
+    if which == "comment" {
+        for content in ["aaa", "a-a", "a\u{e9}", "-a"] {
+            for tail in [
+                "-->",
+                "--->",
+                "---->",
+                "--x-->",
+                "-x-->",
+                "---x-->",
+                "-- -->",
+                "-\u{e9}-->",
+                "--",
+            ] {
+                for (pre, post) in [("", "<r/>"), ("<r>", "</r>")] {
+                    add(
+                        "注释",
+                        pre,
+                        "<!--",
+                        format!("{content}{tail}"),
+                        post,
+                        b"-->",
+                        true,
+                    );
+                }
+            }
+        }
+    } else {
+        for content in ["aaa", "a?a", "a\u{e9}"] {
+            for tail in ["?>", "??>", "?x?>", "???>", "?\u{e9}?>"] {
+                for (pre, post) in [("", "<r/>"), ("<r>", "</r>")] {
+                    add(
+                        "PI",
+                        pre,
+                        "<?pi ",
+                        format!("{content}{tail}"),
+                        post,
+                        b"?>",
+                        false,
+                    );
+                }
+            }
+        }
+        for content in ["aaa", "a]a", "a\u{e9}"] {
+            for tail in ["]]>", "]]]>", "]]x]]>", "]x]]>", "]]]]>", "]\u{e9}]]>"] {
+                add(
+                    "CDATA",
+                    "<r>",
+                    "<![CDATA[",
+                    format!("{content}{tail}"),
+                    "</r>",
+                    b"]]>",
+                    false,
+                );
+            }
+        }
+    }
+    v
+}
+
+fn term_run(which: &str, full: bool) -> (usize, Vec<String>, Vec<(String, usize, usize)>) {
+    let dflt = ParserConfig::default();
+    let mut fails = Vec::new();
+    let mut per_ctx: Vec<(String, usize, usize)> = Vec::new();
+    let mut groups = 0;
+    for t in term_cases(which) {
+        let d = &t.d;
+        let body_len = d.len() - t.body_start;
+        for m in 0..=(body_len as u64 + 1) {
+            let base_cfg = dflt.clone().with_max_text_len(m);
+            let (outcome, proof, tok_end) = term_oracle(&t, m);
+            // (说明, 边界字节, 配置, 该上限的报错)；None 表示不设按字节计的上限
+            let mut cfgs: Vec<(
+                String,
+                Option<usize>,
+                ParserConfig,
+                Option<(LimitKind, u64)>,
+            )> = vec![("无字节上限".into(), None, base_cfg.clone(), None)];
+            let hi = tok_end.map_or(proof + 1, |e| e).min(d.len() - 1);
+            let (lo, hi) = if full {
+                (t.tok_start, hi)
+            } else {
+                (
+                    proof.saturating_sub(3).max(t.tok_start),
+                    (proof + 3).min(hi),
+                )
+            };
+            for cap in lo..=hi {
+                let after_token = tok_end.is_some_and(|e| cap >= e);
+                let tl = cap - t.tok_start;
+                // 文档里其它 token（`<r>`、`<r/>`、`</r>`）最长 4 字节
+                let tok_ok = tl >= 1 && !(t.pre_len > 0 && tl < 3) && !(after_token && tl < 4);
+                if tok_ok {
+                    cfgs.push((
+                        format!("TokenLength={tl}"),
+                        if after_token { None } else { Some(cap) },
+                        base_cfg.clone().with_max_token_len(tl as u64),
+                        Some((LimitKind::TokenLength, tl as u64)),
+                    ));
+                }
+                if !after_token {
+                    cfgs.push((
+                        format!("TotalInput={cap}"),
+                        Some(cap),
+                        base_cfg.clone().with_max_total_input(cap as u64),
+                        Some((LimitKind::TotalInput, cap as u64)),
+                    ));
+                }
+            }
+            let slot = match per_ctx.iter().position(|x| x.0 == t.ctx) {
+                Some(i) => i,
+                None => {
+                    per_ctx.push((t.ctx.to_string(), 0, 0));
+                    per_ctx.len() - 1
+                }
+            };
+            for (what, cap, c, lim) in cfgs {
+                let want: End = match (cap, lim) {
+                    (Some(cap), Some((kind, limit))) if cap <= proof => Err((
+                        ErrorKind::SecurityLimit {
+                            kind,
+                            limit,
+                            actual: limit + 1,
+                        },
+                        doc_position(d, cap),
+                    )),
+                    _ => outcome.clone(),
+                };
+                groups += 1;
+                per_ctx[slot].1 += 1;
+                let mut cuts = vec![proof, proof + 1];
+                if let Some(cap) = cap {
+                    cuts.push(cap);
+                }
+                let paths = d40_paths(d, &c, &cuts, full);
+                let base_events = paths[0].1.events.clone();
+                let bad: Vec<String> = paths
+                    .into_iter()
+                    .filter(|(_, s)| s.end != want || s.events != base_events)
+                    .map(|(p, s)| format!("{p}={:?}", s.end))
+                    .collect();
+                if !bad.is_empty() {
+                    per_ctx[slot].2 += 1;
+                    fails.push(format!(
+                        "{} max_text_len={m} {what}（判定字节 {proof}）：应为 {want:?}；不符 {} 条：{}",
+                        t.label,
+                        bad.len(),
+                        bad.iter().take(3).cloned().collect::<Vec<_>>().join("；")
+                    ));
+                }
+            }
+        }
+    }
+    (groups, fails, per_ctx)
+}
+
+fn term_report(name: &str, which: &str, full: bool) {
+    let (n, fails, per_ctx) = term_run(which, full);
+    println!("{name}：{n} 组（文档 × max_text_len × 字节上限）");
+    for (ctx, total, bad) in &per_ctx {
+        println!("  {ctx}：{total} 组，不符 {bad}");
+    }
+    let show = if std::env::var_os("PUREXML_D40_ALL").is_some() {
+        fails.len()
+    } else {
+        40
+    };
+    for f in fails.iter().take(show) {
+        println!("  ✗ {f}");
+    }
+    assert!(
+        fails.is_empty(),
+        "{name}：{} / {n} 组不符（前 40 条见上，PUREXML_D40_ALL=1 列出全部）",
+        fails.len()
+    );
+}
+
+#[test]
+fn comment_dash_vs_text_length_sampled() {
+    term_report("comment_dash_vs_text_length_sampled", "comment", false);
+}
+
+#[test]
+#[ignore = "slow: 全部边界字节 × 四路径全切块，每轮 release --ignored 必跑"]
+fn comment_dash_vs_text_length() {
+    term_report("comment_dash_vs_text_length", "comment", true);
+}
+
+#[test]
+fn pi_cdata_terminator_vs_text_length_sampled() {
+    term_report(
+        "pi_cdata_terminator_vs_text_length_sampled",
+        "picdata",
+        false,
+    );
+}
+
+#[test]
+#[ignore = "slow: 全部边界字节 × 四路径全切块，每轮 release --ignored 必跑"]
+fn pi_cdata_terminator_vs_text_length() {
+    term_report("pi_cdata_terminator_vs_text_length", "picdata", true);
+}
