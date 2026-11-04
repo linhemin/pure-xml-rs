@@ -912,7 +912,7 @@ fn streaming_buffer_stays_bounded_for_a_huge_tiny_token_document() {
                 Ok(None) => break,
                 Err(err) => panic!("chunk {chunk}: {err}"),
             }
-            if seen % 50_000 == 0 {
+            if seen.is_multiple_of(50_000) {
                 assert!(
                     reader.buffered_capacity() <= 1024 * 1024,
                     "chunk {chunk}: capacity {} after {seen} events",

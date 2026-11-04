@@ -1345,10 +1345,10 @@ impl Framer {
         width: usize,
     ) -> Option<Poll> {
         for step in 0..width {
-            if step > 0 {
-                if let Err(done) = self.consider(buf, eof, max_token) {
-                    return Some(done);
-                }
+            if step > 0
+                && let Err(done) = self.consider(buf, eof, max_token)
+            {
+                return Some(done);
             }
             if self.i >= buf.len() {
                 return Some(if eof {
