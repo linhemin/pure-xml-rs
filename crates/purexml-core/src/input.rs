@@ -140,7 +140,9 @@ impl<R: BufRead> IoInput<R> {
         self.blocked = false;
         let mut framer = Framer::start(*pos, doc_start, content);
         loop {
-            match framer.poll(&self.buf, self.eof, config) {
+            let total_at = usize::try_from(config.max_total_input.saturating_sub(self.base))
+                .unwrap_or(usize::MAX);
+            match framer.poll(&self.buf, self.eof, config, total_at) {
                 Poll::NeedMore => {
                     if self.eof || self.blocked {
                         self.view_end = None;
@@ -326,7 +328,13 @@ impl Framer {
         }
     }
 
-    pub(crate) fn poll(&mut self, buf: &[u8], eof: bool, config: &ParserConfig) -> Poll {
+    pub(crate) fn poll(
+        &mut self,
+        buf: &[u8],
+        eof: bool,
+        config: &ParserConfig,
+        total_at: usize,
+    ) -> Poll {
         loop {
             match self.state {
                 State::Lookahead => {
@@ -519,6 +527,7 @@ impl Framer {
                         buf,
                         eof,
                         config,
+                        total_at,
                         Mark {
                             marker: b"-->",
                             body,
@@ -534,6 +543,7 @@ impl Framer {
                         buf,
                         eof,
                         config,
+                        total_at,
                         Mark {
                             marker: b"]]>",
                             body,
@@ -735,6 +745,7 @@ impl Framer {
         buf: &[u8],
         eof: bool,
         config: &ParserConfig,
+        total_at: usize,
         mut mark: Mark,
     ) -> Option<Poll> {
         if starts_at(buf, self.i, mark.marker) {
@@ -782,6 +793,12 @@ impl Framer {
             let next = (self.i - mark.body) as u64 + width as u64;
             if next > config.max_text_len {
                 self.remember_delimited(mark);
+                // from_bytes reports a byte cap that still sits inside an
+                // unresolved `-->` / `--` / `]]>` lookahead. Cutting at this
+                // character hides that byte from the streaming engine.
+                if let Some(end) = self.terminator_limit_end(buf, config, total_at, mark.comment) {
+                    return Some(Poll::Probe { end });
+                }
                 return Some(Poll::Probe {
                     end: self.i + width,
                 });
@@ -796,6 +813,39 @@ impl Framer {
         self.i += 1;
         self.remember_delimited(mark);
         None
+    }
+
+    /// Earliest byte cap inside an unresolved terminator lookahead.
+    ///
+    /// The end is exclusive, so the cap byte itself is in the window and the
+    /// engine can run the same `prefix_cut` as `from_bytes`.
+    fn terminator_limit_end(
+        &self,
+        buf: &[u8],
+        config: &ParserConfig,
+        total_at: usize,
+        comment: bool,
+    ) -> Option<usize> {
+        let patterns: &[&[u8]] = if comment { &[b"-->", b"--"] } else { &[b"]]>"] };
+        let token_at = self
+            .anchor
+            .saturating_add(usize::try_from(config.max_token_len).unwrap_or(usize::MAX));
+        let mut best: Option<usize> = None;
+        for cap in [token_at, total_at] {
+            if cap < self.i || cap >= buf.len() {
+                continue;
+            }
+            let have = &buf[self.i..cap];
+            let open = patterns
+                .iter()
+                .any(|pattern| have.len() < pattern.len() && pattern.starts_with(have));
+            if !open {
+                continue;
+            }
+            let end = cap.saturating_add(1);
+            best = Some(best.map(|so_far| so_far.min(end)).unwrap_or(end));
+        }
+        best
     }
 
     fn remember_delimited(&mut self, mark: Mark) {

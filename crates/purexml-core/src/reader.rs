@@ -681,7 +681,7 @@ impl Engine {
         let cap_end = start
             .saturating_add(self.config.max_token_len as usize)
             .saturating_add(1);
-        match framer.poll(input, self.end_is_eof, &self.config) {
+        match framer.poll(input, self.end_is_eof, &self.config, self.total_stop) {
             Poll::Probe { end } => end == cap_end,
             Poll::NeedMore | Poll::Ready { .. } => false,
         }
@@ -696,7 +696,7 @@ impl Engine {
         let doc_start = start == 0 && input.starts_with(&[0xEF, 0xBB, 0xBF]);
         let mut framer = Framer::start(start, doc_start, content);
         let shown: String = input.iter().take(16).map(|b| format!("{b:02x}")).collect();
-        match framer.poll(input, self.end_is_eof, &self.config) {
+        match framer.poll(input, self.end_is_eof, &self.config, self.total_stop) {
             Poll::Probe { end } => format!("Probe end={end} content={content} [{shown}]"),
             Poll::NeedMore => format!("NeedMore content={content} [{shown}]"),
             Poll::Ready { eof } => format!("Ready eof={eof} content={content} [{shown}]"),
