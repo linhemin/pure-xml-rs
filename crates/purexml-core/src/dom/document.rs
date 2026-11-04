@@ -383,8 +383,8 @@ impl std::fmt::Debug for Document {
 /// Borrowed view of one live node.
 #[derive(Copy, Clone)]
 pub struct NodeRef<'a> {
-    doc: &'a Document,
-    id: NodeId,
+    pub(super) doc: &'a Document,
+    pub(super) id: NodeId,
 }
 
 impl<'a> NodeRef<'a> {

@@ -10,6 +10,7 @@
 
 mod document;
 mod edit;
+mod ser;
 
 pub use document::{
     AttrRef, Attrs, DoctypeName, Document, DomError, DomLimit, ExpandedName, NodeId, NodeKind,
