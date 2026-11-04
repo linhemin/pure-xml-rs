@@ -126,17 +126,17 @@ impl Document {
         self.create_chars(NodeKind::Text, text)
     }
 
-    /// A detached CDATA node. `]]>` is rejected so a later parse stays one node.
+    /// A detached CDATA node. `]]>` and CR are rejected so a later parse stays one node.
     pub fn create_cdata(&mut self, text: &str) -> Result<NodeId, DomError> {
-        if text.contains("]]>") {
+        if text.contains("]]>") || text.contains('\r') {
             return Err(DomError::InvalidChar);
         }
         self.create_chars(NodeKind::CData, text)
     }
 
-    /// A detached comment. `--` and a trailing `-` are rejected.
+    /// A detached comment. `--`, a trailing `-`, and CR are rejected.
     pub fn create_comment(&mut self, text: &str) -> Result<NodeId, DomError> {
-        if text.contains("--") || text.ends_with('-') {
+        if text.contains("--") || text.ends_with('-') || text.contains('\r') {
             return Err(DomError::InvalidChar);
         }
         self.create_chars(NodeKind::Comment, text)
@@ -455,12 +455,12 @@ impl Document {
         match self.nodes[index as usize].kind {
             NodeKind::Text => {}
             NodeKind::Comment => {
-                if text.contains("--") || text.ends_with('-') {
+                if text.contains("--") || text.ends_with('-') || text.contains('\r') {
                     return Err(DomError::InvalidChar);
                 }
             }
             NodeKind::CData => {
-                if text.contains("]]>") {
+                if text.contains("]]>") || text.contains('\r') {
                     return Err(DomError::InvalidChar);
                 }
             }
@@ -1124,7 +1124,7 @@ impl Document {
         }
         if let Some(data) = data {
             self.check_text(data, DomLimit::TextLength)?;
-            if data.contains("?>") {
+            if data.contains("?>") || data.contains('\r') {
                 return Err(DomError::InvalidChar);
             }
         }

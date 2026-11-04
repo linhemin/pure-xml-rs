@@ -50,7 +50,7 @@ impl From<std::io::Error> for WriteError {
 
 /// Escape `&`, `<`, `>`, and CR for character data.
 ///
-/// CR is written as `&#13;` so a later parse does not turn it into a line feed.
+/// CR is written as `&#xD;` so a later parse does not turn it into a line feed.
 /// Every `>` is escaped, so `]]>` cannot close character data early.
 pub fn escape_text(input: &str) -> Cow<'_, str> {
     if !needs_text_escape(input) {
@@ -92,7 +92,7 @@ fn escape_into(input: &str, attribute: bool) -> String {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' if attribute => out.push_str("&quot;"),
-            '\r' => out.push_str("&#13;"),
+            '\r' => out.push_str("&#xD;"),
             '\t' if attribute => out.push_str("&#9;"),
             '\n' if attribute => out.push_str("&#10;"),
             other => out.push(other),

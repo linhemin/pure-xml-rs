@@ -397,7 +397,8 @@ fn escapes_round_trip_and_illegal_forms_are_rejected() {
     assert!(xml.contains("<![CDATA[x<y&z]]>"));
     assert!(xml.contains("&#10;"));
     assert!(xml.contains("&#9;"));
-    assert!(xml.contains("&#13;"));
+    assert!(xml.contains("&#xD;"));
+    assert!(!xml.contains("&#13;"));
     assert!(xml.contains("&quot;"));
     let again = rebuild(&xml);
     assert_eq!(
@@ -461,6 +462,49 @@ fn escapes_round_trip_and_illegal_forms_are_rejected() {
     );
     assert_eq!(doc.approx_heap_bytes(), before);
     assert_eq!(doc.get(comment).unwrap().text(), Some("ok ]]> note"));
+
+    let bytes = doc.approx_heap_bytes();
+    let nodes = doc.node_count();
+    assert_eq!(doc.create_cdata("a\rb").unwrap_err(), DomError::InvalidChar);
+    assert_eq!(
+        doc.create_comment("a\rb").unwrap_err(),
+        DomError::InvalidChar
+    );
+    assert_eq!(
+        doc.set_text(comment, "a\rb").unwrap_err(),
+        DomError::InvalidChar
+    );
+    assert_eq!(
+        doc.create_pi("tgt", Some("a\rb")).unwrap_err(),
+        DomError::InvalidChar
+    );
+    assert_eq!(
+        doc.set_pi_data(pi, Some("a\rb")).unwrap_err(),
+        DomError::InvalidChar
+    );
+    assert_eq!(doc.approx_heap_bytes(), bytes);
+    assert_eq!(doc.node_count(), nodes);
+    assert_eq!(doc.get(comment).unwrap().text(), Some("ok ]]> note"));
+    assert_eq!(doc.get(pi).unwrap().pi().unwrap().1, Some("keep >"));
+
+    let mut plain = Document::new();
+    let host = append_local(&mut plain, "r");
+    let cr_text = plain.create_text("a\rb").unwrap();
+    plain.append_child(host, cr_text).unwrap();
+    plain.set_attribute(host, Name::local("a"), "x\ry").unwrap();
+    let cr_xml = plain.to_string().unwrap();
+    assert!(
+        cr_xml.contains("&#xD;"),
+        "CR in text and attributes must be &#xD;: {cr_xml}"
+    );
+    assert!(cr_xml.contains(">a&#xD;b<"), "{cr_xml}");
+    assert!(cr_xml.contains("a=\"x&#xD;y\""), "{cr_xml}");
+    assert!(!cr_xml.contains('\r'), "{cr_xml}");
+    let cr_again = rebuild(&cr_xml);
+    assert_eq!(
+        fingerprint(&plain, root_id(&plain)),
+        fingerprint(&cr_again, root_id(&cr_again))
+    );
 }
 
 #[test]
