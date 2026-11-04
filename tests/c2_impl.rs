@@ -584,6 +584,39 @@ fn document_without_a_root_element_does_not_serialize() {
 }
 
 #[test]
+fn document_node_write_to_checks_for_a_root_element() {
+    let doc = Document::new();
+    let mut buf = Vec::new();
+    let mut writer = purexml::Writer::new(&mut buf);
+    assert!(matches!(
+        doc.root().unwrap().write_to(&mut writer),
+        Err(purexml::WriteError::NoRootElement)
+    ));
+    assert!(buf.is_empty());
+
+    let mut doc = Document::new();
+    let root = root_id(&doc);
+    let comment = doc.create_comment("only").unwrap();
+    doc.append_child(root, comment).unwrap();
+    let pi = doc.create_pi("t", Some("d")).unwrap();
+    doc.append_child(root, pi).unwrap();
+    let mut buf = Vec::new();
+    let mut writer = purexml::Writer::new(&mut buf);
+    assert!(matches!(
+        doc.root().unwrap().write_to(&mut writer),
+        Err(purexml::WriteError::NoRootElement)
+    ));
+    assert!(buf.is_empty());
+
+    let element = doc.create_element(Name::local("r")).unwrap();
+    doc.append_child(root, element).unwrap();
+    let mut buf = Vec::new();
+    let mut writer = purexml::Writer::new(&mut buf);
+    doc.root().unwrap().write_to(&mut writer).unwrap();
+    assert_eq!(String::from_utf8(buf).unwrap(), doc.to_string().unwrap());
+}
+
+#[test]
 fn byte_cap_rejects_without_growing_the_arena() {
     let mut doc =
         Document::with_config(&purexml::ParserConfig::default().with_max_dom_bytes(120)).unwrap();

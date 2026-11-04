@@ -23,13 +23,7 @@ impl Document {
         writer: &mut crate::Writer<W>,
         options: WriteOptions,
     ) -> Result<(), WriteError> {
-        if self.root_element().is_none() {
-            return Err(WriteError::NoRootElement);
-        }
-        let Some(root) = self.root() else {
-            return Err(WriteError::NoRootElement);
-        };
-        write_at(self, root.id().index(), writer, options)
+        write_document(self, writer, options)
     }
 
     /// `write_to` into a `String`.
@@ -55,14 +49,32 @@ impl NodeRef<'_> {
         self.write_to_with(writer, WriteOptions::default())
     }
 
-    /// Write this subtree. `omit_doctype` applies when the node is the document.
+    /// Write this subtree. A document node uses the same root-element check as
+    /// [`Document::write_to`]. `omit_doctype` applies only in that case.
     pub fn write_to_with<W: Write>(
         self,
         writer: &mut crate::Writer<W>,
         options: WriteOptions,
     ) -> Result<(), WriteError> {
+        if self.kind() == Some(NodeKind::Document) {
+            return write_document(self.doc, writer, options);
+        }
         write_at(self.doc, self.id().index(), writer, options)
     }
+}
+
+fn write_document<W: Write>(
+    doc: &Document,
+    writer: &mut crate::Writer<W>,
+    options: WriteOptions,
+) -> Result<(), WriteError> {
+    if doc.root_element().is_none() {
+        return Err(WriteError::NoRootElement);
+    }
+    let Some(root) = doc.root() else {
+        return Err(WriteError::NoRootElement);
+    };
+    write_at(doc, root.id().index(), writer, options)
 }
 
 enum Job {
