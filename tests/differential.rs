@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::{push_text, Node};
+use common::{Node, push_text};
 use std::path::{Path, PathBuf};
 
 fn rox_structure(input: &[u8]) -> Result<Vec<Node>, String> {

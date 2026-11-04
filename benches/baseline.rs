@@ -5,7 +5,7 @@
 //! 命名空间：purexml 和 roxmltree 都解析元素的命名空间；quick-xml 用普通 Reader，不解析命名空间（它的 NsReader 是另一套 API）。
 
 use criterion::{
-    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
+    BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;

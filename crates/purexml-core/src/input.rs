@@ -7,7 +7,7 @@
 use std::io::{BufRead, ErrorKind as IoErrorKind};
 
 use crate::config::ParserConfig;
-use crate::error::{observe_byte, Error, ErrorKind, Position, Result};
+use crate::error::{Error, ErrorKind, Position, Result, observe_byte};
 use crate::name::{decode_utf8, is_name_char, is_name_start, is_whitespace, utf8_incomplete};
 
 /// Bytes pulled per `read` when the source has them. Not a public knob.
@@ -1345,10 +1345,10 @@ impl Framer {
         width: usize,
     ) -> Option<Poll> {
         for step in 0..width {
-            if step > 0 {
-                if let Err(done) = self.consider(buf, eof, max_token) {
-                    return Some(done);
-                }
+            if step > 0
+                && let Err(done) = self.consider(buf, eof, max_token)
+            {
+                return Some(done);
             }
             if self.i >= buf.len() {
                 return Some(if eof {

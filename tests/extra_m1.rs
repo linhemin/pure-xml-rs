@@ -71,12 +71,16 @@ impl Owned {
 #[test]
 fn balanced_entity_is_content_and_an_unused_bare_lt_is_allowed() {
     let parsed = must(r#"<!DOCTYPE r [<!ENTITY e "<a>t</a>">]><r>&e;</r>"#);
-    assert!(parsed
-        .iter()
-        .any(|ev| matches!(ev, Owned::Start { local, .. } if local == "a")));
-    assert!(parsed
-        .iter()
-        .any(|ev| matches!(ev, Owned::Text(text) if text == "t")));
+    assert!(
+        parsed
+            .iter()
+            .any(|ev| matches!(ev, Owned::Start { local, .. } if local == "a"))
+    );
+    assert!(
+        parsed
+            .iter()
+            .any(|ev| matches!(ev, Owned::Text(text) if text == "t"))
+    );
     assert!(
         events(r#"<!DOCTYPE r [<!ENTITY e "&#60;">]><r></r>"#).is_ok(),
         "an entity that is never used may contain a bare '<'"
@@ -99,9 +103,11 @@ fn predefined_lt_in_an_attribute_stays_a_character() {
 #[test]
 fn escaped_cdata_end_is_character_data() {
     let parsed = must("<r>]]&gt;</r>");
-    assert!(parsed
-        .iter()
-        .any(|ev| matches!(ev, Owned::Text(text) if text == "]]>")));
+    assert!(
+        parsed
+            .iter()
+            .any(|ev| matches!(ev, Owned::Text(text) if text == "]]>"))
+    );
     let err = must_err("<r>]]></r>");
     assert!(err.contains("syntax"), "{err}");
 }

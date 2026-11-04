@@ -158,13 +158,17 @@ fn d23_pi_entity_and_notation_names_are_ncnames() {
     assert!(err.to_string().contains("undefined entity"), "{err}");
 
     let events = must_ok("<r><?ab x?></r>");
-    assert!(events
-        .iter()
-        .any(|ev| matches!(ev, EventOwned::Pi(t) if t == "ab")));
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, EventOwned::Pi(t) if t == "ab"))
+    );
     let events = must_ok("<?xml-stylesheet type=\"text/xsl\" href=\"a\"?><r/>");
-    assert!(events
-        .iter()
-        .any(|ev| matches!(ev, EventOwned::Pi(t) if t == "xml-stylesheet")));
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, EventOwned::Pi(t) if t == "xml-stylesheet"))
+    );
 }
 
 #[test]
@@ -178,9 +182,11 @@ fn d23_doctype_name_is_a_qname() {
         must_syntax(xml);
     }
     let events = must_ok("<!DOCTYPE a:b><r/>");
-    assert!(events
-        .iter()
-        .any(|ev| matches!(ev, EventOwned::Doctype(name) if name == "a:b")));
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, EventOwned::Doctype(name) if name == "a:b"))
+    );
 }
 
 #[test]
@@ -260,7 +266,7 @@ macro_rules! snap_of {
                         line: err.position.line,
                         column: err.position.column,
                         offset: err.position.offset,
-                    })
+                    });
                 }
             }
         };
@@ -507,15 +513,17 @@ fn token_text_and_subset_limits_match_and_use_limit_plus_one() {
     assert_eq!(subset_err.offset, 17);
     assert_eq!(subset_err.line, 1);
     assert_eq!(subset_err.column, 18);
-    assert!(snap_bytes(
-        b"<!DOCTYPE r []><r/>",
-        ParserConfig {
-            max_internal_subset_len: 0,
-            ..ParserConfig::default()
-        },
-    )
-    .err
-    .is_none());
+    assert!(
+        snap_bytes(
+            b"<!DOCTYPE r []><r/>",
+            ParserConfig {
+                max_internal_subset_len: 0,
+                ..ParserConfig::default()
+            },
+        )
+        .err
+        .is_none()
+    );
 }
 
 #[test]
@@ -904,7 +912,7 @@ fn streaming_buffer_stays_bounded_for_a_huge_tiny_token_document() {
                 Ok(None) => break,
                 Err(err) => panic!("chunk {chunk}: {err}"),
             }
-            if seen % 50_000 == 0 {
+            if seen.is_multiple_of(50_000) {
                 assert!(
                     reader.buffered_capacity() <= 1024 * 1024,
                     "chunk {chunk}: capacity {} after {seen} events",

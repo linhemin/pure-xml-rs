@@ -19,7 +19,12 @@ macro_rules! drain {
                 Ok(Some(ev)) => events.push(format!("{ev:?}")),
                 Ok(None) => break Ok(()),
                 Err(e) => {
-                    break Err((e.kind.clone(), e.position.line, e.position.column, e.position.offset))
+                    break Err((
+                        e.kind.clone(),
+                        e.position.line,
+                        e.position.column,
+                        e.position.offset,
+                    ));
                 }
             }
         };
@@ -65,10 +70,9 @@ pub fn check(data: &[u8], sizes: [usize; 3], tight: bool) {
     let a = drain!(bytes);
     let mut owned = Reader::from_vec(data.to_vec()).with_config(config.clone());
     assert_eq!(a, drain!(owned), "from_vec 与 from_bytes 不一致");
-    let mut streamed =
-        Reader::from_reader_with_config(Chunked { data, sizes, i: 0 }, config).expect("from_reader");
+    let mut streamed = Reader::from_reader_with_config(Chunked { data, sizes, i: 0 }, config)
+        .expect("from_reader");
     let b = drain!(streamed);
     // v7（D31 裁定）：TotalInput 按位置判定，和其他错误一样要求事件和错误完全相同。
     assert_eq!(a, b, "from_bytes 与 from_reader（块长 {sizes:?}）不一致");
 }
-

@@ -49,7 +49,7 @@ macro_rules! drain {
                         e.position.line,
                         e.position.column,
                         e.position.offset,
-                    ))
+                    ));
                 }
             }
         };

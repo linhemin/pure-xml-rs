@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{run_guarded, ErrorClass, Failure, Guarded, Limits, Summary, SOFT_CAP};
+use common::{ErrorClass, Failure, Guarded, Limits, SOFT_CAP, Summary, run_guarded};
 use std::io::ErrorKind as IoErrorKind;
 use std::net::TcpListener;
 use std::time::Duration;

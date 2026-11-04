@@ -10,7 +10,7 @@ use std::io::Write;
 
 use crate::event::{
     Attribute, Doctype, EmptyElement, EndElement, Event, Namespace, ProcessingInstruction, QName,
-    StartElement, XmlDecl, XMLNS_NAMESPACE, XML_NAMESPACE,
+    StartElement, XML_NAMESPACE, XMLNS_NAMESPACE, XmlDecl,
 };
 use crate::name::{is_pubid_char, is_xml_char};
 use crate::rules::{self, BindingFault};

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- MSRV is 1.99.1, raised from 1.70 to follow the local stable toolchain.
+  The workspace edition is 2024 (`purexml`, `purexml-core`, and `purexml-fuzz`).
 - **D31.** `TotalInput` is positional. It is reported only when parsing needs
   the byte at offset `max_total_input`. The position is that byte and
   `actual` is `limit + 1`. An error at an earlier offset wins.
