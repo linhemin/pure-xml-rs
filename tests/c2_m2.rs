@@ -4,7 +4,7 @@
 //! 结构比较规则见 `common/dom_c2.rs`（计划 §2.4）。
 //!
 //! 不调用 `create_doctype`（Implementer：将改为 pub(crate)）。Doctype 相关用例经
-//! [`make_doctype`] 适配，当前没有合法公开入口，标 `#[ignore]` 待定。
+//! [`make_doctype`] 适配，等 M2 收尾的公开构建入口，标 `#[ignore]`。
 //!
 //! 运行：cargo test --test c2_m2
 //! 深树/大量兄弟用例默认运行；W3C 子集需要 `PUREXML_W3C_DIR` 或 tests/w3c/cache/xmlconf，缺失则跳过。
@@ -17,7 +17,7 @@ use dom_c2::{
     read_all_paths, read_bytes, read_bytes_with, roundtrip, unified,
 };
 use purexml::dom::{Document, DomError, Name, NodeId, NodeKind, WriteOptions};
-use purexml::{ParserConfig, Writer};
+use purexml::{ParserConfig, WriteError, Writer};
 
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
@@ -199,17 +199,32 @@ fn esc_cdata_markup_and_cr_roundtrip() {
     }
 }
 
-/// CDATA 里的 CR 写出后读回会被行尾规范化成 LF，CDATA 里又没法写字符引用。
-/// 统一断言：要么序列化报错，要么读回一致。
+/// D-C2-1（Lead 19:25 裁定，c0f49a0 修复）：CDATA 里的 CR 读回会被规范化成 LF，又没法写字符引用，
+/// 所以修改阶段直接返回 InvalidChar，文档不变。
 #[test]
-#[ignore = "缺陷 D-C2-1：CDATA/注释/PI 里的 CR 原样写出，读回被行尾规范化为 LF；序列化没有报错（静默改写）"]
 fn esc_cdata_with_cr() {
-    for t in ["a\rb", "a\r\nb", "\r"] {
+    for t in ["a\rb", "a\r\nb", "\r", "x]]\r"] {
+        let mut doc = Document::new();
+        assert!(
+            matches!(doc.create_cdata(t), Err(DomError::InvalidChar)),
+            "create_cdata({t:?}) 应返回 InvalidChar"
+        );
         let (mut doc, r) = new_doc_with_root(Name::local("r"));
-        let c = doc.create_cdata(t);
-        let Ok(c) = c else { continue }; // 创建时拒绝也符合口径
+        let c = doc.create_cdata("ok").unwrap();
         doc.append_child(r, c).unwrap();
-        assert_unified(&doc);
+        let before = assert_serializes(&doc);
+        let (nodes, bytes) = (doc.node_count(), doc.approx_heap_bytes());
+        assert!(
+            matches!(doc.set_text(c, t), Err(DomError::InvalidChar)),
+            "CDATA set_text({t:?}) 应返回 InvalidChar"
+        );
+        assert_eq!(
+            doc.get(c).unwrap().text(),
+            Some("ok"),
+            "被拒的 set_text 不能改值"
+        );
+        assert_eq!((doc.node_count(), doc.approx_heap_bytes()), (nodes, bytes));
+        assert_eq!(assert_serializes(&doc), before);
     }
 }
 
@@ -229,16 +244,27 @@ fn esc_comment_rules() {
     assert_serializes(&doc);
 }
 
+/// D-C2-1：注释里的 CR 在修改阶段返回 InvalidChar，文档不变。
 #[test]
-#[ignore = "缺陷 D-C2-1：CDATA/注释/PI 里的 CR 原样写出，读回被行尾规范化为 LF；序列化没有报错（静默改写）"]
 fn esc_comment_with_cr() {
-    for t in ["a\rb", "\r\n"] {
+    for t in ["a\rb", "\r\n", "\r"] {
+        let mut doc = Document::new();
+        assert!(
+            matches!(doc.create_comment(t), Err(DomError::InvalidChar)),
+            "create_comment({t:?}) 应返回 InvalidChar"
+        );
         let (mut doc, r) = new_doc_with_root(Name::local("r"));
-        let Ok(c) = doc.create_comment(t) else {
-            continue;
-        };
+        let c = doc.create_comment("ok").unwrap();
         doc.append_child(r, c).unwrap();
-        assert_unified(&doc);
+        let before = assert_serializes(&doc);
+        let (nodes, bytes) = (doc.node_count(), doc.approx_heap_bytes());
+        assert!(
+            matches!(doc.set_text(c, t), Err(DomError::InvalidChar)),
+            "注释 set_text({t:?}) 应返回 InvalidChar"
+        );
+        assert_eq!(doc.get(c).unwrap().text(), Some("ok"));
+        assert_eq!((doc.node_count(), doc.approx_heap_bytes()), (nodes, bytes));
+        assert_eq!(assert_serializes(&doc), before);
     }
 }
 
@@ -280,16 +306,49 @@ fn esc_pi_data_edge_cases() {
     }
 }
 
+/// D-C2-1：PI 数据里的 CR 在修改阶段返回 InvalidChar，文档不变。
 #[test]
-#[ignore = "缺陷 D-C2-1：CDATA/注释/PI 里的 CR 原样写出，读回被行尾规范化为 LF；序列化没有报错（静默改写）"]
 fn esc_pi_data_with_cr() {
-    for d in ["a\rb", "a\r\nb"] {
+    for d in ["a\rb", "a\r\nb", "\r", " \rlead"] {
+        let mut doc = Document::new();
+        assert!(
+            matches!(doc.create_pi("t", Some(d)), Err(DomError::InvalidChar)),
+            "create_pi(t, {d:?}) 应返回 InvalidChar"
+        );
         let (mut doc, r) = new_doc_with_root(Name::local("r"));
-        let Ok(p) = doc.create_pi("t", Some(d)) else {
-            continue;
-        };
+        let p = doc.create_pi("t", Some("ok")).unwrap();
         doc.append_child(r, p).unwrap();
-        assert_unified(&doc);
+        let before = assert_serializes(&doc);
+        let (nodes, bytes) = (doc.node_count(), doc.approx_heap_bytes());
+        assert!(
+            matches!(doc.set_pi_data(p, Some(d)), Err(DomError::InvalidChar)),
+            "set_pi_data({d:?}) 应返回 InvalidChar"
+        );
+        assert_eq!(doc.get(p).unwrap().pi(), Some(("t", Some("ok"))));
+        assert_eq!((doc.node_count(), doc.approx_heap_bytes()), (nodes, bytes));
+        assert_eq!(assert_serializes(&doc), before);
+    }
+}
+
+/// D-C2-1 另一半：文本和属性里的 CR 写成 `&#xD;`，读回仍是 CR（统一断言比较结构）。
+#[test]
+fn esc_text_and_attr_cr_written_as_char_ref() {
+    for (t, want_t) in [
+        ("a\rb", "a&#xD;b"),
+        ("\r", "&#xD;"),
+        ("x\r\ny", "x&#xD;\ny"),
+    ] {
+        let (mut doc, r) = new_doc_with_root(Name::local("r"));
+        doc.set_attribute(r, Name::local("a"), t).unwrap();
+        add_text(&mut doc, r, t);
+        let s = assert_serializes(&doc);
+        let want_a = want_t.replace('\n', "&#10;");
+        assert_eq!(s, format!("<r a=\"{want_a}\">{want_t}</r>"));
+        // 读回后文本、属性里仍是原样的 CR
+        let back = build(&read_bytes(s.as_bytes()).unwrap()).unwrap().doc;
+        let br = back.root_element().unwrap();
+        assert_eq!(br.attribute("a"), Some(t));
+        assert_eq!(br.children().next().unwrap().text(), Some(t));
     }
 }
 
@@ -646,7 +705,7 @@ fn make_doctype(
 }
 
 #[test]
-#[ignore = "待定：等 doctype 新 API（Lead 18:45，create_doctype 改 pub(crate)）"]
+#[ignore = "等 M2 收尾的公开构建入口；ser.rs 暂无对应单元测试（规则在 edit.rs create_doctype，PUBLIC 无 SYSTEM → Hierarchy）"]
 fn doctype_public_without_system_rejected() {
     let mut doc = Document::new();
     let r = make_doctype(&mut doc, "r", None, Some("-//X//Y"))
@@ -655,7 +714,7 @@ fn doctype_public_without_system_rejected() {
 }
 
 #[test]
-#[ignore = "待定：等 doctype 新 API（Lead 18:45，create_doctype 改 pub(crate)）"]
+#[ignore = "等 M2 收尾的公开构建入口；当前由 ser.rs 单元测试覆盖"]
 fn doctype_omit_option_drops_doctype() {
     let mut doc = Document::new();
     let d = make_doctype(&mut doc, "r", Some("r.dtd"), None)
@@ -677,17 +736,64 @@ fn doctype_omit_option_drops_doctype() {
 
 // ───────────────────────────── 文档形状 ─────────────────────────────
 
-/// 没有根元素的文档：写出来不是良构文档。统一断言：要么 Err，要么读得回。
+/// Q-C2-1（Lead 19:25 裁定，c0f49a0 实现）：没有根元素的 Document 序列化返回
+/// `WriteError::NoRootElement`；单个节点子树（NodeRef::write_to）不受影响。
 #[test]
-#[ignore = "待裁决 Q-C2-1：没有根元素的文档 to_string 返回 Ok，但输出不是良构文档"]
 fn doc_without_root_element() {
+    fn write_doc(doc: &Document) -> (Result<(), WriteError>, Vec<u8>) {
+        let mut buf = Vec::new();
+        let r = doc.write_to(&mut Writer::new(&mut buf));
+        (r, buf)
+    }
     let doc = Document::new();
-    assert_unified(&doc);
+    assert!(matches!(doc.to_string(), Err(WriteError::NoRootElement)));
+    let (r, buf) = write_doc(&doc);
+    assert!(matches!(r, Err(WriteError::NoRootElement)) && buf.is_empty());
+
+    // 只有注释/PI，没有元素
     let mut doc = Document::new();
     let rt = root(&doc);
     let c = doc.create_comment("only").unwrap();
     doc.append_child(rt, c).unwrap();
-    assert_unified(&doc);
+    let p = doc.create_pi("t", Some("d")).unwrap();
+    doc.append_child(rt, p).unwrap();
+    assert!(matches!(doc.to_string(), Err(WriteError::NoRootElement)));
+    assert!(matches!(
+        doc.to_string_with(WriteOptions { omit_doctype: true }),
+        Err(WriteError::NoRootElement)
+    ));
+    let (r, buf) = write_doc(&doc);
+    assert!(matches!(r, Err(WriteError::NoRootElement)) && buf.is_empty());
+    // 统一断言接受 Err
+    assert!(matches!(assert_unified(&doc), Unified::SerErr(_)));
+
+    // 子树不受影响：注释节点、未挂接的元素子树都能写
+    let mut buf = Vec::new();
+    doc.get(c)
+        .unwrap()
+        .write_to(&mut Writer::new(&mut buf))
+        .unwrap();
+    assert_eq!(String::from_utf8(buf).unwrap(), "<!--only-->");
+    let e = doc.create_element(Name::local("e")).unwrap();
+    add_text(&mut doc, e, "t");
+    let mut buf = Vec::new();
+    doc.get(e)
+        .unwrap()
+        .write_to(&mut Writer::new(&mut buf))
+        .unwrap();
+    assert_eq!(String::from_utf8(buf).unwrap(), "<e>t</e>");
+    assert!(
+        matches!(doc.to_string(), Err(WriteError::NoRootElement)),
+        "未挂接的元素不算根"
+    );
+
+    // 删掉根元素以后同样报错；挂回元素后恢复
+    let (mut doc, r) = new_doc_with_root(Name::local("r"));
+    doc.remove(r).unwrap();
+    assert!(matches!(doc.to_string(), Err(WriteError::NoRootElement)));
+    let rt = root(&doc);
+    add_el(&mut doc, rt, Name::local("s"));
+    assert_eq!(assert_serializes(&doc), "<s/>");
 }
 
 #[test]
@@ -1317,10 +1423,9 @@ fn esc_text_and_attr_exact_output() {
     assert!(!s.contains('\r'), "文本里的 CR 必须写成字符引用：{s:?}");
 }
 
-/// D-C2-4（e880f3c 回归）：默认命名空间作用域下的无前缀属性，序列化报错。
-/// `<r xmlns="urn:b" a="2"/>` 是合法 XML，必须能写出。
+/// D-C2-4（e880f3c 回归，c0f49a0 修复）：默认命名空间作用域下的无前缀属性不属于任何命名空间，
+/// 序列化不能报错，也不能为它找或声明前缀。`<r xmlns="urn:b" a="2"/>` 必须能写出并 round-trip。
 #[test]
-#[ignore = "缺陷 D-C2-4：默认命名空间下有无前缀属性时 to_string 报 \"default namespace does not match the element name\"（ser.rs require_binding）"]
 fn ser_unprefixed_attr_under_default_namespace() {
     let (mut doc, r) = new_doc_with_root_ns(Name::qualified(B, None, "r"), &[(None, B)]);
     doc.set_attribute(r, Name::local("a"), "2").unwrap();
@@ -1330,5 +1435,15 @@ fn ser_unprefixed_attr_under_default_namespace() {
         &[(Some("p"), A), (None, B)],
     );
     doc.set_attribute(r, Name::local("a"), "2").unwrap();
-    assert_serializes(&doc);
+    let s = assert_serializes(&doc);
+    // 只有用户声明的两个，序列化不能为无前缀属性另外发明前缀或声明
+    assert_eq!(s.matches("xmlns").count(), 2, "{s}");
+    assert!(s.contains(" a=\"2\""), "{s}");
+    // 子元素上的无前缀属性同理：不能为它发明前缀声明，属性保持无前缀
+    // （子元素上重复写出的 xmlns="urn:b" 是另一回事，见 v10.7 观察项 O-C2-5，这里不锁）
+    let c = add_el(&mut doc, r, Name::qualified(B, None, "c"));
+    doc.set_attribute(c, Name::local("b"), "3").unwrap();
+    let s = assert_serializes(&doc);
+    assert_eq!(s.matches("xmlns:").count(), 1, "{s}");
+    assert!(s.contains(" b=\"3\""), "{s}");
 }

@@ -12,10 +12,12 @@
 //! - 任何操作都只能返回 Ok 或 Err，不能 panic
 //! - 每一步之后统一断言（Lead 18:45）：to_string 要么 Err，要么 Reader 读回无错且结构与树一致
 //! - 失败的操作不能改树（结构指纹不变）
+//! - Q-C2-1（Lead 19:25）：没有根元素时 to_string 必须返回 `WriteError::NoRootElement`
+//! - D-C2-1（Lead 19:25）：往 CDATA/注释/PI 写入含 CR 的内容必须在修改阶段失败
+//!   （create_cdata/create_comment/set_text/set_pi_data 返回 InvalidChar；create_pi 可能先报 InvalidName），
+//!   且任何时刻树里（含未挂接节点）的 CDATA/注释/PI 都不含 CR
 //!
-//! 已知问题过滤（修复后删掉 `known_issue`）：
-//! - D-C2-1：CDATA/注释/PI 里有 CR 时写出后会被读回规范化，暂不判
-//! - Q-C2-1：没有根元素的文档写出不是良构文档，待 Lead 裁决，暂不判
+//! 已知问题过滤：当前为空（v10.7 撤掉了 Q-C2-1、D-C2-1 的屏蔽，c0f49a0 已修）。
 //!
 //! 不调用 create_doctype。
 //!
@@ -26,6 +28,7 @@
 mod dom_c2;
 
 use libfuzzer_sys::fuzz_target;
+use purexml::WriteError;
 use purexml::dom::{Document, Name, NodeId, NodeKind};
 
 const MAX_OPS: usize = 96;
@@ -143,41 +146,50 @@ fn has_root_element(doc: &Document) -> bool {
     doc.root_element().is_some()
 }
 
-/// 已知问题（见文件头）。返回 Some(原因) 时本步跳过统一断言。
-fn known_issue(doc: &Document) -> Option<&'static str> {
-    if !has_root_element(doc) {
-        return Some("Q-C2-1");
-    }
-    let root = doc.root()?.id();
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
+/// D-C2-1 不变量：已知节点（含未挂接的）里，CDATA/注释/PI 不能带 CR。
+fn assert_no_cr_in_raw_nodes(doc: &Document, ids: &[NodeId], step: usize, op: u8) {
+    for &id in ids {
         let Some(n) = doc.get(id) else { continue };
-        match n.kind() {
+        let bad = match n.kind() {
             Some(NodeKind::CData) | Some(NodeKind::Comment) => {
-                if n.text().is_some_and(|t| t.contains('\r')) {
-                    return Some("D-C2-1");
-                }
+                n.text().is_some_and(|t| t.contains('\r'))
             }
-            Some(NodeKind::Pi) => {
-                if n.pi()
-                    .and_then(|(_, d)| d)
-                    .is_some_and(|d| d.contains('\r'))
-                {
-                    return Some("D-C2-1");
-                }
-            }
-            _ => {}
-        }
-        stack.extend(n.children().map(|c| c.id()));
+            Some(NodeKind::Pi) => n
+                .pi()
+                .and_then(|(_, d)| d)
+                .is_some_and(|d| d.contains('\r')),
+            _ => false,
+        };
+        assert!(
+            !bad,
+            "第 {step} 步 op {op} 后 {:?} 节点里有 CR（D-C2-1）",
+            n.kind()
+        );
     }
-    None
+}
+
+/// D-C2-1：带 CR 的写入必须失败，且（除 create_pi 的名字先错外）错误是 InvalidChar。
+fn expect_cr_rejected(res: &Result<(), String>, allow_name: bool, what: &str) {
+    match res {
+        Ok(()) => panic!("{what}：内容含 CR，却返回 Ok（D-C2-1）"),
+        Err(e) => assert!(
+            e.starts_with("InvalidChar") || (allow_name && e.starts_with("InvalidName")),
+            "{what}：内容含 CR，期望 InvalidChar，实际 {e}"
+        ),
+    }
+}
+
+fn is_kind(doc: &Document, n: NodeId, kinds: &[NodeKind]) -> bool {
+    doc.get(n)
+        .and_then(|x| x.kind())
+        .is_some_and(|k| kinds.contains(&k))
 }
 
 fn start_doc(seed: &[u8]) -> Document {
-    if let Ok(evs) = dom_c2::read_bytes(seed) {
-        if let Ok(b) = dom_c2::build(&evs) {
-            return b.doc;
-        }
+    if let Ok(evs) = dom_c2::read_bytes(seed)
+        && let Ok(b) = dom_c2::build(&evs)
+    {
+        return b.doc;
     }
     let mut doc = Document::new();
     let root = doc.root().expect("document node").id();
@@ -199,10 +211,16 @@ fn all_ids(doc: &Document) -> Vec<NodeId> {
     out
 }
 
-fn check(doc: &Document, step: usize, op: u8) {
-    if known_issue(doc).is_some() {
-        // 即便跳过统一断言，序列化本身也不能 panic
-        let _ = doc.to_string();
+fn check(doc: &Document, ids: &[NodeId], step: usize, op: u8) {
+    assert_no_cr_in_raw_nodes(doc, ids, step, op);
+    if !has_root_element(doc) {
+        // Q-C2-1：必须报 NoRootElement，不能 Ok 加不良构输出
+        match doc.to_string() {
+            Err(WriteError::NoRootElement) => {}
+            other => {
+                panic!("第 {step} 步 op {op} 后没有根元素，期望 Err(NoRootElement)，实际 {other:?}")
+            }
+        }
         return;
     }
     if let Err(msg) = dom_c2::unified(doc, false) {
@@ -220,7 +238,7 @@ fn run(data: &[u8]) -> Option<()> {
     let mut b = Bytes { d: &data[2 + l..] };
     let mut doc = start_doc(seed);
     let mut ids = all_ids(&doc);
-    check(&doc, 0, 255);
+    check(&doc, &ids, 0, 255);
     for step in 1..=MAX_OPS {
         let op = b.u8()?;
         let before = dom_c2::canon_doc(&doc);
@@ -245,22 +263,37 @@ fn run(data: &[u8]) -> Option<()> {
             }
             3 => {
                 let t = b.text()?;
-                doc.create_cdata(&t)
+                let r = doc
+                    .create_cdata(&t)
                     .map(|id| ids.push(id))
-                    .map_err(|e| format!("{e:?}"))
+                    .map_err(|e| format!("{e:?}"));
+                if t.contains('\r') {
+                    expect_cr_rejected(&r, false, "create_cdata");
+                }
+                r
             }
             4 => {
                 let t = b.text()?;
-                doc.create_comment(&t)
+                let r = doc
+                    .create_comment(&t)
                     .map(|id| ids.push(id))
-                    .map_err(|e| format!("{e:?}"))
+                    .map_err(|e| format!("{e:?}"));
+                if t.contains('\r') {
+                    expect_cr_rejected(&r, false, "create_comment");
+                }
+                r
             }
             5 => {
                 let t = b.pick(NAMES)?;
                 let d = b.opt_text()?;
-                doc.create_pi(t, d.as_deref())
+                let r = doc
+                    .create_pi(t, d.as_deref())
                     .map(|id| ids.push(id))
-                    .map_err(|e| format!("{e:?}"))
+                    .map_err(|e| format!("{e:?}"));
+                if d.as_deref().is_some_and(|d| d.contains('\r')) {
+                    expect_cr_rejected(&r, true, "create_pi");
+                }
+                r
             }
             6 => {
                 let (p, c) = (b.node(&ids)?, b.node(&ids)?);
@@ -319,13 +352,24 @@ fn run(data: &[u8]) -> Option<()> {
             15 => {
                 let n = b.node(&ids)?;
                 let t = b.text()?;
-                doc.set_text(n, &t).map_err(|e| format!("{e:?}"))
+                let raw = is_kind(&doc, n, &[NodeKind::CData, NodeKind::Comment]);
+                let r = doc.set_text(n, &t).map_err(|e| format!("{e:?}"));
+                if raw && t.contains('\r') {
+                    expect_cr_rejected(&r, false, "CDATA/注释 set_text");
+                }
+                r
             }
             16 => {
                 let n = b.node(&ids)?;
                 let d = b.opt_text()?;
-                doc.set_pi_data(n, d.as_deref())
-                    .map_err(|e| format!("{e:?}"))
+                let pi = is_kind(&doc, n, &[NodeKind::Pi]);
+                let r = doc
+                    .set_pi_data(n, d.as_deref())
+                    .map_err(|e| format!("{e:?}"));
+                if pi && d.as_deref().is_some_and(|d| d.contains('\r')) {
+                    expect_cr_rejected(&r, false, "set_pi_data");
+                }
+                r
             }
             _ => {
                 let (x, y) = (b.node(&ids)?, b.node(&ids)?);
@@ -344,7 +388,7 @@ fn run(data: &[u8]) -> Option<()> {
                 "第 {step} 步 op {op} 返回 {res:?}，但树被改了"
             );
         }
-        check(&doc, step, op);
+        check(&doc, &ids, step, op);
     }
     Some(())
 }

@@ -468,11 +468,9 @@ pub fn check_readback(xml: &str, want: &[Tok], all_paths: bool) -> Result<(), St
 }
 
 /// 已登记、等修复的序列化缺陷：按报错文字识别，修好后删掉这里的对应项。
-/// - D-C2-4（e880f3c）：默认命名空间作用域下有无前缀属性时误报。
-pub fn known_ser_defect(msg: &str) -> Option<&'static str> {
-    if msg.contains("default namespace does not match the element name") {
-        return Some("D-C2-4");
-    }
+/// 当前为空：D-C2-4（e880f3c 默认命名空间下无前缀属性误报）已在 c0f49a0 修复，屏蔽已撤（计划 v10.7）。
+/// 以后再登记缺陷时按 `if msg.contains("…") { return Some("D-C2-x"); }` 的形式加在这里。
+pub fn known_ser_defect(_msg: &str) -> Option<&'static str> {
     None
 }
 

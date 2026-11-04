@@ -96,10 +96,10 @@ fuzz_target!(|data: &[u8]| {
         match r.read_event() {
             Ok(Some(ev)) => {
                 norm(&ev, &mut first);
-                if write_err.is_none() {
-                    if let Err(e) = w.write_event(&ev) {
-                        write_err = Some(format!("{e:?} 写 {ev:?}"));
-                    }
+                if write_err.is_none()
+                    && let Err(e) = w.write_event(&ev)
+                {
+                    write_err = Some(format!("{e:?} 写 {ev:?}"));
                 }
             }
             Ok(None) => break,
