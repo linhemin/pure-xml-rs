@@ -378,6 +378,92 @@ fn same_expanded_name_replaces_and_round_trips() {
 }
 
 #[test]
+fn escapes_round_trip_and_illegal_forms_are_rejected() {
+    let mut doc = Document::new();
+    let element = append_local(&mut doc, "r");
+    let text = doc.create_text("a&b<c]]>d").unwrap();
+    doc.append_child(element, text).unwrap();
+    let cdata = doc.create_cdata("x<y&z").unwrap();
+    doc.append_child(element, cdata).unwrap();
+    doc.set_attribute(element, Name::local("q"), "\"a&b<c\nb\tc\rd")
+        .unwrap();
+    let comment = doc.create_comment("ok ]]> note").unwrap();
+    doc.append_child(element, comment).unwrap();
+    let pi = doc.create_pi("tgt", Some("keep >")).unwrap();
+    doc.append_child(element, pi).unwrap();
+
+    let xml = doc.to_string().unwrap();
+    assert!(xml.contains("a&amp;b&lt;c]]&gt;d"));
+    assert!(xml.contains("<![CDATA[x<y&z]]>"));
+    assert!(xml.contains("&#10;"));
+    assert!(xml.contains("&#9;"));
+    assert!(xml.contains("&#13;"));
+    assert!(xml.contains("&quot;"));
+    let again = rebuild(&xml);
+    assert_eq!(
+        fingerprint(&doc, root_id(&doc)),
+        fingerprint(&again, root_id(&again))
+    );
+    let mut reader = Reader::from_str(&xml);
+    let mut saw_text = false;
+    let mut saw_attr = false;
+    loop {
+        match reader.read_event().unwrap() {
+            None => break,
+            Some(Event::Text(text)) => {
+                assert_eq!(text.as_str(), "a&b<c]]>d");
+                saw_text = true;
+            }
+            Some(Event::EmptyElement(_)) => {}
+            Some(Event::StartElement(el)) => {
+                let value = el.attribute("q").unwrap().value.as_str();
+                assert_eq!(value, "\"a&b<c\nb\tc\rd");
+                saw_attr = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_text && saw_attr);
+
+    let before = doc.approx_heap_bytes();
+    assert_eq!(
+        doc.create_comment("a--b").unwrap_err(),
+        DomError::InvalidChar
+    );
+    assert_eq!(
+        doc.create_comment("tail-").unwrap_err(),
+        DomError::InvalidChar
+    );
+    assert_eq!(
+        doc.set_text(comment, "a--b").unwrap_err(),
+        DomError::InvalidChar
+    );
+    assert_eq!(
+        doc.create_pi("tgt", Some("bad?>")).unwrap_err(),
+        DomError::InvalidChar
+    );
+    assert_eq!(
+        doc.set_pi_data(pi, Some("bad?>")).unwrap_err(),
+        DomError::InvalidChar
+    );
+    assert_eq!(
+        doc.create_cdata("has]]>end").unwrap_err(),
+        DomError::InvalidChar
+    );
+    assert_eq!(
+        doc.create_text("\u{0001}").unwrap_err(),
+        DomError::InvalidChar
+    );
+    assert_eq!(
+        doc.set_attribute(element, Name::local("z"), "\u{FFFE}")
+            .unwrap_err(),
+        DomError::InvalidChar
+    );
+    assert_eq!(doc.approx_heap_bytes(), before);
+    assert_eq!(doc.get(comment).unwrap().text(), Some("ok ]]> note"));
+}
+
+#[test]
 fn byte_cap_rejects_without_growing_the_arena() {
     let mut doc =
         Document::with_config(&purexml::ParserConfig::default().with_max_dom_bytes(120)).unwrap();
