@@ -45,6 +45,14 @@ impl NodeId {
     pub(crate) fn index(self) -> u32 {
         self.index
     }
+
+    pub(super) fn mint(document: u64, index: u32, generation: u32) -> Self {
+        Self {
+            document,
+            index,
+            generation,
+        }
+    }
 }
 
 /// What a live node is.
@@ -61,7 +69,7 @@ pub enum NodeKind {
     Doctype,
 }
 
-/// Why building a document node was refused.
+/// Why a DOM operation was refused. A failure leaves the document unchanged.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DomError {
     /// `actual` is strictly greater than `limit`.
@@ -70,58 +78,80 @@ pub enum DomError {
         limit: u64,
         actual: u64,
     },
+    /// The handle is stale, foreign, or names a tombstone.
+    RemovedNode,
+    /// The node is live but has the wrong kind for this operation.
+    WrongKind,
+    /// The operation would break the document tree.
+    Hierarchy,
+    /// The name is not a QName or NCName the reader would accept.
+    InvalidName,
+    /// The text contains a character XML 1.0 rejects, or a forbidden sequence.
+    InvalidChar,
+    /// A prefix does not resolve, or a declaration is reserved or still in use.
+    Namespace,
+    /// The element already has this expanded attribute name.
+    DuplicateAttribute,
 }
 
-/// DOM caps. Exceeding either one is [`DomError::Limit`].
+/// DOM caps. Exceeding one is [`DomError::Limit`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum DomLimit {
     /// Created nodes, including the document node and tombstones.
     NodeCount,
     /// Logical record and arena bytes, not allocator capacity.
     DomBytes,
+    /// Element nesting. The document node does not count.
+    ElementDepth,
+    /// Attributes plus namespace declarations on one element.
+    Attributes,
+    /// A qualified name, in UTF-8 bytes, including the colon.
+    NameLength,
+    /// Text, CDATA, comment, PI data, or an attribute value, in UTF-8 bytes.
+    TextLength,
 }
 
 #[derive(Copy, Clone)]
-struct StrSpan {
-    start: u32,
-    len: u32,
+pub(super) struct StrSpan {
+    pub(super) start: u32,
+    pub(super) len: u32,
 }
 
 #[derive(Copy, Clone)]
-struct ElementData {
-    namespace: Option<StrSpan>,
-    prefix: Option<StrSpan>,
-    local: StrSpan,
-    attrs: Range,
-    ns_decls: Range,
+pub(super) struct ElementData {
+    pub(super) namespace: Option<StrSpan>,
+    pub(super) prefix: Option<StrSpan>,
+    pub(super) local: StrSpan,
+    pub(super) attrs: Range,
+    pub(super) ns_decls: Range,
 }
 
 #[derive(Copy, Clone)]
-struct Range {
-    start: u32,
-    len: u32,
+pub(super) struct Range {
+    pub(super) start: u32,
+    pub(super) len: u32,
 }
 
 #[derive(Copy, Clone)]
-struct AttrData {
-    namespace: Option<StrSpan>,
-    prefix: Option<StrSpan>,
-    local: StrSpan,
-    value: StrSpan,
-    specified: bool,
+pub(super) struct AttrData {
+    pub(super) namespace: Option<StrSpan>,
+    pub(super) prefix: Option<StrSpan>,
+    pub(super) local: StrSpan,
+    pub(super) value: StrSpan,
+    pub(super) specified: bool,
 }
 
 #[derive(Copy, Clone)]
-struct NsDecl {
+pub(super) struct NsDecl {
     /// `None` is the default namespace (`xmlns`).
-    prefix: Option<StrSpan>,
-    uri: StrSpan,
+    pub(super) prefix: Option<StrSpan>,
+    pub(super) uri: StrSpan,
 }
 
 /// Filled by the skeleton tests. Parsing does not build nodes yet.
-#[allow(dead_code)]
 #[derive(Copy, Clone)]
-enum Payload {
+#[allow(dead_code)]
+pub(super) enum Payload {
     None,
     Element(u32),
     Span(StrSpan),
@@ -137,16 +167,16 @@ enum Payload {
 }
 
 #[derive(Copy, Clone)]
-struct Node {
-    kind: NodeKind,
-    alive: bool,
-    generation: u32,
-    parent: Option<u32>,
-    prev: Option<u32>,
-    next: Option<u32>,
-    first_child: Option<u32>,
-    last_child: Option<u32>,
-    payload: Payload,
+pub(super) struct Node {
+    pub(super) kind: NodeKind,
+    pub(super) alive: bool,
+    pub(super) generation: u32,
+    pub(super) parent: Option<u32>,
+    pub(super) prev: Option<u32>,
+    pub(super) next: Option<u32>,
+    pub(super) first_child: Option<u32>,
+    pub(super) last_child: Option<u32>,
+    pub(super) payload: Payload,
 }
 
 impl Node {
@@ -170,14 +200,20 @@ impl Node {
 /// The read API returns [`Option`] or [`Result`] and does not panic when a
 /// handle is stale, foreign, or points past the arena.
 pub struct Document {
-    id: u64,
-    nodes: Vec<Node>,
-    elements: Vec<ElementData>,
-    attrs: Vec<AttrData>,
-    ns_decls: Vec<NsDecl>,
-    arena: String,
-    max_nodes: u64,
-    max_dom_bytes: u64,
+    pub(super) id: u64,
+    pub(super) nodes: Vec<Node>,
+    pub(super) elements: Vec<ElementData>,
+    pub(super) attrs: Vec<AttrData>,
+    pub(super) ns_decls: Vec<NsDecl>,
+    pub(super) arena: String,
+    pub(super) max_nodes: u64,
+    pub(super) max_dom_bytes: u64,
+    pub(super) max_depth: usize,
+    pub(super) max_attrs: usize,
+    pub(super) max_name_len: usize,
+    pub(super) max_text_len: u64,
+    /// Preorder ranks. Any link change or new node drops it.
+    pub(super) order_cache: Option<Vec<u32>>,
 }
 
 impl Document {
@@ -201,6 +237,11 @@ impl Document {
             arena: String::new(),
             max_nodes: config.max_nodes,
             max_dom_bytes: config.max_dom_bytes,
+            max_depth: config.max_depth,
+            max_attrs: config.max_attrs,
+            max_name_len: config.max_name_len,
+            max_text_len: config.max_text_len,
+            order_cache: None,
         };
         doc.reserve(1, size_of::<Node>() as u64)?;
         doc.nodes.push(Node::root());
@@ -268,11 +309,11 @@ impl Document {
         self.max_nodes.min(u32::MAX as u64)
     }
 
-    fn byte_cap(&self) -> u64 {
+    pub(super) fn byte_cap(&self) -> u64 {
         self.max_dom_bytes.min(u32::MAX as u64)
     }
 
-    fn reserve(&self, extra_nodes: u64, extra_bytes: u64) -> Result<(), DomError> {
+    pub(super) fn reserve(&self, extra_nodes: u64, extra_bytes: u64) -> Result<(), DomError> {
         if extra_nodes > 0 {
             let cap = self.node_cap();
             let next = (self.nodes.len() as u64).saturating_add(extra_nodes);
@@ -296,7 +337,7 @@ impl Document {
         Ok(())
     }
 
-    fn node_ref(&self, index: u32) -> Option<NodeRef<'_>> {
+    pub(super) fn node_ref(&self, index: u32) -> Option<NodeRef<'_>> {
         let node = self.nodes.get(index as usize)?;
         if !node.alive {
             return None;
@@ -311,7 +352,7 @@ impl Document {
         })
     }
 
-    fn str_at(&self, span: StrSpan) -> Option<&str> {
+    pub(super) fn str_at(&self, span: StrSpan) -> Option<&str> {
         let start = span.start as usize;
         let end = start.checked_add(span.len as usize)?;
         self.arena.get(start..end)
