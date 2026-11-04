@@ -335,6 +335,27 @@ fn borrowed(doc: &Document, span: StrSpan) -> XmlText<'_> {
     XmlText::borrowed(doc.str_at(span).unwrap_or(""))
 }
 
+fn children(doc: &Document, parent: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut child = doc
+        .nodes
+        .get(parent as usize)
+        .and_then(|node| node.first_child);
+    let mut guard = doc.nodes.len();
+    while let Some(index) = child {
+        if guard == 0 {
+            break;
+        }
+        guard -= 1;
+        let node = &doc.nodes[index as usize];
+        if node.alive {
+            out.push(index);
+        }
+        child = node.next;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use crate::dom::Document;
@@ -356,25 +377,4 @@ mod tests {
         assert!(!omitted.contains("<!DOCTYPE"));
         assert!(omitted.contains("<r"));
     }
-}
-
-fn children(doc: &Document, parent: u32) -> Vec<u32> {
-    let mut out = Vec::new();
-    let mut child = doc
-        .nodes
-        .get(parent as usize)
-        .and_then(|node| node.first_child);
-    let mut guard = doc.nodes.len();
-    while let Some(index) = child {
-        if guard == 0 {
-            break;
-        }
-        guard -= 1;
-        let node = &doc.nodes[index as usize];
-        if node.alive {
-            out.push(index);
-        }
-        child = node.next;
-    }
-    out
 }
