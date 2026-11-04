@@ -8,7 +8,7 @@ use crate::dom::document::{
     Range, StrSpan,
 };
 use crate::event::{XML_NAMESPACE, XMLNS_NAMESPACE};
-use crate::name::is_xml_char;
+use crate::name::{is_pubid_char, is_xml_char};
 use crate::rules::{self, BindingFault};
 
 /// A name to store on an element or attribute.
@@ -50,18 +50,10 @@ impl<'a> Name<'a> {
 }
 
 /// Options for [`Document::write_to_with`](Document::write_to_with).
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct WriteOptions {
     /// Skip document-type nodes. Default is to write them.
     pub omit_doctype: bool,
-}
-
-impl Default for WriteOptions {
-    fn default() -> Self {
-        Self {
-            omit_doctype: false,
-        }
-    }
 }
 
 impl Document {
@@ -162,6 +154,63 @@ impl Document {
         };
         self.drop_order();
         Ok(self.push_detached(NodeKind::Pi, Payload::Pi { target, data }))
+    }
+
+    /// A detached document-type node. A public id requires a system id.
+    pub fn create_doctype(
+        &mut self,
+        name: &str,
+        system: Option<&str>,
+        public: Option<&str>,
+    ) -> Result<NodeId, DomError> {
+        if !rules::is_qname(name) {
+            return Err(DomError::InvalidName);
+        }
+        let (prefix, local) = match name.split_once(':') {
+            Some((prefix, local)) => (Some(prefix), local),
+            None => (None, name),
+        };
+        self.check_qname_len(prefix, local)?;
+        if public.is_some() && system.is_none() {
+            return Err(DomError::Hierarchy);
+        }
+        if let Some(public) = public
+            && !public.chars().all(is_pubid_char)
+        {
+            return Err(DomError::InvalidChar);
+        }
+        if let Some(system) = system {
+            self.check_chars_only(system)?;
+            if system.contains('"') && system.contains('\'') {
+                return Err(DomError::InvalidChar);
+            }
+        }
+        let bytes =
+            name.len() + system.map(str::len).unwrap_or(0) + public.map(str::len).unwrap_or(0);
+        self.reserve_new(1, size_of::<Node>() + bytes)?;
+        let mark = self.arena.len();
+        let name_span = self.intern_checked(name);
+        let system_span = self.optional_intern(system);
+        let public_span = self.optional_intern(public);
+        if let (Ok(name_span), Ok(system_span), Ok(public_span)) =
+            (name_span, system_span, public_span)
+        {
+            self.drop_order();
+            return Ok(self.push_detached(
+                NodeKind::Doctype,
+                Payload::Doctype {
+                    name: name_span,
+                    system: system_span,
+                    public: public_span,
+                },
+            ));
+        }
+        self.arena.truncate(mark);
+        Err(DomError::Limit {
+            kind: DomLimit::DomBytes,
+            limit: self.byte_cap(),
+            actual: self.byte_cap().saturating_add(1),
+        })
     }
 
     /// Link `child` as the last child of `parent`, moving it if it already has a parent.

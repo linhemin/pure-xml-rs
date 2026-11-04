@@ -4,7 +4,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use crate::WriteError;
-use crate::dom::document::{Document, NodeId, NodeKind, NodeRef, Payload, StrSpan};
+use crate::dom::document::{Document, NodeKind, NodeRef, Payload, StrSpan};
 use crate::dom::edit::WriteOptions;
 use crate::event::{
     Attribute, Doctype, EmptyElement, EndElement, Event, Namespace, ProcessingInstruction, QName,
