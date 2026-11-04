@@ -20,7 +20,7 @@
 
 mod common;
 
-use common::{ErrorClass, Guarded, run_guarded};
+use common::{run_guarded, ErrorClass, Guarded};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;

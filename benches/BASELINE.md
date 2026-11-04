@@ -243,3 +243,6 @@ Lead 2026-10-21 08:45 裁定 F-2：这一组 **只记录，不作门槛**，M4 �
   - 同一份 `baseline.rs` 在 257c900 和 4d7ebe2 上都能编译，clippy `-D warnings` 也干净，不需要 cfg 或 Cargo 特性。
 - **门槛对照**：from_vec 组对比 257c900 的 **from_bytes** 同名组（例如 `text-dense/1KB/purexml-from_vec` 对比 `text-dense/1KB/purexml`），同一时段 A/B 交替。
 - **还没有正式测量**：要等功能修完，在新 head 上找安静时段测。text-dense 1 KB（from_bytes 和 from_vec）如果仍然超过 10%，就算阻塞。
+
+## 2e818ce（2026-11-04）
+from_bytes vs 257c900：-2.5%~-9.6%（text-dense 1KB -8.1%）；from_vec -8.0%~+0.2%；from_reader vs 4d7ebe2：config +3.2%、attr +3.9%、text +8.0%、ns-dense 1MB +4.5%（复测）。reader/bytes 比：1.305/1.138/1.144/1.299。

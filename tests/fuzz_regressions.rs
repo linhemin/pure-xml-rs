@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{Guarded, SOFT_CAP, run_guarded};
+use common::{run_guarded, Guarded, SOFT_CAP};
 use std::path::Path;
 use std::time::Duration;
 

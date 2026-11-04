@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{ErrorClass, Guarded, Node, run_guarded};
+use common::{run_guarded, ErrorClass, Guarded, Node};
 use std::time::Duration;
 
 fn class(x: &str) -> Result<(), ErrorClass> {

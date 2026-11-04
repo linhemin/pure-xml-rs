@@ -4,12 +4,11 @@
 //! 三方工作量尽量对齐：都遍历所有事件 / 节点，都取出全部属性值与文本（含实体解码）。
 //! 命名空间：purexml 和 roxmltree 都解析元素的命名空间；quick-xml 用普通 Reader，不解析命名空间（它的 NsReader 是另一套 API）。
 
+use criterion::{
+    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-
-use criterion::{
-    BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
-};
 
 /// 配置型：中等嵌套、短文本、少量属性
 fn config_like(target: usize) -> String {
@@ -94,7 +93,7 @@ fn ns_dense(target: usize) -> String {
 /// 用宏而不是泛型函数，这样不依赖 `Reader` 的类型参数（M2 PR-B 会把 from_reader 的返回类型
 /// 改成 `Reader<IoInput<R>>`，宏不用跟着改）。
 macro_rules! purexml_drain_reader {
-    ($r:expr_2021) => {{
+    ($r:expr) => {{
         use purexml::Event;
         let mut r = $r;
         let mut n = 0usize;

@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{ErrorClass, Failure, Guarded, Limits, SOFT_CAP, Summary, run_guarded};
+use common::{run_guarded, ErrorClass, Failure, Guarded, Limits, Summary, SOFT_CAP};
 use std::io::ErrorKind as IoErrorKind;
 use std::net::TcpListener;
 use std::time::Duration;
@@ -96,7 +96,7 @@ macro_rules! sample {
 
 /// 普通样本：只按类别断言。
 macro_rules! attack {
-    ($name:ident, $file:literal, $expect:expr_2021) => {
+    ($name:ident, $file:literal, $expect:expr) => {
         #[test]
         fn $name() {
             check(stringify!($name), sample!($file), T_SMALL, $expect).ok();
@@ -175,7 +175,7 @@ fn check_no_io(id: &str, raw: &[u8], expect: Expect) -> Result<Summary, Failure>
 }
 
 macro_rules! attack_io {
-    ($name:ident, $file:literal, $expect:expr_2021) => {
+    ($name:ident, $file:literal, $expect:expr) => {
         #[test]
         fn $name() {
             check_no_io(stringify!($name), &sample!($file), $expect).ok();
