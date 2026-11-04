@@ -59,3 +59,17 @@ path = "fuzz_targets/reader_1byte.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "dom_roundtrip"
+path = "fuzz_targets/dom_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dom_mutation"
+path = "fuzz_targets/dom_mutation.rs"
+test = false
+doc = false
+bench = false
