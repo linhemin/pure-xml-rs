@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - MSRV is 1.99.1, raised from 1.70 to follow the local stable toolchain.
   The workspace edition is 2024 (`purexml`, `purexml-core`, and `purexml-fuzz`).
+- **D31.** `TotalInput` is positional. It is reported only when parsing needs
+  the byte at offset `max_total_input`. The position is that byte and
+  `actual` is `limit + 1`. An error at an earlier offset wins.
+  `Reader::from_bytes` and `Reader::from_vec` no longer reject the buffer
+  up front, so every entry point yields the same events before that byte.
 - Entity-reference names are NCNames. `&a:b;` is a name error
   (`ErrorKind::Syntax`) at the colon. It is no longer reported as an
   undefined entity. A reference such as `&missing;`, whose name is an NCName
@@ -34,3 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the first character past the cap, including that character's UTF-8 bytes.
   The position is the cursor after that character. An unterminated comment
   that exceeds the cap reports `TextLength`.
+
+### Security
+
+- `>` characters in text were not counted toward `max_text_len`, allowing the
+  limit to be bypassed; fixed.
