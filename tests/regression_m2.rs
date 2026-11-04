@@ -19,7 +19,7 @@
 
 mod common;
 
-use common::{run_guarded, ErrorClass, Failure, Guarded, Limits};
+use common::{ErrorClass, Failure, Guarded, Limits, run_guarded};
 use std::io::{BufReader, Read};
 use std::time::Duration;
 
@@ -292,11 +292,13 @@ fn d23_entity_and_parameter_entity_names_are_ncnames() {
     ] {
         name_error(x);
     }
-    assert!(both(
-        "<!DOCTYPE r [<!ENTITY a_b \"x\">]><r>&a_b;</r>",
-        Limits::default()
-    )
-    .is_ok());
+    assert!(
+        both(
+            "<!DOCTYPE r [<!ENTITY a_b \"x\">]><r>&a_b;</r>",
+            Limits::default()
+        )
+        .is_ok()
+    );
     assert!(both("<!DOCTYPE r [<!ENTITY % p \"x\">]><r/>", Limits::default()).is_ok());
 }
 
@@ -333,11 +335,13 @@ fn d23_notation_names_are_ncnames() {
     ] {
         name_error(x);
     }
-    assert!(both(
-        "<!DOCTYPE r [<!NOTATION n SYSTEM \"x\">]><r/>",
-        Limits::default()
-    )
-    .is_ok());
+    assert!(
+        both(
+            "<!DOCTYPE r [<!NOTATION n SYSTEM \"x\">]><r/>",
+            Limits::default()
+        )
+        .is_ok()
+    );
     // 合法的 NDATA 记号名：外部实体仍然禁止，不加载
     let f = both(
         "<!DOCTYPE r [<!ENTITY e SYSTEM \"u\" NDATA n>]><r/>",

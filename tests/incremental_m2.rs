@@ -17,12 +17,12 @@
 
 mod common;
 
-use common::{run_guarded, Guarded};
+use common::{Guarded, run_guarded};
 use purexml::{Error, ErrorKind, LimitKind, ParserConfig, Position, Reader};
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 // ───────────────────────────── 结果快照 ─────────────────────────────
@@ -193,11 +193,7 @@ impl<'a> Feed<'a> {
                     self.zero_done = true;
                     return Ok(0);
                 }
-                if self.pos < *k {
-                    k - self.pos
-                } else {
-                    rem
-                }
+                if self.pos < *k { k - self.pos } else { rem }
             }
             Plan::Interrupt { permille, .. } => {
                 if xorshift(&mut self.rng) % 1000 < *permille {
@@ -322,8 +318,12 @@ fn assert_same(label: &str, base: &Snap, got: &Snap) {
         "{label}：与 from_bytes 不一致。事件数 {} vs {}，第一个不同在第 {i} 项：{:?} vs {:?}；结尾 {:?} vs {:?}",
         base.events.len(),
         got.events.len(),
-        base.events.get(i).map(|s| s.chars().take(120).collect::<String>()),
-        got.events.get(i).map(|s| s.chars().take(120).collect::<String>()),
+        base.events
+            .get(i)
+            .map(|s| s.chars().take(120).collect::<String>()),
+        got.events
+            .get(i)
+            .map(|s| s.chars().take(120).collect::<String>()),
         base.end,
         got.end
     );
@@ -481,48 +481,107 @@ fn crafted() -> Vec<(&'static str, Vec<u8>)> {
     vec![
         // UTF-8 多字节字符在各种位置（2/3/4 字节）
         ("utf8-text", s("<r>é€😀x é€😀</r>")),
-        ("utf8-names", s("<é€😀 a€😀=\"v\"><é€😀:x xmlns:é€😀=\"u\"/></é€😀>")),
+        (
+            "utf8-names",
+            s("<é€😀 a€😀=\"v\"><é€😀:x xmlns:é€😀=\"u\"/></é€😀>"),
+        ),
         ("utf8-attr", s("<r a=\"é€😀\" b='😀&amp;é'/>")),
-        ("utf8-comment-cdata-pi", s("<r><!--é€😀--><![CDATA[é€😀]]><?pé€😀 é€😀?></r>")),
-        ("utf8-doctype-entity", s("<!DOCTYPE é€😀 [<!ENTITY e \"é€😀\">]><é€😀>&e;</é€😀>")),
-        ("utf8-bad-mid", vec![b'<', b'r', b'>', 0xE2, 0x82, b'x', b'<', b'/', b'r', b'>']),
-        ("utf8-bad-lead", vec![b'<', b'r', b'>', 0xFF, b'<', b'/', b'r', b'>']),
-        ("utf8-truncated-eof", vec![b'<', b'r', b'>', 0xF0, 0x9F, 0x98]),
-        ("utf8-bad-in-name", vec![b'<', b'r', 0xC3, b'>', b'<', b'/', b'r', b'>']),
+        (
+            "utf8-comment-cdata-pi",
+            s("<r><!--é€😀--><![CDATA[é€😀]]><?pé€😀 é€😀?></r>"),
+        ),
+        (
+            "utf8-doctype-entity",
+            s("<!DOCTYPE é€😀 [<!ENTITY e \"é€😀\">]><é€😀>&e;</é€😀>"),
+        ),
+        (
+            "utf8-bad-mid",
+            vec![b'<', b'r', b'>', 0xE2, 0x82, b'x', b'<', b'/', b'r', b'>'],
+        ),
+        (
+            "utf8-bad-lead",
+            vec![b'<', b'r', b'>', 0xFF, b'<', b'/', b'r', b'>'],
+        ),
+        (
+            "utf8-truncated-eof",
+            vec![b'<', b'r', b'>', 0xF0, 0x9F, 0x98],
+        ),
+        (
+            "utf8-bad-in-name",
+            vec![b'<', b'r', 0xC3, b'>', b'<', b'/', b'r', b'>'],
+        ),
         // BOM
         ("bom-utf8", [&[0xEF, 0xBB, 0xBF][..], b"<r/>"].concat()),
-        ("bom-utf16be", [&[0xFE, 0xFF][..], &[0, b'<', 0, b'r', 0, b'/', 0, b'>']].concat()),
-        ("bom-utf16le", [&[0xFF, 0xFE][..], &[b'<', 0, b'r', 0, b'/', 0, b'>', 0]].concat()),
+        (
+            "bom-utf16be",
+            [&[0xFE, 0xFF][..], &[0, b'<', 0, b'r', 0, b'/', 0, b'>']].concat(),
+        ),
+        (
+            "bom-utf16le",
+            [&[0xFF, 0xFE][..], &[b'<', 0, b'r', 0, b'/', 0, b'>', 0]].concat(),
+        ),
         ("bom-only", vec![0xEF, 0xBB, 0xBF]),
         // CRLF
-        ("crlf", s("<r a=\"1\r\n2\">x\r\ny\rz\r\n<!--a\r\nb--><?p a\r\nb?><![CDATA[\r\n]]></r>\r\n")),
+        (
+            "crlf",
+            s("<r a=\"1\r\n2\">x\r\ny\rz\r\n<!--a\r\nb--><?p a\r\nb?><![CDATA[\r\n]]></r>\r\n"),
+        ),
         ("cr-eof", s("<r/>\r")),
         ("crlf-pi-gap", s("<r><?p\r\nd?><?q\rd?></r>")),
         // 标签和结束符
-        ("tags", s("<r><a/><b></b><!--c--><![CDATA[x]]]]><?p d?></r>")),
-        ("cdata-brackets", s("<r><![CDATA[]]]><![CDATA[]]]]><![CDATA[a]b]]c]]></r>")),
+        (
+            "tags",
+            s("<r><a/><b></b><!--c--><![CDATA[x]]]]><?p d?></r>"),
+        ),
+        (
+            "cdata-brackets",
+            s("<r><![CDATA[]]]><![CDATA[]]]]><![CDATA[a]b]]c]]></r>"),
+        ),
         ("comment-dashes", s("<r><!-- - -- --></r>")),
         ("empty-pi", s("<r><?p?><?q ?></r>")),
         // 实体和字符引用
         ("refs", s("<r>&amp;&#x10FFFF;&#65;&lt;&gt;&quot;&apos;</r>")),
         ("charref-zeros", s("<r>&#0000000000000065;&#x00000041;</r>")),
-        ("named-entity", s("<!DOCTYPE r [<!ENTITY name \"v\">]><r a=\"&name;\">&name;</r>")),
-        ("entity-markup-then-text", s("<!DOCTYPE r [<!ENTITY e \"<a>x</a>\">]><r>1&e;2&e;3</r>")),
-        ("entity-empty", s("<!DOCTYPE r [<!ENTITY e \"\">]><r>&e;<a/>&e;&e;x&e;</r>")),
+        (
+            "named-entity",
+            s("<!DOCTYPE r [<!ENTITY name \"v\">]><r a=\"&name;\">&name;</r>"),
+        ),
+        (
+            "entity-markup-then-text",
+            s("<!DOCTYPE r [<!ENTITY e \"<a>x</a>\">]><r>1&e;2&e;3</r>"),
+        ),
+        (
+            "entity-empty",
+            s("<!DOCTYPE r [<!ENTITY e \"\">]><r>&e;<a/>&e;&e;x&e;</r>"),
+        ),
         ("undefined-entity", s("<r>&nope;</r>")),
         // 属性值
-        ("attr-forms", s("<r a = \"1\" b='2'\tc=\"&amp;\" d=\"\t\n x\"/>")),
+        (
+            "attr-forms",
+            s("<r a = \"1\" b='2'\tc=\"&amp;\" d=\"\t\n x\"/>"),
+        ),
         ("attr-gt-lt", s("<r a=\">\" b='>'/><x a=\"<\"/>")),
         ("attr-dup", s("<r a=\"1\" a=\"2\"/>")),
         // XML 声明
-        ("xmldecl", s("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone='yes'?><r/>")),
+        (
+            "xmldecl",
+            s("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone='yes'?><r/>"),
+        ),
         ("xmldecl-late", s(" <?xml version=\"1.0\"?><r/>")),
-        ("xmldecl-q", s("<?xml version=\"1.0\"?><?xml-stylesheet x?><r/>")),
-        ("xmldecl-gt-in-quote", s("<?xml version=\"1.0\" encoding=\"UTF-8?>\"?><r/>")),
+        (
+            "xmldecl-q",
+            s("<?xml version=\"1.0\"?><?xml-stylesheet x?><r/>"),
+        ),
+        (
+            "xmldecl-gt-in-quote",
+            s("<?xml version=\"1.0\" encoding=\"UTF-8?>\"?><r/>"),
+        ),
         // DOCTYPE 内部子集
         (
             "subset",
-            s("<!DOCTYPE r [<!ENTITY a \"]>\"><!ATTLIST r x CDATA ']>'><!--]>--><?p ]>?><!ENTITY % pe \"x\">%pe;<!ELEMENT r ANY>]><r>&a;</r>"),
+            s(
+                "<!DOCTYPE r [<!ENTITY a \"]>\"><!ATTLIST r x CDATA ']>'><!--]>--><?p ]>?><!ENTITY % pe \"x\">%pe;<!ELEMENT r ANY>]><r>&a;</r>",
+            ),
         ),
         ("subset-unterminated", s("<!DOCTYPE r [<!ENTITY a \"x\">")),
         ("doctype-external", s("<!DOCTYPE r SYSTEM \"r.dtd\"><r/>")),
@@ -539,7 +598,10 @@ fn crafted() -> Vec<(&'static str, Vec<u8>)> {
         ("bang-junk", s("<r><!x></r>")),
         ("lt-in-text", s("<r>a<b</r>")),
         ("gt-gt", s("<r>]]></r>")),
-        ("ns", s("<a xmlns=\"urn:a\" xmlns:b=\"urn:b\"><b:c b:x=\"1\"/><u:x/></a>")),
+        (
+            "ns",
+            s("<a xmlns=\"urn:a\" xmlns:b=\"urn:b\"><b:c b:x=\"1\"/><u:x/></a>"),
+        ),
     ]
 }
 
@@ -2493,7 +2555,7 @@ fn d35_bad_bytes() -> [&'static [u8]; 4] {
 
 fn d35_doc(ctx: &str, at: usize, bad: &[u8]) -> Vec<u8> {
     let mut d = ctx.as_bytes().to_vec();
-    d.extend(std::iter::repeat(b'a').take(at - ctx.len()));
+    d.extend(std::iter::repeat_n(b'a', at - ctx.len()));
     d.extend_from_slice(bad);
     d.extend_from_slice(b"zzzz</r>");
     d
@@ -4191,16 +4253,16 @@ fn d40_run(full: bool) -> (usize, Vec<String>, Vec<(String, usize, usize)>) {
                     dflt.clone().with_max_token_len(t),
                 ));
             }
-            if let Some(s) = sub_start {
-                if cap >= *s {
-                    let u = (cap - s) as u64;
-                    cfgs.push((
-                        LimitKind::InternalSubsetLength,
-                        u,
-                        cap,
-                        dflt.clone().with_max_internal_subset_len(u),
-                    ));
-                }
+            if let Some(s) = sub_start
+                && cap >= *s
+            {
+                let u = (cap - s) as u64;
+                cfgs.push((
+                    LimitKind::InternalSubsetLength,
+                    u,
+                    cap,
+                    dflt.clone().with_max_internal_subset_len(u),
+                ));
             }
             // 边界落在更早的 token 里时事件流不同，那是别的用例的事
             if cap >= *tok_start {

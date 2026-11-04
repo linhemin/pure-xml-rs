@@ -1,7 +1,7 @@
 //! Writer（M1 只要求转义）测试：输出必须良构，且经 Reader 重新解析后内容不变。
 //! d7_* 为缺陷用例（M1-test-report.md D7），保持开启。
 
-use purexml::{escape_attribute, escape_text, Event, Reader, Writer};
+use purexml::{Event, Reader, Writer, escape_attribute, escape_text};
 
 /// 解析 `out`，返回 (根元素属性, 根元素内文本)。
 fn reparse(out: &[u8]) -> Result<(Vec<(String, String)>, String), String> {
