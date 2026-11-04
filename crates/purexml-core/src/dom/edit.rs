@@ -157,7 +157,11 @@ impl Document {
     }
 
     /// A detached document-type node. A public id requires a system id.
-    pub fn create_doctype(
+    ///
+    /// Crate-private: a public constructor would let callers emit a `DOCTYPE`
+    /// with a `SYSTEM` id, which is an XXE hazard for a downstream parser.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn create_doctype(
         &mut self,
         name: &str,
         system: Option<&str>,

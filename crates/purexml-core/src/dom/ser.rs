@@ -245,6 +245,29 @@ fn borrowed(doc: &Document, span: StrSpan) -> XmlText<'_> {
     XmlText::borrowed(doc.str_at(span).unwrap_or(""))
 }
 
+#[cfg(test)]
+mod tests {
+    use crate::dom::Document;
+    use crate::dom::edit::WriteOptions;
+
+    #[test]
+    fn omit_doctype_drops_a_system_identifier() {
+        let mut doc = Document::new();
+        let root = doc.root().unwrap().id();
+        let dtd = doc.create_doctype("r", Some("sys"), None).unwrap();
+        doc.append_child(root, dtd).unwrap();
+        let element = doc.create_element(crate::dom::Name::local("r")).unwrap();
+        doc.append_child(root, element).unwrap();
+        let full = doc.to_string().unwrap();
+        assert!(full.contains("<!DOCTYPE r SYSTEM \"sys\">"));
+        let omitted = doc
+            .to_string_with(WriteOptions { omit_doctype: true })
+            .unwrap();
+        assert!(!omitted.contains("<!DOCTYPE"));
+        assert!(omitted.contains("<r"));
+    }
+}
+
 fn children(doc: &Document, parent: u32) -> Vec<u32> {
     let mut out = Vec::new();
     let mut child = doc

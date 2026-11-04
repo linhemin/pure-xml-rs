@@ -3,7 +3,7 @@
 //! Tester trees are left untouched. A fuzz target for round-trip and mutation
 //! is noted for the Tester; it is not added here.
 
-use purexml::dom::{Document, DomError, DomLimit, Name, NodeId, NodeKind, WriteOptions};
+use purexml::dom::{Document, DomError, DomLimit, Name, NodeId, NodeKind};
 use purexml::{Event, Reader};
 
 fn root_id(doc: &Document) -> NodeId {
@@ -111,15 +111,8 @@ fn rebuild(xml: &str) -> Document {
                     .unwrap();
                 doc.append_child(*stack.last().unwrap(), id).unwrap();
             }
-            Some(Event::Doctype(dtd)) => {
-                let id = doc
-                    .create_doctype(
-                        dtd.name.as_str(),
-                        dtd.system_id.as_deref(),
-                        dtd.public_id.as_deref(),
-                    )
-                    .unwrap();
-                doc.append_child(*stack.last().unwrap(), id).unwrap();
+            Some(Event::Doctype(_)) => {
+                panic!("integration tests do not rebuild a document type");
             }
         }
     }
@@ -155,8 +148,6 @@ fn element_from_event(
 fn round_trip_keeps_structure() {
     let mut doc = Document::new();
     let root = root_id(&doc);
-    let dtd = doc.create_doctype("r", Some("sys"), None).unwrap();
-    doc.append_child(root, dtd).unwrap();
     let element = append_new(&mut doc, root, "r");
     doc.declare_namespace(element, Some("p"), "urn:p").unwrap();
     let child = doc
@@ -179,10 +170,6 @@ fn round_trip_keeps_structure() {
         fingerprint(&doc, root_id(&doc)),
         fingerprint(&again, root_id(&again))
     );
-    let omitted = doc
-        .to_string_with(WriteOptions { omit_doctype: true })
-        .unwrap();
-    assert!(!omitted.contains("<!DOCTYPE"));
 }
 
 #[test]
