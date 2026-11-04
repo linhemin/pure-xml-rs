@@ -4542,13 +4542,14 @@ fn term_run(which: &str, full: bool) -> (usize, Vec<String>, Vec<(String, usize,
             let base_cfg = dflt.clone().with_max_text_len(m);
             let (outcome, proof, tok_end) = term_oracle(&t, m);
             // (说明, 边界字节, 配置, 该上限的报错)；None 表示不设按字节计的上限
-            let mut cfgs: Vec<(
+            type TermCfg = (
                 String,
                 Option<usize>,
                 ParserConfig,
                 Option<(LimitKind, u64)>,
-            )> = vec![("无字节上限".into(), None, base_cfg.clone(), None)];
-            let hi = tok_end.map_or(proof + 1, |e| e).min(d.len() - 1);
+            );
+            let mut cfgs: Vec<TermCfg> = vec![("无字节上限".into(), None, base_cfg.clone(), None)];
+            let hi = tok_end.unwrap_or(proof + 1).min(d.len() - 1);
             let (lo, hi) = if full {
                 (t.tok_start, hi)
             } else {
