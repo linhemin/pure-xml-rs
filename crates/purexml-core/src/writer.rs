@@ -22,6 +22,10 @@ pub enum WriteError {
     Io(std::io::Error),
     /// The event cannot be written as well-formed XML.
     Syntax(String),
+    /// `Document::write_to` or `Document::to_string` found no element child.
+    ///
+    /// A subtree written with `NodeRef::write_to` is not subject to this.
+    NoRootElement,
 }
 
 impl std::fmt::Display for WriteError {
@@ -29,6 +33,7 @@ impl std::fmt::Display for WriteError {
         match self {
             Self::Io(err) => write!(f, "write error: {err}"),
             Self::Syntax(msg) => write!(f, "write error: {msg}"),
+            Self::NoRootElement => write!(f, "write error: document has no root element"),
         }
     }
 }
@@ -37,7 +42,7 @@ impl std::error::Error for WriteError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(err) => Some(err),
-            Self::Syntax(_) => None,
+            Self::Syntax(_) | Self::NoRootElement => None,
         }
     }
 }

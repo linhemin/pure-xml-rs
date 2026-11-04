@@ -23,8 +23,11 @@ impl Document {
         writer: &mut crate::Writer<W>,
         options: WriteOptions,
     ) -> Result<(), WriteError> {
+        if self.root_element().is_none() {
+            return Err(WriteError::NoRootElement);
+        }
         let Some(root) = self.root() else {
-            return Ok(());
+            return Err(WriteError::NoRootElement);
         };
         write_at(self, root.id().index(), writer, options)
     }

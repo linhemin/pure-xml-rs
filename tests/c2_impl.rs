@@ -547,6 +547,43 @@ fn unprefixed_attribute_ignores_the_default_namespace() {
 }
 
 #[test]
+fn document_without_a_root_element_does_not_serialize() {
+    let doc = Document::new();
+    assert!(matches!(
+        doc.to_string(),
+        Err(purexml::WriteError::NoRootElement)
+    ));
+    let mut buf = Vec::new();
+    let mut writer = purexml::Writer::new(&mut buf);
+    assert!(matches!(
+        doc.write_to(&mut writer),
+        Err(purexml::WriteError::NoRootElement)
+    ));
+    assert!(buf.is_empty());
+
+    let mut doc = Document::new();
+    let root = root_id(&doc);
+    let comment = doc.create_comment("only").unwrap();
+    doc.append_child(root, comment).unwrap();
+    assert!(matches!(
+        doc.to_string_with(purexml::dom::WriteOptions::default()),
+        Err(purexml::WriteError::NoRootElement)
+    ));
+    let mut buf = Vec::new();
+    let mut writer = purexml::Writer::new(&mut buf);
+    doc.get(comment).unwrap().write_to(&mut writer).unwrap();
+    assert_eq!(String::from_utf8(buf).unwrap(), "<!--only-->");
+
+    let element = doc.create_element(Name::local("r")).unwrap();
+    let mut buf = Vec::new();
+    let mut writer = purexml::Writer::new(&mut buf);
+    doc.get(element).unwrap().write_to(&mut writer).unwrap();
+    assert_eq!(String::from_utf8(buf).unwrap(), "<r/>");
+    doc.append_child(root, element).unwrap();
+    assert!(doc.to_string().unwrap().contains("<r"));
+}
+
+#[test]
 fn byte_cap_rejects_without_growing_the_arena() {
     let mut doc =
         Document::with_config(&purexml::ParserConfig::default().with_max_dom_bytes(120)).unwrap();
