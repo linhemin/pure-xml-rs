@@ -6,8 +6,9 @@ use std::io::Cursor;
 use purexml_core::{
     Error, ErrorKind, Event, LimitKind, ParserConfig, Reader, Writer, XmlText, DEFAULT_MAX_ATTRS,
     DEFAULT_MAX_DEPTH, DEFAULT_MAX_ENTITY_DEPTH, DEFAULT_MAX_ENTITY_EXPANSIONS,
-    DEFAULT_MAX_EXPANDED_BYTES, DEFAULT_MAX_EXPANSION_RATIO, DEFAULT_MAX_NAME_LEN,
-    DEFAULT_MAX_TEXT_LEN, DEFAULT_MAX_TOTAL_INPUT, EXPANSION_RATIO_FLOOR_BYTES, XML_NAMESPACE,
+    DEFAULT_MAX_EXPANDED_BYTES, DEFAULT_MAX_EXPANSION_RATIO, DEFAULT_MAX_INTERNAL_SUBSET_LEN,
+    DEFAULT_MAX_NAME_LEN, DEFAULT_MAX_TEXT_LEN, DEFAULT_MAX_TOKEN_LEN, DEFAULT_MAX_TOTAL_INPUT,
+    EXPANSION_RATIO_FLOOR_BYTES, XML_NAMESPACE,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -212,6 +213,13 @@ fn defaults_match_public_constants() {
     assert_eq!(DEFAULT_MAX_TEXT_LEN, 16 * 1024 * 1024);
     assert_eq!(config.max_total_input, DEFAULT_MAX_TOTAL_INPUT);
     assert_eq!(DEFAULT_MAX_TOTAL_INPUT, 1024 * 1024 * 1024);
+    assert_eq!(config.max_token_len, DEFAULT_MAX_TOKEN_LEN);
+    assert_eq!(DEFAULT_MAX_TOKEN_LEN, 32 * 1024 * 1024);
+    assert_eq!(
+        config.max_internal_subset_len,
+        DEFAULT_MAX_INTERNAL_SUBSET_LEN
+    );
+    assert_eq!(DEFAULT_MAX_INTERNAL_SUBSET_LEN, 16 * 1024 * 1024);
     assert_eq!(config.max_entity_depth, DEFAULT_MAX_ENTITY_DEPTH);
     assert_eq!(DEFAULT_MAX_ENTITY_DEPTH, 8);
     assert_eq!(config.max_entity_expansions, DEFAULT_MAX_ENTITY_EXPANSIONS);

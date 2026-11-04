@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **D31.** `TotalInput` is positional. It is reported only when parsing needs
+  the byte at offset `max_total_input`. The position is that byte and
+  `actual` is `limit + 1`. An error at an earlier offset wins.
+  `Reader::from_bytes` and `Reader::from_vec` no longer reject the buffer
+  up front, so every entry point yields the same events before that byte.
 - Entity-reference names are NCNames. `&a:b;` is a name error
   (`ErrorKind::Syntax`) at the colon. It is no longer reported as an
   undefined entity. A reference such as `&missing;`, whose name is an NCName

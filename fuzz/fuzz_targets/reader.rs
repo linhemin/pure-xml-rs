@@ -16,56 +16,61 @@ struct Trace {
     max_depth: usize,
 }
 
-fn drain<B: AsRef<[u8]>>(mut r: Reader<B>) -> Trace {
-    let mut events = Vec::new();
-    let (mut depth, mut max_depth, mut balanced) = (0usize, 0usize, true);
-    let end = loop {
-        match r.read_event() {
-            Ok(Some(ev)) => {
-                match &ev {
-                    Event::StartElement(_) => {
-                        depth += 1;
-                        max_depth = max_depth.max(depth);
-                    }
-                    Event::EndElement(_) => {
-                        if depth == 0 {
-                            balanced = false;
-                        } else {
-                            depth -= 1;
+/// `from_reader` 的事件借用阅读器，闭包无法把该借用交出来。
+macro_rules! drain {
+    ($reader:expr) => {{
+        let reader = &mut $reader;
+        let mut events = Vec::new();
+        let (mut depth, mut max_depth, mut balanced) = (0usize, 0usize, true);
+        let end = loop {
+            match reader.read_event() {
+                Ok(Some(ev)) => {
+                    match &ev {
+                        Event::StartElement(_) => {
+                            depth += 1;
+                            max_depth = max_depth.max(depth);
                         }
+                        Event::EndElement(_) => {
+                            if depth == 0 {
+                                balanced = false;
+                            } else {
+                                depth -= 1;
+                            }
+                        }
+                        Event::EmptyElement(_) => max_depth = max_depth.max(depth + 1),
+                        _ => {}
                     }
-                    Event::EmptyElement(_) => max_depth = max_depth.max(depth + 1),
-                    _ => {}
+                    events.push(format!("{ev:?}"));
                 }
-                events.push(format!("{ev:?}"));
+                Ok(None) => break Ok(()),
+                Err(e) => {
+                    break Err((
+                        e.kind.clone(),
+                        e.position.line,
+                        e.position.column,
+                        e.position.offset,
+                    ))
+                }
             }
-            Ok(None) => break Ok(()),
-            Err(e) => {
-                break Err((
-                    e.kind.clone(),
-                    e.position.line,
-                    e.position.column,
-                    e.position.offset,
-                ))
-            }
+        };
+        Trace {
+            events,
+            end,
+            balanced: balanced && depth == 0,
+            max_depth,
         }
-    };
-    Trace {
-        events,
-        end,
-        balanced: balanced && depth == 0,
-        max_depth,
-    }
+    }};
 }
 
 fuzz_target!(|input: (u8, &[u8])| {
     let (chunk, data) = input;
     let chunk = (chunk as usize % 64) + 1;
-    let a = drain(Reader::from_bytes(data));
+    let mut bytes = Reader::from_bytes(data);
+    let a = drain!(bytes);
     let br = std::io::BufReader::with_capacity(chunk, data);
     match Reader::from_reader(br) {
-        Ok(r) => {
-            let b = drain(r);
+        Ok(mut streamed) => {
+            let b = drain!(streamed);
             assert_eq!(a, b, "from_bytes 与 from_reader(chunk={chunk}) 结果不一致");
         }
         Err(e) => {

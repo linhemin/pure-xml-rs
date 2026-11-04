@@ -44,3 +44,17 @@ path = "fuzz_targets/parse_small_stack.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "reader_chunked"
+path = "fuzz_targets/reader_chunked.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reader_1byte"
+path = "fuzz_targets/reader_1byte.rs"
+test = false
+doc = false
+bench = false

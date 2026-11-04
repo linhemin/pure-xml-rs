@@ -70,19 +70,42 @@ pub enum LimitKind {
     /// Attributes plus namespace declarations on one element.
     Attributes,
     /// Name length in UTF-8 bytes.
+    ///
+    /// Checked per character. The position is the cursor just after the
+    /// character that crosses the cap. `actual` includes that character's
+    /// UTF-8 bytes.
     NameLength,
-    /// One text node, in UTF-8 bytes, after end-of-line normalization and
-    /// entity expansion.
+    /// One text node, comment, CDATA section, or processing instruction, in
+    /// UTF-8 bytes, after end-of-line normalization and entity expansion.
+    ///
+    /// Checked per character. The position is the cursor just after the
+    /// character that crosses the cap. `actual` includes that character's
+    /// UTF-8 bytes.
     TextLength,
     /// Original input size in bytes.
+    ///
+    /// `actual` is `limit + 1`. The position is the offending byte itself.
     TotalInput,
     /// One attribute value, in UTF-8 bytes, after attribute-value normalization
     /// and entity expansion. The length is checked as each character is
     /// accepted, on the plain scan and on the normalizing path. `actual` is
     /// the length at the first character that makes the value longer than the
-    /// limit (the limit plus that character's UTF-8 byte length). `limit` is
+    /// limit (the limit plus that character's UTF-8 byte length). The position
+    /// is the cursor just after that character. `limit` is
     /// `ParserConfig::max_text_len`.
     AttrValueLength,
+    /// Raw byte length of one top-level token, from its first byte through the
+    /// terminator, not the lookahead byte. A UTF-8 BOM and prolog or epilog
+    /// whitespace are not part of the token. `actual` is `limit + 1`. The
+    /// position is the offending byte itself, `limit` bytes from the start of
+    /// the token, and does not depend on chunk size. Checked on both the slice
+    /// and the streaming reader.
+    TokenLength,
+    /// Raw byte length of one DTD internal subset, counting bytes after `[`
+    /// and before `]`. `actual` is the length at the first byte that makes
+    /// the subset longer than the limit. The position is that offending byte
+    /// itself.
+    InternalSubsetLength,
 }
 
 impl fmt::Display for LimitKind {
@@ -98,6 +121,8 @@ impl fmt::Display for LimitKind {
             Self::TextLength => "text length",
             Self::TotalInput => "total input",
             Self::AttrValueLength => "attribute value length",
+            Self::TokenLength => "token length",
+            Self::InternalSubsetLength => "internal subset length",
         })
     }
 }
@@ -208,18 +233,6 @@ impl std::error::Error for Error {}
 
 /// Result of a parse operation.
 pub type Result<T> = std::result::Result<T, Error>;
-
-/// Compute a [`Position`] by scanning `input` up to `offset` bytes.
-pub(crate) fn position_at(input: &[u8], offset: usize) -> Position {
-    let offset = offset.min(input.len());
-    let mut pos = Position::start();
-    let mut cr_pending = false;
-    for &b in &input[..offset] {
-        observe_byte(&mut pos, &mut cr_pending, b);
-    }
-    pos.offset = offset as u64;
-    pos
-}
 
 pub(crate) fn observe_byte(pos: &mut Position, cr_pending: &mut bool, b: u8) {
     if *cr_pending {
