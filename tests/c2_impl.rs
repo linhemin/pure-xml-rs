@@ -319,6 +319,65 @@ fn order_cache_clears_when_the_shape_changes() {
 }
 
 #[test]
+fn same_expanded_name_replaces_and_round_trips() {
+    let mut doc = Document::new();
+    let element = append_local(&mut doc, "r");
+    doc.declare_namespace(element, Some("p"), "urn:a").unwrap();
+    doc.declare_namespace(element, Some("q"), "urn:a").unwrap();
+    doc.set_attribute(element, Name::qualified("urn:a", Some("p"), "id"), "1")
+        .unwrap();
+    doc.set_attribute(element, Name::qualified("urn:a", Some("q"), "id"), "2")
+        .unwrap();
+    let attrs: Vec<_> = doc.get(element).unwrap().attributes().collect();
+    assert_eq!(attrs.len(), 1);
+    assert_eq!(attrs[0].prefix(), Some("q"));
+    assert_eq!(attrs[0].local(), "id");
+    assert_eq!(attrs[0].value(), "2");
+    assert_eq!(
+        doc.get(element).unwrap().attribute_ns(Some("urn:a"), "id"),
+        Some("2")
+    );
+    let before = doc.node_count();
+    assert_eq!(
+        doc.set_attribute(element, Name::qualified("urn:other", Some("q"), "id"), "3")
+            .unwrap_err(),
+        DomError::Namespace
+    );
+    assert_eq!(doc.get(element).unwrap().attribute("id"), None);
+    assert_eq!(
+        doc.get(element).unwrap().attribute_ns(Some("urn:a"), "id"),
+        Some("2")
+    );
+    assert_eq!(doc.node_count(), before);
+    let xml = doc.to_string().unwrap();
+    assert!(xml.contains("xmlns:q=\"urn:a\""));
+    assert!(xml.contains("q:id=\"2\""));
+    assert!(!xml.contains("p:id="));
+    let again = rebuild(&xml);
+    assert_eq!(
+        fingerprint(&doc, root_id(&doc)),
+        fingerprint(&again, root_id(&again))
+    );
+
+    let child = doc
+        .create_element(Name::qualified("urn:a", Some("p"), "c"))
+        .unwrap();
+    doc.append_child(element, child).unwrap();
+    let mut buf = Vec::new();
+    {
+        let mut writer = purexml::Writer::new(&mut buf);
+        doc.get(child).unwrap().write_to(&mut writer).unwrap();
+    }
+    let subtree = String::from_utf8(buf).unwrap();
+    assert!(subtree.contains("xmlns:p=\"urn:a\""));
+    let parsed = rebuild(&subtree);
+    assert_eq!(
+        fingerprint(&doc, child),
+        fingerprint(&parsed, parsed.root_element().unwrap().id())
+    );
+}
+
+#[test]
 fn byte_cap_rejects_without_growing_the_arena() {
     let mut doc =
         Document::with_config(&purexml::ParserConfig::default().with_max_dom_bytes(120)).unwrap();

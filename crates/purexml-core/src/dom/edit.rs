@@ -313,7 +313,17 @@ impl Document {
         Ok(())
     }
 
-    /// Set an attribute, replacing one with the same expanded name.
+    /// Set an attribute, replacing any attribute with the same expanded name.
+    ///
+    /// The expanded name is the namespace URI plus the local name. A second
+    /// call with a different prefix still replaces the old attribute when the
+    /// URI and local name match, so the element never keeps two attributes
+    /// with that expanded name. The prefix must already resolve to `name`'s
+    /// URI in scope; otherwise this returns [`DomError::Namespace`] and the
+    /// element is unchanged. Serialization then writes a declaration for that
+    /// prefix on the element when the element itself does not already declare
+    /// it, including when the binding was inherited or the stored URI would
+    /// disagree with an ancestor.
     ///
     /// `xmlns` and `xmlns:*` are rejected. Declare those with [`Self::declare_namespace`].
     pub fn set_attribute(
@@ -377,6 +387,9 @@ impl Document {
         let index = self.require(element)?;
         let slot = self.slot_of(index)?;
         self.check_binding(prefix, uri)?;
+        if !self.names_match_binding(index, prefix, uri) {
+            return Err(DomError::Namespace);
+        }
         if let Some(existing) = self.find_ns(slot, prefix) {
             let current = self.str_at(self.ns_decls[existing].uri).unwrap_or("");
             if current == uri {
@@ -911,6 +924,83 @@ impl Document {
         self.ns_decls.truncate(ns_len);
         self.arena.truncate(arena_len);
         self.elements[slot as usize] = element;
+    }
+
+    /// Names this declaration would cover already store `uri`.
+    fn names_match_binding(&self, owner: u32, prefix: Option<&str>, uri: &str) -> bool {
+        for index in self.subtree_indexes(owner) {
+            if let Some(stored) = self.stored_ns(index, prefix, false)
+                && self.covered_by(index, owner, prefix)
+                && stored != uri
+            {
+                return false;
+            }
+            if prefix.is_some()
+                && let Some(stored) = self.stored_ns(index, prefix, true)
+                && self.covered_by(index, owner, prefix)
+                && stored != uri
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn stored_ns(&self, index: u32, prefix: Option<&str>, attribute: bool) -> Option<String> {
+        let Payload::Element(slot) = self.nodes[index as usize].payload else {
+            return None;
+        };
+        if attribute {
+            let range = self.elements[slot as usize].attrs;
+            let start = range.start as usize;
+            let end = start + range.len as usize;
+            for attr in self.attrs.get(start..end).unwrap_or(&[]) {
+                if attr.prefix.and_then(|span| self.str_at(span)) == prefix {
+                    let uri = attr
+                        .namespace
+                        .and_then(|span| self.str_at(span))
+                        .unwrap_or("");
+                    return Some(uri.to_string());
+                }
+            }
+            return None;
+        }
+        let element = &self.elements[slot as usize];
+        let name_prefix = element.prefix.and_then(|span| self.str_at(span));
+        let uses = if prefix.is_none() {
+            name_prefix.is_none()
+        } else {
+            name_prefix == prefix
+        };
+        if !uses {
+            return None;
+        }
+        Some(
+            element
+                .namespace
+                .and_then(|span| self.str_at(span))
+                .unwrap_or("")
+                .to_string(),
+        )
+    }
+
+    fn covered_by(&self, index: u32, owner: u32, prefix: Option<&str>) -> bool {
+        let mut current = Some(index);
+        let mut guard = self.nodes.len();
+        while let Some(at) = current {
+            if guard == 0 {
+                return false;
+            }
+            guard -= 1;
+            if at == owner {
+                return true;
+            }
+            if self.binding_on(at, prefix).is_some() {
+                return false;
+            }
+            current = self.nodes[at as usize].parent;
+        }
+        false
     }
 
     fn binding_in_use(&self, owner: u32, prefix: Option<&str>) -> bool {

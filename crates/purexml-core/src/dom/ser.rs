@@ -112,12 +112,15 @@ fn open_node<W: Write>(
             Ok(())
         }
         NodeKind::Element => {
+            let namespaces = covered_namespaces(doc, index)?;
+            let name = element_name(doc, index)?;
+            let attributes = attributes(doc, index);
             let kids = children(doc, index);
             if kids.is_empty() {
                 writer.write_event(&Event::EmptyElement(EmptyElement {
-                    name: element_name(doc, index)?,
-                    attributes: attributes(doc, index),
-                    namespaces: namespaces(doc, index),
+                    name,
+                    attributes,
+                    namespaces,
                 }))
             } else {
                 stack.push(Job::Close(index));
@@ -125,9 +128,9 @@ fn open_node<W: Write>(
                     stack.push(Job::Open(child));
                 }
                 writer.write_event(&Event::StartElement(StartElement {
-                    name: element_name(doc, index)?,
-                    attributes: attributes(doc, index),
-                    namespaces: namespaces(doc, index),
+                    name,
+                    attributes,
+                    namespaces,
                 }))
             }
         }
@@ -213,7 +216,49 @@ fn attributes(doc: &Document, index: u32) -> Vec<Attribute<'_>> {
         .collect()
 }
 
-fn namespaces(doc: &Document, index: u32) -> Vec<Namespace<'_>> {
+struct Binding<'a> {
+    prefix: Option<&'a str>,
+    uri: &'a str,
+}
+
+/// Declarations stored on the element, plus any binding its name or attributes
+/// need so the start tag stays namespace-well-formed on its own.
+fn covered_namespaces<'a>(doc: &'a Document, index: u32) -> Result<Vec<Namespace<'a>>, WriteError> {
+    let Payload::Element(slot) = doc.nodes[index as usize].payload else {
+        return Ok(Vec::new());
+    };
+    let element = &doc.elements[slot as usize];
+    let mut bindings = stored_bindings(doc, index);
+    require_binding(
+        &mut bindings,
+        element.prefix.and_then(|span| doc.str_at(span)),
+        element
+            .namespace
+            .and_then(|span| doc.str_at(span))
+            .unwrap_or(""),
+    )?;
+    let range = element.attrs;
+    let start = range.start as usize;
+    let end = start + range.len as usize;
+    for attr in doc.attrs.get(start..end).unwrap_or(&[]) {
+        require_binding(
+            &mut bindings,
+            attr.prefix.and_then(|span| doc.str_at(span)),
+            attr.namespace
+                .and_then(|span| doc.str_at(span))
+                .unwrap_or(""),
+        )?;
+    }
+    Ok(bindings
+        .into_iter()
+        .map(|binding| Namespace {
+            prefix: binding.prefix.map(XmlText::borrowed),
+            uri: XmlText::borrowed(binding.uri),
+        })
+        .collect())
+}
+
+fn stored_bindings(doc: &Document, index: u32) -> Vec<Binding<'_>> {
     let Payload::Element(slot) = doc.nodes[index as usize].payload else {
         return Vec::new();
     };
@@ -224,14 +269,59 @@ fn namespaces(doc: &Document, index: u32) -> Vec<Namespace<'_>> {
         .get(start..end)
         .unwrap_or(&[])
         .iter()
-        .map(|decl| Namespace {
-            prefix: decl
-                .prefix
-                .and_then(|span| doc.str_at(span))
-                .map(XmlText::borrowed),
-            uri: XmlText::borrowed(doc.str_at(decl.uri).unwrap_or("")),
+        .filter_map(|decl| {
+            Some(Binding {
+                prefix: decl.prefix.and_then(|span| doc.str_at(span)),
+                uri: doc.str_at(decl.uri)?,
+            })
         })
         .collect()
+}
+
+fn require_binding<'a>(
+    bindings: &mut Vec<Binding<'a>>,
+    prefix: Option<&'a str>,
+    uri: &'a str,
+) -> Result<(), WriteError> {
+    if prefix == Some("xml") {
+        return if uri == crate::event::XML_NAMESPACE {
+            Ok(())
+        } else {
+            Err(WriteError::Syntax(
+                "the xml prefix is bound to the XML namespace".to_string(),
+            ))
+        };
+    }
+    // An unprefixed attribute is in no namespace and does not use the default.
+    if prefix.is_none() && uri.is_empty() {
+        if let Some(existing) = bindings.iter().find(|binding| binding.prefix.is_none())
+            && !existing.uri.is_empty()
+        {
+            return Err(WriteError::Syntax(
+                "default namespace does not match the element name".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    if let Some(existing) = bindings.iter().find(|binding| binding.prefix == prefix) {
+        return if existing.uri == uri {
+            Ok(())
+        } else {
+            Err(WriteError::Syntax(format!(
+                "prefix `{}` is bound to `{}` and `{}`",
+                prefix.unwrap_or(""),
+                existing.uri,
+                uri
+            )))
+        };
+    }
+    if prefix.is_some() && uri.is_empty() {
+        return Err(WriteError::Syntax(
+            "a prefixed name has no namespace URI".to_string(),
+        ));
+    }
+    bindings.push(Binding { prefix, uri });
+    Ok(())
 }
 
 fn text_of(doc: &Document, index: u32) -> XmlText<'_> {
