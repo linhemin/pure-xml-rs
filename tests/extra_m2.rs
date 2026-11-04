@@ -1293,3 +1293,70 @@ fn comment_dash_at_text_cap_is_text_length() {
         17,
     );
 }
+
+/// Byte caps on a comment `--` or CDATA `]]` lookahead match `from_bytes`,
+/// including the debug scanner check for TokenLength.
+#[test]
+fn terminator_cap_agrees_with_from_bytes_in_debug() {
+    let cases: &[(&str, &[u8], ParserConfig, LimitKind, u64, u64)] = &[
+        (
+            "comment total",
+            b"<!--aaa---><r/>",
+            ParserConfig::default()
+                .with_max_text_len(3)
+                .with_max_total_input(9),
+            LimitKind::TotalInput,
+            9,
+            9,
+        ),
+        (
+            "comment x",
+            b"<!--aaa--x--><r/>",
+            ParserConfig::default()
+                .with_max_text_len(3)
+                .with_max_total_input(9),
+            LimitKind::TotalInput,
+            9,
+            9,
+        ),
+        (
+            "cdata x",
+            b"<r><![CDATA[aaa]]x]]></r>",
+            ParserConfig::default()
+                .with_max_text_len(3)
+                .with_max_total_input(17),
+            LimitKind::TotalInput,
+            17,
+            17,
+        ),
+        (
+            "comment token",
+            b"<!--aaa---><r/>",
+            ParserConfig::default()
+                .with_max_text_len(3)
+                .with_max_token_len(8),
+            LimitKind::TokenLength,
+            8,
+            8,
+        ),
+        (
+            "cdata token",
+            b"<r><![CDATA[aaa]]]></r>",
+            ParserConfig::default().with_max_token_len(13),
+            LimitKind::TokenLength,
+            13,
+            16,
+        ),
+    ];
+    for (label, doc, cfg, kind, limit, offset) in cases {
+        let snap = assert_all_paths(label, doc, cfg);
+        assert_byte_limit(label, &snap, *kind, *limit, *offset);
+        for chunk in [1usize, 7, 64] {
+            assert_eq!(
+                snap_chunks(doc, chunk, cfg.clone()),
+                snap,
+                "{label} chunk {chunk}"
+            );
+        }
+    }
+}
