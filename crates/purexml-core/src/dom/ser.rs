@@ -229,7 +229,7 @@ fn covered_namespaces<'a>(doc: &'a Document, index: u32) -> Result<Vec<Namespace
     };
     let element = &doc.elements[slot as usize];
     let mut bindings = stored_bindings(doc, index);
-    require_binding(
+    require_element_binding(
         &mut bindings,
         element.prefix.and_then(|span| doc.str_at(span)),
         element
@@ -241,7 +241,7 @@ fn covered_namespaces<'a>(doc: &'a Document, index: u32) -> Result<Vec<Namespace
     let start = range.start as usize;
     let end = start + range.len as usize;
     for attr in doc.attrs.get(start..end).unwrap_or(&[]) {
-        require_binding(
+        require_attribute_binding(
             &mut bindings,
             attr.prefix.and_then(|span| doc.str_at(span)),
             attr.namespace
@@ -278,7 +278,8 @@ fn stored_bindings(doc: &Document, index: u32) -> Vec<Binding<'_>> {
         .collect()
 }
 
-fn require_binding<'a>(
+/// The element name uses the default namespace when it has no prefix.
+fn require_element_binding<'a>(
     bindings: &mut Vec<Binding<'a>>,
     prefix: Option<&'a str>,
     uri: &'a str,
@@ -292,7 +293,6 @@ fn require_binding<'a>(
             ))
         };
     }
-    // An unprefixed attribute is in no namespace and does not use the default.
     if prefix.is_none() && uri.is_empty() {
         if let Some(existing) = bindings.iter().find(|binding| binding.prefix.is_none())
             && !existing.uri.is_empty()
@@ -303,6 +303,36 @@ fn require_binding<'a>(
         }
         return Ok(());
     }
+    align_binding(bindings, prefix, uri)
+}
+
+/// An unprefixed attribute is in no namespace. The default namespace does not
+/// apply to it, so serialization must not invent a prefix or a declaration.
+fn require_attribute_binding<'a>(
+    bindings: &mut Vec<Binding<'a>>,
+    prefix: Option<&'a str>,
+    uri: &'a str,
+) -> Result<(), WriteError> {
+    if prefix.is_none() {
+        return Ok(());
+    }
+    if prefix == Some("xml") {
+        return if uri == crate::event::XML_NAMESPACE {
+            Ok(())
+        } else {
+            Err(WriteError::Syntax(
+                "the xml prefix is bound to the XML namespace".to_string(),
+            ))
+        };
+    }
+    align_binding(bindings, prefix, uri)
+}
+
+fn align_binding<'a>(
+    bindings: &mut Vec<Binding<'a>>,
+    prefix: Option<&'a str>,
+    uri: &'a str,
+) -> Result<(), WriteError> {
     if let Some(existing) = bindings.iter().find(|binding| binding.prefix == prefix) {
         return if existing.uri == uri {
             Ok(())

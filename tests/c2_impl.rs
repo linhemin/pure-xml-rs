@@ -464,6 +464,45 @@ fn escapes_round_trip_and_illegal_forms_are_rejected() {
 }
 
 #[test]
+fn unprefixed_attribute_ignores_the_default_namespace() {
+    let mut doc = Document::new();
+    let root = root_id(&doc);
+    let element = doc
+        .create_element(Name::qualified("urn:b", None, "r"))
+        .unwrap();
+    doc.declare_namespace(element, None, "urn:b").unwrap();
+    doc.append_child(root, element).unwrap();
+    doc.set_attribute(element, Name::local("a"), "2").unwrap();
+    let xml = doc.to_string().unwrap();
+    assert_eq!(xml, r#"<r xmlns="urn:b" a="2"/>"#);
+    let again = rebuild(&xml);
+    assert_eq!(
+        fingerprint(&doc, root_id(&doc)),
+        fingerprint(&again, root_id(&again))
+    );
+
+    let mut doc = Document::new();
+    let root = root_id(&doc);
+    let element = doc
+        .create_element(Name::qualified("urn:a", Some("p"), "r"))
+        .unwrap();
+    doc.declare_namespace(element, Some("p"), "urn:a").unwrap();
+    doc.declare_namespace(element, None, "urn:b").unwrap();
+    doc.append_child(root, element).unwrap();
+    doc.set_attribute(element, Name::local("a"), "2").unwrap();
+    let xml = doc.to_string().unwrap();
+    assert!(xml.contains("xmlns:p=\"urn:a\""));
+    assert!(xml.contains("xmlns=\"urn:b\""));
+    assert!(xml.contains("a=\"2\""));
+    assert!(!xml.contains("xmlns:a"));
+    let again = rebuild(&xml);
+    assert_eq!(
+        fingerprint(&doc, root_id(&doc)),
+        fingerprint(&again, root_id(&again))
+    );
+}
+
+#[test]
 fn byte_cap_rejects_without_growing_the_arena() {
     let mut doc =
         Document::with_config(&purexml::ParserConfig::default().with_max_dom_bytes(120)).unwrap();
