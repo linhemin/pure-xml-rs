@@ -1551,3 +1551,40 @@ fn record_growth(range: Range, len: usize, extra: usize) -> usize {
         range.len as usize + extra
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Document, DomError, Name};
+
+    #[test]
+    fn public_id_without_system_id_leaves_the_document_unchanged() {
+        let mut doc = Document::new();
+        let root = doc.root().unwrap().id();
+        let element = doc.create_element(Name::local("r")).unwrap();
+        doc.append_child(root, element).unwrap();
+        let nodes = doc.node_count();
+        let xml = doc.to_string().unwrap();
+        let err = doc
+            .create_doctype("r", None, Some("-//Example//EN"))
+            .unwrap_err();
+        assert_eq!(err, DomError::Hierarchy);
+        assert_eq!(doc.node_count(), nodes);
+        assert_eq!(doc.to_string().unwrap(), xml);
+    }
+
+    #[test]
+    fn public_and_system_ids_serialize() {
+        let mut doc = Document::new();
+        let root = doc.root().unwrap().id();
+        let dtd = doc
+            .create_doctype("r", Some("r.dtd"), Some("-//Example//EN"))
+            .unwrap();
+        doc.append_child(root, dtd).unwrap();
+        let element = doc.create_element(Name::local("r")).unwrap();
+        doc.append_child(root, element).unwrap();
+        assert_eq!(
+            doc.to_string().unwrap(),
+            "<!DOCTYPE r PUBLIC \"-//Example//EN\" \"r.dtd\"><r/>"
+        );
+    }
+}
