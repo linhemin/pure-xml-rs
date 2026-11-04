@@ -1298,7 +1298,8 @@ fn comment_dash_at_text_cap_is_text_length() {
 /// including the debug scanner check for TokenLength.
 #[test]
 fn terminator_cap_agrees_with_from_bytes_in_debug() {
-    let cases: &[(&str, &[u8], ParserConfig, LimitKind, u64, u64)] = &[
+    type TermCase<'a> = (&'a str, &'a [u8], ParserConfig, LimitKind, u64, u64);
+    let cases: &[TermCase] = &[
         (
             "comment total",
             b"<!--aaa---><r/>",
