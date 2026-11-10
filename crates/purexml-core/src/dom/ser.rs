@@ -1,5 +1,6 @@
 //! Serialize a document or a subtree through [`crate::Writer`].
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -85,12 +86,14 @@ enum Job {
     Close(u32),
 }
 
-fn write_at<W: Write>(
-    doc: &Document,
+fn write_at<'a, W: Write>(
+    doc: &'a Document,
     index: u32,
     writer: &mut crate::Writer<W>,
     options: WriteOptions,
 ) -> Result<(), WriteError> {
+    let mut scope = OutScope::empty();
+    scope.push(Some("xml"), crate::event::XML_NAMESPACE);
     let mut stack = vec![Job::Open(index)];
     let mut guard = doc.nodes.len().saturating_mul(4);
     while let Some(job) = stack.pop() {
@@ -99,21 +102,25 @@ fn write_at<W: Write>(
         }
         guard -= 1;
         match job {
-            Job::Close(current) => writer.write_event(&Event::EndElement(EndElement {
-                name: element_name(doc, current)?,
-            }))?,
-            Job::Open(current) => open_node(doc, current, &mut stack, writer, options)?,
+            Job::Close(current) => {
+                scope.leave();
+                writer.write_event(&Event::EndElement(EndElement {
+                    name: element_name(doc, current)?,
+                }))?;
+            }
+            Job::Open(current) => open_node(doc, current, &mut stack, writer, options, &mut scope)?,
         }
     }
     Ok(())
 }
 
-fn open_node<W: Write>(
-    doc: &Document,
+fn open_node<'a, W: Write>(
+    doc: &'a Document,
     index: u32,
     stack: &mut Vec<Job>,
     writer: &mut crate::Writer<W>,
     options: WriteOptions,
+    scope: &mut OutScope<'a>,
 ) -> Result<(), WriteError> {
     let node = &doc.nodes[index as usize];
     if !node.alive {
@@ -130,7 +137,7 @@ fn open_node<W: Write>(
             Ok(())
         }
         NodeKind::Element => {
-            let namespaces = covered_namespaces(doc, index)?;
+            let namespaces = namespaces_in_scope(doc, index, scope)?;
             let name = element_name(doc, index)?;
             let attributes = attributes(doc, index);
             let kids = children(doc, index);
@@ -139,7 +146,9 @@ fn open_node<W: Write>(
                     name,
                     attributes,
                     namespaces,
-                }))
+                }))?;
+                scope.leave();
+                Ok(())
             } else {
                 stack.push(Job::Close(index));
                 for child in kids.into_iter().rev() {
@@ -239,16 +248,75 @@ struct Binding<'a> {
     uri: &'a str,
 }
 
-/// Declarations stored on the element, plus any binding its name or attributes
-/// need so the start tag stays namespace-well-formed on its own.
-fn covered_namespaces<'a>(doc: &'a Document, index: u32) -> Result<Vec<Namespace<'a>>, WriteError> {
+/// Declarations already written by an ancestor, plus the ones this element adds.
+///
+/// Stored declarations are always emitted, including ones an ancestor already
+/// wrote. A binding is invented only when the name needs one that is not in
+/// this scope. A subtree write starts from a fresh scope, so its root stays
+/// self-contained.
+struct OutScope<'a> {
+    map: HashMap<Option<String>, Vec<&'a str>>,
+    undo: Vec<(usize, Option<String>)>,
+    depth: usize,
+}
+
+impl<'a> OutScope<'a> {
+    fn empty() -> Self {
+        Self {
+            map: HashMap::new(),
+            undo: Vec::new(),
+            depth: 0,
+        }
+    }
+
+    fn lookup(&self, prefix: Option<&str>) -> Option<&'a str> {
+        let key = prefix.map(str::to_string);
+        self.map.get(&key).and_then(|stack| stack.last().copied())
+    }
+
+    fn push(&mut self, prefix: Option<&str>, uri: &'a str) {
+        let key = prefix.map(str::to_string);
+        self.map.entry(key.clone()).or_default().push(uri);
+        self.undo.push((self.depth, key));
+    }
+
+    fn enter(&mut self) {
+        self.depth += 1;
+    }
+
+    fn leave(&mut self) {
+        while self
+            .undo
+            .last()
+            .is_some_and(|(depth, _)| *depth == self.depth)
+        {
+            let (_, key) = self.undo.pop().expect("undo entry");
+            if let Some(stack) = self.map.get_mut(&key) {
+                stack.pop();
+            }
+        }
+        self.depth = self.depth.saturating_sub(1);
+    }
+}
+
+fn namespaces_in_scope<'a>(
+    doc: &'a Document,
+    index: u32,
+    scope: &mut OutScope<'a>,
+) -> Result<Vec<Namespace<'a>>, WriteError> {
     let Payload::Element(slot) = doc.nodes[index as usize].payload else {
         return Ok(Vec::new());
     };
     let element = &doc.elements[slot as usize];
-    let mut bindings = stored_bindings(doc, index);
-    require_element_binding(
-        &mut bindings,
+    scope.enter();
+    let mut out = Vec::new();
+    for binding in stored_bindings(doc, index) {
+        scope.push(binding.prefix, binding.uri);
+        out.push(namespace_of(binding));
+    }
+    require_element(
+        scope,
+        &mut out,
         element.prefix.and_then(|span| doc.str_at(span)),
         element
             .namespace
@@ -259,21 +327,23 @@ fn covered_namespaces<'a>(doc: &'a Document, index: u32) -> Result<Vec<Namespace
     let start = range.start as usize;
     let end = start + range.len as usize;
     for attr in doc.attrs.get(start..end).unwrap_or(&[]) {
-        require_attribute_binding(
-            &mut bindings,
+        require_attribute(
+            scope,
+            &mut out,
             attr.prefix.and_then(|span| doc.str_at(span)),
             attr.namespace
                 .and_then(|span| doc.str_at(span))
                 .unwrap_or(""),
         )?;
     }
-    Ok(bindings
-        .into_iter()
-        .map(|binding| Namespace {
-            prefix: binding.prefix.map(XmlText::borrowed),
-            uri: XmlText::borrowed(binding.uri),
-        })
-        .collect())
+    Ok(out)
+}
+
+fn namespace_of(binding: Binding<'_>) -> Namespace<'_> {
+    Namespace {
+        prefix: binding.prefix.map(XmlText::borrowed),
+        uri: XmlText::borrowed(binding.uri),
+    }
 }
 
 fn stored_bindings(doc: &Document, index: u32) -> Vec<Binding<'_>> {
@@ -297,8 +367,9 @@ fn stored_bindings(doc: &Document, index: u32) -> Vec<Binding<'_>> {
 }
 
 /// The element name uses the default namespace when it has no prefix.
-fn require_element_binding<'a>(
-    bindings: &mut Vec<Binding<'a>>,
+fn require_element<'a>(
+    scope: &mut OutScope<'a>,
+    out: &mut Vec<Namespace<'a>>,
     prefix: Option<&'a str>,
     uri: &'a str,
 ) -> Result<(), WriteError> {
@@ -312,22 +383,26 @@ fn require_element_binding<'a>(
         };
     }
     if prefix.is_none() && uri.is_empty() {
-        if let Some(existing) = bindings.iter().find(|binding| binding.prefix.is_none())
-            && !existing.uri.is_empty()
+        if scope
+            .lookup(None)
+            .is_some_and(|existing| !existing.is_empty())
         {
-            return Err(WriteError::Syntax(
-                "default namespace does not match the element name".to_string(),
-            ));
+            scope.push(None, "");
+            out.push(Namespace {
+                prefix: None,
+                uri: XmlText::borrowed(""),
+            });
         }
         return Ok(());
     }
-    align_binding(bindings, prefix, uri)
+    align_scope(scope, out, prefix, uri)
 }
 
 /// An unprefixed attribute is in no namespace. The default namespace does not
 /// apply to it, so serialization must not invent a prefix or a declaration.
-fn require_attribute_binding<'a>(
-    bindings: &mut Vec<Binding<'a>>,
+fn require_attribute<'a>(
+    scope: &mut OutScope<'a>,
+    out: &mut Vec<Namespace<'a>>,
     prefix: Option<&'a str>,
     uri: &'a str,
 ) -> Result<(), WriteError> {
@@ -343,23 +418,22 @@ fn require_attribute_binding<'a>(
             ))
         };
     }
-    align_binding(bindings, prefix, uri)
+    align_scope(scope, out, prefix, uri)
 }
 
-fn align_binding<'a>(
-    bindings: &mut Vec<Binding<'a>>,
+fn align_scope<'a>(
+    scope: &mut OutScope<'a>,
+    out: &mut Vec<Namespace<'a>>,
     prefix: Option<&'a str>,
     uri: &'a str,
 ) -> Result<(), WriteError> {
-    if let Some(existing) = bindings.iter().find(|binding| binding.prefix == prefix) {
-        return if existing.uri == uri {
+    if let Some(existing) = scope.lookup(prefix) {
+        return if existing == uri {
             Ok(())
         } else {
             Err(WriteError::Syntax(format!(
-                "prefix `{}` is bound to `{}` and `{}`",
+                "prefix `{}` is bound to `{existing}` and `{uri}`",
                 prefix.unwrap_or(""),
-                existing.uri,
-                uri
             )))
         };
     }
@@ -368,7 +442,11 @@ fn align_binding<'a>(
             "a prefixed name has no namespace URI".to_string(),
         ));
     }
-    bindings.push(Binding { prefix, uri });
+    scope.push(prefix, uri);
+    out.push(Namespace {
+        prefix: prefix.map(XmlText::borrowed),
+        uri: XmlText::borrowed(uri),
+    });
     Ok(())
 }
 
@@ -407,7 +485,7 @@ fn children(doc: &Document, parent: u32) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use crate::dom::Document;
-    use crate::dom::edit::WriteOptions;
+    use crate::dom::edit::{Name, WriteOptions};
 
     #[test]
     fn omit_doctype_drops_a_system_identifier() {
@@ -424,5 +502,32 @@ mod tests {
             .unwrap();
         assert!(!omitted.contains("<!DOCTYPE"));
         assert!(omitted.contains("<r"));
+    }
+
+    #[test]
+    fn ancestor_declarations_are_not_invented_again() {
+        let xml = r#"<r xmlns="urn:b" xmlns:p="urn:a"><c xmlns="urn:b"><p:d xmlns:p="urn:a" p:x="1"/></c></r>"#;
+        let doc = Document::parse(xml).unwrap();
+        let once = doc.to_string().unwrap();
+        assert_eq!(once, xml);
+        let twice = Document::parse(&once).unwrap().to_string().unwrap();
+        assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn no_namespace_child_clears_a_default_namespace() {
+        let mut doc = Document::new();
+        let root = doc.root().unwrap().id();
+        let element = doc
+            .create_element(Name::qualified("urn:b", None, "r"))
+            .unwrap();
+        doc.declare_namespace(element, None, "urn:b").unwrap();
+        doc.append_child(root, element).unwrap();
+        let child = doc.create_element(Name::local("c")).unwrap();
+        doc.link_last(element.index(), child.index());
+        assert_eq!(
+            doc.to_string().unwrap(),
+            r#"<r xmlns="urn:b"><c xmlns=""/></r>"#
+        );
     }
 }
