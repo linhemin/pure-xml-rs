@@ -207,11 +207,15 @@ fn check_ncname(name: &str) -> Result<(), WriteError> {
 /// Remembers namespace URIs by `Arc` address after the first content compare.
 ///
 /// The address is only a fast path. Two different allocations with the same
-/// URI still compare equal. Each `Arc` is kept so a freed address cannot be
-/// reused for a different URI.
+/// URI still compare equal. `by_ptr` holds the `Arc` whose address is the
+/// key, so a later allocation cannot reuse that address while the cache
+/// still names it.
 struct UriIdentity {
-    by_ptr: HashMap<usize, Arc<str>>,
-    by_text: HashMap<Arc<str>, Arc<str>>,
+    /// Pointer of a held `Arc` → content id.
+    by_ptr: HashMap<usize, (Arc<str>, u32)>,
+    /// Canonical `Arc` for each distinct URI content → id.
+    by_text: HashMap<Arc<str>, u32>,
+    next: u32,
 }
 
 impl UriIdentity {
@@ -219,24 +223,26 @@ impl UriIdentity {
         Self {
             by_ptr: HashMap::new(),
             by_text: HashMap::new(),
+            next: 1,
         }
     }
 
     fn canonical(&mut self, uri: &Arc<str>) -> usize {
         let ptr = Arc::as_ptr(uri) as *const u8 as usize;
-        if let Some(canon) = self.by_ptr.get(&ptr) {
-            return Arc::as_ptr(canon) as *const u8 as usize;
+        if let Some((_, id)) = self.by_ptr.get(&ptr) {
+            return *id as usize;
         }
-        let canon = if let Some(existing) = self.by_text.get(uri) {
-            Arc::clone(existing)
+        let id = if let Some(id) = self.by_text.get(uri).copied() {
+            id
         } else {
-            let owned = Arc::clone(uri);
-            self.by_text.insert(Arc::clone(&owned), Arc::clone(&owned));
-            owned
+            let id = self.next;
+            self.next = self.next.saturating_add(1);
+            self.by_text.insert(Arc::clone(uri), id);
+            id
         };
-        let id = Arc::as_ptr(&canon) as *const u8 as usize;
-        self.by_ptr.insert(ptr, canon);
-        id
+        // Hold this allocation. Dropping it would let a different URI reuse `ptr`.
+        self.by_ptr.insert(ptr, (Arc::clone(uri), id));
+        id as usize
     }
 }
 

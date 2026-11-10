@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **D-C3-2.** The writer's URI cache keyed non-canonical `Arc` addresses
+  without holding those allocations. After the `Arc` was dropped, a new URI
+  could reuse the address and be treated as the old one: distinct attributes
+  were rejected, and real duplicates were written. The cache now keeps the
+  `Arc` whose address it uses. Content comparison is unchanged.
 - **D-C3-1.** Checking distinct attributes hashed the namespace URI on every
   attribute, and serialization allocated a fresh `Arc` for every element.
   A long URI therefore made writing much slower than reading. The writer now
