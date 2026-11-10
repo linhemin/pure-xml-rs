@@ -1,4 +1,8 @@
 //! DOM mutation. Every `Err` returns before the arena or the links change.
+//!
+//! Each operation here is O(depth) or O(subtree): it walks ancestors or
+//! descendants to check hierarchy, depth, and namespaces. Build a large
+//! document with [`Document::parse`] instead of inserting nodes one by one.
 
 use std::cmp::Ordering;
 use std::mem::size_of;
@@ -77,6 +81,9 @@ impl Document {
     }
 
     /// A detached element. Insert it with [`Self::append_child`] or the insert methods.
+    ///
+    /// Creating the node is O(1). Linking it is O(depth). Build a large
+    /// document with [`Self::parse`].
     pub fn create_element(&mut self, name: Name<'_>) -> Result<NodeId, DomError> {
         self.check_element_name(name)?;
         let strings = name_bytes(name);
@@ -218,6 +225,8 @@ impl Document {
     }
 
     /// Link `child` as the last child of `parent`, moving it if it already has a parent.
+    ///
+    /// O(depth). Build a large document with [`Self::parse`].
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) -> Result<(), DomError> {
         let parent = self.require(parent)?;
         let child = self.require(child)?;
@@ -229,6 +238,8 @@ impl Document {
     }
 
     /// Insert `child` immediately before `reference`.
+    ///
+    /// O(depth). Build a large document with [`Self::parse`].
     pub fn insert_before(&mut self, child: NodeId, reference: NodeId) -> Result<(), DomError> {
         let reference = self.require(reference)?;
         let child = self.require(child)?;
@@ -243,6 +254,8 @@ impl Document {
     }
 
     /// Insert `child` immediately after `reference`.
+    ///
+    /// O(depth). Build a large document with [`Self::parse`].
     pub fn insert_after(&mut self, child: NodeId, reference: NodeId) -> Result<(), DomError> {
         let reference = self.require(reference)?;
         let child = self.require(child)?;
@@ -257,6 +270,8 @@ impl Document {
     }
 
     /// Unlink `node` and copy namespace bindings it still needs onto its root.
+    ///
+    /// O(depth) or O(subtree). Build a large document with [`Document::parse`].
     ///
     /// The node stays live. After this returns, the subtree does not depend on
     /// an ancestor declaration.
@@ -276,6 +291,8 @@ impl Document {
     }
 
     /// Unlink `node` and tombstone it and every descendant. Slots are not reused.
+    ///
+    /// O(subtree). Build a large document with [`Document::parse`].
     pub fn remove(&mut self, node: NodeId) -> Result<(), DomError> {
         let index = self.require(node)?;
         if self.nodes[index as usize].kind == NodeKind::Document {
@@ -314,6 +331,8 @@ impl Document {
     }
 
     /// Set an attribute, replacing any attribute with the same expanded name.
+    ///
+    /// O(depth). Build a large document with [`Document::parse`].
     ///
     /// The expanded name is the namespace URI plus the local name. A second
     /// call with a different prefix still replaces the old attribute when the
@@ -1449,7 +1468,7 @@ impl Document {
         node.next = None;
     }
 
-    fn link_last(&mut self, parent: u32, child: u32) {
+    pub(super) fn link_last(&mut self, parent: u32, child: u32) {
         let last = self.nodes[parent as usize].last_child;
         if let Some(last) = last {
             self.nodes[last as usize].next = Some(child);

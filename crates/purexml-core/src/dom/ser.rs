@@ -27,6 +27,9 @@ impl Document {
     }
 
     /// `write_to` into a `String`.
+    ///
+    /// The bytes are always UTF-8. An XML declaration is not written: a
+    /// declaration in the input is not stored on the document.
     pub fn to_string(&self) -> Result<String, WriteError> {
         self.to_string_with(WriteOptions::default())
     }

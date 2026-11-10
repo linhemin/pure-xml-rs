@@ -148,7 +148,7 @@ pub(super) struct NsDecl {
     pub(super) uri: StrSpan,
 }
 
-/// Filled by the skeleton tests. Parsing does not build nodes yet.
+/// Payload of one node. The parser and the mutation API share this layout.
 #[derive(Copy, Clone)]
 #[allow(dead_code)]
 pub(super) enum Payload {
@@ -311,6 +311,28 @@ impl Document {
 
     pub(super) fn byte_cap(&self) -> u64 {
         self.max_dom_bytes.min(u32::MAX as u64)
+    }
+
+    pub(super) fn intern_span(&mut self, text: &str) -> Result<StrSpan, DomError> {
+        let start = u32::try_from(self.arena.len()).map_err(|_| DomError::Limit {
+            kind: DomLimit::DomBytes,
+            limit: self.byte_cap(),
+            actual: self.byte_cap().saturating_add(1),
+        })?;
+        let len = u32::try_from(text.len()).map_err(|_| DomError::Limit {
+            kind: DomLimit::DomBytes,
+            limit: self.byte_cap(),
+            actual: self.byte_cap().saturating_add(1),
+        })?;
+        if start.checked_add(len).is_none() {
+            return Err(DomError::Limit {
+                kind: DomLimit::DomBytes,
+                limit: self.byte_cap(),
+                actual: self.byte_cap().saturating_add(1),
+            });
+        }
+        self.arena.push_str(text);
+        Ok(StrSpan { start, len })
     }
 
     pub(super) fn reserve(&self, extra_nodes: u64, extra_bytes: u64) -> Result<(), DomError> {

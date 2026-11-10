@@ -86,6 +86,10 @@ impl<S> Reader<S> {
     pub(crate) fn last_defaulted(&self) -> usize {
         self.engine.last_defaulted
     }
+
+    pub(crate) fn build_cursor(&self) -> Position {
+        self.engine.pos_now()
+    }
 }
 
 impl<'a> Reader<&'a [u8]> {
