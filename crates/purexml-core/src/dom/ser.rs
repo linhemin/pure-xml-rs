@@ -294,9 +294,10 @@ struct OutScope<'a> {
     defaults: Vec<&'a str>,
     cache: HashMap<&'a str, (u64, &'a str)>,
     epoch: u64,
-    /// Arena-pointer of a URI already interned, mapping to the one canonical
-    /// `&str` for that content. Each address is hashed at most once.
-    proven: HashMap<usize, &'a str>,
+    /// `(data pointer, length)` of a URI already interned, mapping to the one
+    /// canonical `&str` for that content. Length is part of the key: an empty
+    /// slice and a longer slice can share a starting address.
+    proven: HashMap<(usize, usize), &'a str>,
     /// Content intern table. The key is the canonical string itself.
     by_text: HashMap<&'a str, &'a str>,
 }
@@ -364,19 +365,19 @@ impl<'a> OutScope<'a> {
         self.epoch = self.epoch.wrapping_add(1);
     }
 
-    /// One id per URI content. The address is only a fast path; the first
-    /// sight of an address hashes the bytes and joins the content table.
+    /// One id per URI content. `(pointer, length)` is only a fast path; the
+    /// first sight of that pair hashes the bytes and joins the content table.
     fn canonical(&mut self, uri: &'a str) -> &'a str {
-        let ptr = uri.as_ptr() as usize;
-        if let Some(canon) = self.proven.get(&ptr).copied() {
+        let key = (uri.as_ptr() as usize, uri.len());
+        if let Some(canon) = self.proven.get(&key).copied() {
             return canon;
         }
         if let Some(canon) = self.by_text.get(uri).copied() {
-            self.proven.insert(ptr, canon);
+            self.proven.insert(key, canon);
             return canon;
         }
         self.by_text.insert(uri, uri);
-        self.proven.insert(ptr, uri);
+        self.proven.insert(key, uri);
         uri
     }
 
@@ -573,7 +574,9 @@ fn children(doc: &Document, parent: u32) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
+    use super::OutScope;
     use crate::dom::Document;
+    use crate::dom::document::NodeKind;
     use crate::dom::edit::{Name, WriteOptions};
 
     #[test]
@@ -621,5 +624,102 @@ mod tests {
             doc.to_string().unwrap(),
             r#"<r xmlns="urn:b"><c xmlns=""/></r>"#
         );
+    }
+
+    #[test]
+    fn same_uri_rejects_slices_that_share_a_starting_address() {
+        let buf = "abcdef";
+        let empty = &buf[..0];
+        let five = &buf[..5];
+        let six = &buf[..6];
+        assert_eq!(empty.as_ptr(), five.as_ptr());
+        assert_eq!(five.as_ptr(), six.as_ptr());
+        let mut scope = OutScope::with_capacity(4);
+        assert!(!scope.same_uri(empty, five));
+        assert!(!scope.same_uri(five, six));
+        assert!(scope.same_uri(five, five));
+    }
+
+    #[test]
+    fn same_uri_accepts_equal_contents_at_different_addresses() {
+        let left = "urn:b".to_string();
+        let right = "urn:b".to_string();
+        assert_ne!(left.as_ptr(), right.as_ptr());
+        let mut scope = OutScope::with_capacity(2);
+        assert!(scope.same_uri(left.as_str(), right.as_str()));
+    }
+
+    #[test]
+    fn empty_default_and_nonempty_uri_round_trip() {
+        let xml = r#"<r xmlns=""><c xmlns="urn:b"><d xmlns=""/></c></r>"#;
+        let doc = Document::parse(xml).unwrap();
+        let once = doc.to_string().unwrap();
+        let again = Document::parse(&once).unwrap();
+        assert_eq!(element_shape(&doc), element_shape(&again));
+        assert_eq!(again.to_string().unwrap(), once);
+    }
+
+    fn element_shape(doc: &Document) -> Vec<(String, Option<String>)> {
+        let mut out = Vec::new();
+        let mut node = doc.root().and_then(|root| root.first_child());
+        let mut guard = doc.node_count();
+        while let Some(current) = node {
+            if guard == 0 {
+                break;
+            }
+            guard -= 1;
+            if current.kind() == Some(NodeKind::Element) {
+                let name = current.name().unwrap();
+                out.push((name.local.to_string(), name.namespace.map(str::to_string)));
+                if let Some(child) = current.first_child() {
+                    node = Some(child);
+                    continue;
+                }
+            }
+            node = current.next_sibling().or_else(|| {
+                let mut parent = current.parent();
+                while let Some(up) = parent {
+                    if let Some(next) = up.next_sibling() {
+                        return Some(next);
+                    }
+                    parent = up.parent();
+                }
+                None
+            });
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod d_c3_3_scratch_tests {
+    use super::OutScope;
+
+    /// 内部构造：同一 arena 里的空切片与非空切片同址、不同长度。
+    #[test]
+    fn same_start_different_len_is_not_same_uri() {
+        let arena = String::from("urn:b");
+        let empty = &arena[0..0];
+        let full = &arena[0..5];
+        assert_eq!(empty.as_ptr(), full.as_ptr());
+        let mut scope = OutScope::with_capacity(0);
+        assert!(
+            !scope.same_uri(empty, full),
+            "空 URI 与 urn:b 被判为同一 URI"
+        );
+        let other = String::from("urn:b");
+        assert!(scope.same_uri(&other, full), "同内容不同地址应判相同");
+    }
+
+    /// 反向：先 canonical 非空，再遇到同址空切片。
+    #[test]
+    fn same_start_reverse_order() {
+        let arena = String::from("urn:a");
+        let full = &arena[0..5];
+        let empty = &arena[0..0];
+        let mut scope = OutScope::with_capacity(0);
+        let other = String::from("urn:a");
+        assert!(scope.same_uri(&other, full));
+        assert!(!scope.same_uri(&other, empty), "空 URI 被当成 urn:a");
     }
 }

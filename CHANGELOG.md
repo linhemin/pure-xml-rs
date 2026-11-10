@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **D-C3-3.** URI address caches keyed only the starting pointer. An empty
+  slice and a longer string can share that address, so they were treated as
+  the same URI and a required `xmlns` declaration could be omitted. Cache
+  keys are now `(pointer, length)` in the serializer scope, the writer's
+  `UriIdentity`, the DOM builder's URI-span table, and the reader's expanded
+  attribute check. Equality still matches a full content compare.
 - **D-C3-2.** The writer's URI cache keyed non-canonical `Arc` addresses
   without holding those allocations. After the `Arc` was dropped, a new URI
   could reuse the address and be treated as the old one: distinct attributes

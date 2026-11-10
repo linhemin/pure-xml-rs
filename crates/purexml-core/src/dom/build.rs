@@ -113,7 +113,7 @@ pub(crate) fn build_from(
     let mut doc =
         Document::with_config(config).map_err(|err| dom_error(err, Position::start(), config))?;
     let mut open = vec![0u32];
-    let mut uris: HashMap<usize, (Arc<str>, StrSpan)> = HashMap::new();
+    let mut uris: HashMap<(usize, usize), (Arc<str>, StrSpan)> = HashMap::new();
     while let Some(event) = source.next_event()? {
         let owned = OwnedEvent::from_event(event);
         let position = source.position();
@@ -127,7 +127,7 @@ pub(crate) fn build_from(
 fn apply(
     doc: &mut Document,
     open: &mut Vec<u32>,
-    uris: &mut HashMap<usize, (Arc<str>, StrSpan)>,
+    uris: &mut HashMap<(usize, usize), (Arc<str>, StrSpan)>,
     event: OwnedEvent,
     defaulted: usize,
 ) -> Result<(), DomError> {
@@ -291,14 +291,14 @@ fn append_element(
     parent: u32,
     element: &OwnedElement,
     defaulted: usize,
-    uris: &mut HashMap<usize, (Arc<str>, StrSpan)>,
+    uris: &mut HashMap<(usize, usize), (Arc<str>, StrSpan)>,
 ) -> Result<u32, DomError> {
     let attributes = &element.attributes;
     let namespaces = &element.namespaces;
     let name = &element.name;
     let defaulted = defaulted.min(attributes.len());
     let first_default = attributes.len() - defaulted;
-    let mut seen_uris = Vec::new();
+    let mut seen_uris = Vec::<(usize, usize)>::new();
     let mut string_bytes = name.local.len() + name.prefix.as_ref().map(String::len).unwrap_or(0);
     if let Some(uri) = &name.namespace {
         string_bytes += fresh_uri_len(uris, uri, &mut seen_uris);
@@ -425,14 +425,14 @@ fn push_node(doc: &mut Document, kind: NodeKind, payload: Payload) -> u32 {
     index
 }
 
-fn uri_key(uri: &Arc<str>) -> usize {
-    Arc::as_ptr(uri) as *const u8 as usize
+fn uri_key(uri: &Arc<str>) -> (usize, usize) {
+    (Arc::as_ptr(uri) as *const u8 as usize, uri.len())
 }
 
 fn fresh_uri_len(
-    uris: &HashMap<usize, (Arc<str>, StrSpan)>,
+    uris: &HashMap<(usize, usize), (Arc<str>, StrSpan)>,
     uri: &Arc<str>,
-    seen: &mut Vec<usize>,
+    seen: &mut Vec<(usize, usize)>,
 ) -> usize {
     let key = uri_key(uri);
     if uris.contains_key(&key) || seen.contains(&key) {
@@ -444,7 +444,7 @@ fn fresh_uri_len(
 
 fn intern_uri(
     doc: &mut Document,
-    uris: &mut HashMap<usize, (Arc<str>, StrSpan)>,
+    uris: &mut HashMap<(usize, usize), (Arc<str>, StrSpan)>,
     uri: &Arc<str>,
 ) -> Result<StrSpan, DomError> {
     let key = uri_key(uri);

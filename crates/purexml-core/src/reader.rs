@@ -2139,7 +2139,7 @@ impl Engine {
         let resolved_name = self.resolve_name(input, qname, true)?;
         // Hash the interned allocation's address, not the URI bytes. `Arc<str>`
         // hashes by content, which makes a long namespace URI cost O(URI) per attribute.
-        let mut seen_exp: HashSet<(usize, String)> = HashSet::new();
+        let mut seen_exp: HashSet<((usize, usize), String)> = HashSet::new();
         let mut resolved_attrs = Vec::with_capacity(regular.len());
         for (name, value) in regular {
             let resolved = self.resolve_name(input, name, false)?;
@@ -3849,11 +3849,11 @@ fn materialize_attr(input: &[u8], attr: ResolvedAttr) -> Attribute<'_> {
     }
 }
 
-fn ns_ptr(namespace: &Option<Arc<str>>) -> usize {
+fn ns_ptr(namespace: &Option<Arc<str>>) -> (usize, usize) {
     namespace
         .as_ref()
-        .map(|uri| Arc::as_ptr(uri) as *const u8 as usize)
-        .unwrap_or(0)
+        .map(|uri| (Arc::as_ptr(uri) as *const u8 as usize, uri.len()))
+        .unwrap_or((0, 0))
 }
 
 fn materialize_ns(input: &[u8], ns: RawNs) -> Namespace<'_> {

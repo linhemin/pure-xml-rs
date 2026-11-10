@@ -211,8 +211,10 @@ fn check_ncname(name: &str) -> Result<(), WriteError> {
 /// key, so a later allocation cannot reuse that address while the cache
 /// still names it.
 struct UriIdentity {
-    /// Pointer of a held `Arc` → content id.
-    by_ptr: HashMap<usize, (Arc<str>, u32)>,
+    /// `(data pointer, length)` of a held `Arc` → content id.
+    /// Length is part of the key so two slices that start at the same
+    /// address are not treated as one URI.
+    by_ptr: HashMap<(usize, usize), (Arc<str>, u32)>,
     /// Canonical `Arc` for each distinct URI content → id.
     by_text: HashMap<Arc<str>, u32>,
     next: u32,
@@ -228,8 +230,8 @@ impl UriIdentity {
     }
 
     fn canonical(&mut self, uri: &Arc<str>) -> usize {
-        let ptr = Arc::as_ptr(uri) as *const u8 as usize;
-        if let Some((_, id)) = self.by_ptr.get(&ptr) {
+        let key = (Arc::as_ptr(uri) as *const u8 as usize, uri.len());
+        if let Some((_, id)) = self.by_ptr.get(&key) {
             return *id as usize;
         }
         let id = if let Some(id) = self.by_text.get(uri).copied() {
@@ -241,7 +243,7 @@ impl UriIdentity {
             id
         };
         // Hold this allocation. Dropping it would let a different URI reuse `ptr`.
-        self.by_ptr.insert(ptr, (Arc::clone(uri), id));
+        self.by_ptr.insert(key, (Arc::clone(uri), id));
         id as usize
     }
 }
