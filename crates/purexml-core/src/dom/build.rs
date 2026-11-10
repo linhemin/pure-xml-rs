@@ -298,16 +298,17 @@ fn append_element(
     let name = &element.name;
     let defaulted = defaulted.min(attributes.len());
     let first_default = attributes.len() - defaulted;
+    let mut seen_uris = Vec::new();
     let mut string_bytes = name.local.len() + name.prefix.as_ref().map(String::len).unwrap_or(0);
     if let Some(uri) = &name.namespace {
-        string_bytes += fresh_uri_len(uris, uri);
+        string_bytes += fresh_uri_len(uris, uri, &mut seen_uris);
     }
     for attr in attributes {
         string_bytes += attr.name.local.len()
             + attr.value.len()
             + attr.name.prefix.as_ref().map(String::len).unwrap_or(0);
         if let Some(uri) = &attr.name.namespace {
-            string_bytes += fresh_uri_len(uris, uri);
+            string_bytes += fresh_uri_len(uris, uri, &mut seen_uris);
         }
     }
     for ns in namespaces {
@@ -428,12 +429,17 @@ fn uri_key(uri: &Arc<str>) -> usize {
     Arc::as_ptr(uri) as *const u8 as usize
 }
 
-fn fresh_uri_len(uris: &HashMap<usize, (Arc<str>, StrSpan)>, uri: &Arc<str>) -> usize {
-    if uris.contains_key(&uri_key(uri)) {
-        0
-    } else {
-        uri.len()
+fn fresh_uri_len(
+    uris: &HashMap<usize, (Arc<str>, StrSpan)>,
+    uri: &Arc<str>,
+    seen: &mut Vec<usize>,
+) -> usize {
+    let key = uri_key(uri);
+    if uris.contains_key(&key) || seen.contains(&key) {
+        return 0;
     }
+    seen.push(key);
+    uri.len()
 }
 
 fn intern_uri(

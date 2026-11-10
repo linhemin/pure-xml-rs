@@ -143,7 +143,12 @@ pub struct ParserConfig {
     ///
     /// The pull parser does not read this field. See [`DEFAULT_MAX_NODES`].
     pub max_nodes: u64,
-    /// Logical DOM bytes. The pull parser does not read this field.
+    /// Logical DOM bytes, measured like
+    /// [`crate::dom::Document::approx_heap_bytes`]: arena UTF-8 length plus
+    /// the record size of every node, element, attribute, and namespace
+    /// declaration. Shared URI spans count once. The pull parser does not
+    /// read this field. A document whose total equals the cap is kept; one
+    /// more byte is [`crate::LimitKind::DomBytes`].
     /// See [`DEFAULT_MAX_DOM_BYTES`].
     pub max_dom_bytes: u64,
 }

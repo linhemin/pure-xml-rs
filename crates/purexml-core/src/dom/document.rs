@@ -293,9 +293,17 @@ impl Document {
         self.nodes.len() as u64
     }
 
-    /// Logical heap bytes. Allocator capacity is not included.
+    /// Logical DOM bytes. Allocator capacity and spare `Vec` capacity are
+    /// not included.
     ///
+    /// The sum is the arena's UTF-8 length plus `size_of` times the number of
+    /// node, element, attribute, and namespace-declaration records. A URI
+    /// span shared by several names is stored once and counted once.
     /// Tombstones and attribute records that were copied aside still count.
+    ///
+    /// [`ParserConfig::max_dom_bytes`] uses this same total. A document whose
+    /// total equals the cap is kept. A build step whose total would be
+    /// greater is rejected with [`crate::LimitKind::DomBytes`].
     #[doc(hidden)]
     pub fn approx_heap_bytes(&self) -> u64 {
         (self.arena.len() as u64)

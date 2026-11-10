@@ -115,8 +115,12 @@ pub enum LimitKind {
     /// Logical DOM bytes ([`crate::dom::Document::approx_heap_bytes`]), not
     /// allocator capacity.
     ///
-    /// Checked while building a DOM, after the event that would grow the
-    /// arena. `actual` is the byte count that would result.
+    /// The meter is the arena's UTF-8 length plus one record size for each
+    /// node, element, attribute, and namespace declaration. A URI span shared
+    /// by several names is stored once and counted once. A build whose total
+    /// equals `max_dom_bytes` is kept. The next byte over that cap is
+    /// rejected. `actual` is the byte count that reserve predicted for the
+    /// step that crossed the cap.
     DomBytes,
 }
 
