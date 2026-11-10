@@ -22,6 +22,10 @@ pub enum WriteError {
     Io(std::io::Error),
     /// The event cannot be written as well-formed XML.
     Syntax(String),
+    /// `Document::write_to` or `Document::to_string` found no element child.
+    ///
+    /// A subtree written with `NodeRef::write_to` is not subject to this.
+    NoRootElement,
 }
 
 impl std::fmt::Display for WriteError {
@@ -29,6 +33,7 @@ impl std::fmt::Display for WriteError {
         match self {
             Self::Io(err) => write!(f, "write error: {err}"),
             Self::Syntax(msg) => write!(f, "write error: {msg}"),
+            Self::NoRootElement => write!(f, "write error: document has no root element"),
         }
     }
 }
@@ -37,7 +42,7 @@ impl std::error::Error for WriteError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(err) => Some(err),
-            Self::Syntax(_) => None,
+            Self::Syntax(_) | Self::NoRootElement => None,
         }
     }
 }
@@ -50,7 +55,7 @@ impl From<std::io::Error> for WriteError {
 
 /// Escape `&`, `<`, `>`, and CR for character data.
 ///
-/// CR is written as `&#13;` so a later parse does not turn it into a line feed.
+/// CR is written as `&#xD;` so a later parse does not turn it into a line feed.
 /// Every `>` is escaped, so `]]>` cannot close character data early.
 pub fn escape_text(input: &str) -> Cow<'_, str> {
     if !needs_text_escape(input) {
@@ -92,7 +97,7 @@ fn escape_into(input: &str, attribute: bool) -> String {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' if attribute => out.push_str("&quot;"),
-            '\r' => out.push_str("&#13;"),
+            '\r' => out.push_str("&#xD;"),
             '\t' if attribute => out.push_str("&#9;"),
             '\n' if attribute => out.push_str("&#10;"),
             other => out.push(other),
