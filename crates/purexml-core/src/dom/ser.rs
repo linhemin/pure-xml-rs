@@ -96,7 +96,7 @@ fn write_at<W: Write>(
     writer: &mut crate::Writer<W>,
     options: WriteOptions,
 ) -> Result<(), WriteError> {
-    let mut scope = OutScope::empty();
+    let mut scope = OutScope::with_capacity(doc.ns_decls.len());
     scope.push(Some("xml"), crate::event::XML_NAMESPACE);
     let mut arcs = SpanArcs::default();
     let mut stack = vec![Job::Open(index)];
@@ -284,47 +284,107 @@ struct Binding<'a> {
 /// this scope. A subtree write starts from a fresh scope, so its root stays
 /// self-contained.
 struct OutScope<'a> {
-    map: HashMap<Option<String>, Vec<&'a str>>,
-    undo: Vec<(usize, Option<String>)>,
-    depth: usize,
+    /// One frame per open element, plus a base frame for `xml`.
+    ///
+    /// Declarations are appended here instead of inserted into a map of every
+    /// prefix. A map that grows with the declaration count rehashes and makes
+    /// `ns_scaled` look superlinear. Lookups scan the open frames; a cache
+    /// remembers a prefix until the next push or pop.
+    frames: Vec<Vec<(Option<&'a str>, &'a str)>>,
+    defaults: Vec<&'a str>,
+    cache: HashMap<&'a str, (u64, &'a str)>,
+    epoch: u64,
+    /// Arena-pointer of a URI already interned, mapping to the one canonical
+    /// `&str` for that content. Each address is hashed at most once.
+    proven: HashMap<usize, &'a str>,
+    /// Content intern table. The key is the canonical string itself.
+    by_text: HashMap<&'a str, &'a str>,
 }
 
 impl<'a> OutScope<'a> {
-    fn empty() -> Self {
+    fn with_capacity(decls: usize) -> Self {
+        let mut frames = Vec::with_capacity(64);
+        frames.push(Vec::new());
         Self {
-            map: HashMap::new(),
-            undo: Vec::new(),
-            depth: 0,
+            frames,
+            defaults: Vec::new(),
+            cache: HashMap::new(),
+            epoch: 1,
+            proven: HashMap::with_capacity(decls.min(64)),
+            by_text: HashMap::with_capacity(decls.min(64)),
         }
     }
 
-    fn lookup(&self, prefix: Option<&str>) -> Option<&'a str> {
-        let key = prefix.map(str::to_string);
-        self.map.get(&key).and_then(|stack| stack.last().copied())
+    fn lookup(&mut self, prefix: Option<&str>) -> Option<&'a str> {
+        match prefix {
+            None => self.defaults.last().copied(),
+            Some(prefix) => self.lookup_prefix(prefix),
+        }
     }
 
-    fn push(&mut self, prefix: Option<&str>, uri: &'a str) {
-        let key = prefix.map(str::to_string);
-        self.map.entry(key.clone()).or_default().push(uri);
-        self.undo.push((self.depth, key));
+    fn lookup_prefix(&mut self, prefix: &str) -> Option<&'a str> {
+        if let Some(&(epoch, uri)) = self.cache.get(prefix)
+            && epoch == self.epoch
+        {
+            return Some(uri);
+        }
+        for frame in self.frames.iter().rev() {
+            for (bound, uri) in frame.iter().rev() {
+                if bound.is_some_and(|bound| bound == prefix) {
+                    let uri = *uri;
+                    let key = bound.unwrap();
+                    self.cache.insert(key, (self.epoch, uri));
+                    return Some(uri);
+                }
+            }
+        }
+        None
+    }
+
+    fn push(&mut self, prefix: Option<&'a str>, uri: &'a str) {
+        if prefix.is_none() {
+            self.defaults.push(uri);
+        }
+        self.frames
+            .last_mut()
+            .expect("base frame")
+            .push((prefix, uri));
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     fn enter(&mut self) {
-        self.depth += 1;
+        self.frames.push(Vec::new());
     }
 
     fn leave(&mut self) {
-        while self
-            .undo
-            .last()
-            .is_some_and(|(depth, _)| *depth == self.depth)
-        {
-            let (_, key) = self.undo.pop().expect("undo entry");
-            if let Some(stack) = self.map.get_mut(&key) {
-                stack.pop();
-            }
+        let frame = self.frames.pop().expect("element frame");
+        let defaults = frame.iter().filter(|(prefix, _)| prefix.is_none()).count();
+        let len = self.defaults.len();
+        self.defaults.truncate(len.saturating_sub(defaults));
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// One id per URI content. The address is only a fast path; the first
+    /// sight of an address hashes the bytes and joins the content table.
+    fn canonical(&mut self, uri: &'a str) -> &'a str {
+        let ptr = uri.as_ptr() as usize;
+        if let Some(canon) = self.proven.get(&ptr).copied() {
+            return canon;
         }
-        self.depth = self.depth.saturating_sub(1);
+        if let Some(canon) = self.by_text.get(uri).copied() {
+            self.proven.insert(ptr, canon);
+            return canon;
+        }
+        self.by_text.insert(uri, uri);
+        self.proven.insert(ptr, uri);
+        uri
+    }
+
+    /// True when both strings are the same namespace URI.
+    fn same_uri(&mut self, existing: &'a str, uri: &'a str) -> bool {
+        let left = self.canonical(existing);
+        let right = self.canonical(uri);
+        left.as_ptr() == right.as_ptr() && left.len() == right.len()
     }
 }
 
@@ -457,7 +517,7 @@ fn align_scope<'a>(
     uri: &'a str,
 ) -> Result<(), WriteError> {
     if let Some(existing) = scope.lookup(prefix) {
-        return if existing == uri {
+        return if scope.same_uri(existing, uri) {
             Ok(())
         } else {
             Err(WriteError::Syntax(format!(
