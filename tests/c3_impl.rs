@@ -361,12 +361,13 @@ fn complexity_probe_release() {
             xml.push_str(&format!("<p:e a=\"{i}\"/>"));
         }
         xml.push_str("</r>");
-        let bytes = xml.len();
         let secs = time_iters(|| {
             let doc = Document::parse_with_config(&xml, &wide).unwrap();
             let _ = doc.to_string().unwrap();
         });
-        uri_points.push((bytes, secs));
+        // The 64 KiB URI dominates the byte count, so the log-log fit uses
+        // the leaf count. A byte fit would treat a tiny size change as huge.
+        uri_points.push((leaves as usize, secs));
     }
     fit("long-uri-serialize", &uri_points);
 }
