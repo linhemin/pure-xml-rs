@@ -6,6 +6,49 @@
 
 解析器不包含任何 `unsafe`，也没有运行时依赖或 C 绑定。它**从不**根据 system id / public id 打开文件或网络；调用方传入的 `BufRead` 只是字节来源，解析器不会把外部标识符解释成路径。
 
+## 交接（必读）
+
+这条规则是仓库所有者定的，**必须遵守**。改这个仓库的人和 AI 都算在内。多个 AI 会各自开工，后一个人看不到前一个人的对话。
+
+库的用法从下一节「用法」开始。这一节是交接，下面各节仍是库文档。
+
+1. **开工前读完**这一节和 [`PROGRESS.md`](PROGRESS.md)。对照代码、`CHANGELOG.md` 的 `[Unreleased]`、`CONTRIBUTING.md`、测试和当时仍开着的 PR / issue。对话记录不能代替这份文档。
+2. **每次会话结束都更新**下面的「当前状态」和 [`PROGRESS.md`](PROGRESS.md)。写上日期、这次改了什么、还剩什么、阻塞，以及相关 PR 或 issue 链接。没有链接就写「无」。只写仓库里对得上的事实，不新编里程碑、日期、PR 号或已经完成的工作。
+3. **额度、上下文或用量预算快用完时，先写交接。** 功能做到一半也停下来，把这一节和 [`PROGRESS.md`](PROGRESS.md) 写完再结束。只提交代码、没有交接的会话是未完成的。
+
+### 当前状态（2026-11-10）
+
+`main` 为 `4a5cafb`（2026-11-04 合并 [PR #5](https://github.com/linhemin/pure-xml-rs/pull/5)）。版本 `0.1.0`，没有 tag。2026-11-10 查过 GitHub：没有 issue。未合并的有草稿 [PR #6](https://github.com/linhemin/pure-xml-rs/pull/6)，以及本交接 [PR #7](https://github.com/linhemin/pure-xml-rs/pull/7)。本轮没有重跑测试、W3C 或 bench。
+
+**已经在 main 上**
+
+- 流式拉取解析器（`from_bytes` / `from_str` / `from_vec` / `from_reader`）和基础 `Writer`。外部实体与外部 DTD 不加载。只接受 UTF-8。
+- [PR #2](https://github.com/linhemin/pure-xml-rs/pull/2)（M2 PR-A）：属性值按字符限长（D11）；Reader 与 Writer 共用 NCName / QName（D23）。
+- [PR #3](https://github.com/linhemin/pure-xml-rs/pull/3)（M2 PR-B）：按完整顶层 token 增量读取。
+- [PR #4](https://github.com/linhemin/pure-xml-rs/pull/4)：文本里的 `>` 计入 `max_text_len`（D37）。
+- [PR #5](https://github.com/linhemin/pure-xml-rs/pull/5)（M2-C1）：只读 DOM arena。可以遍历；`max_nodes` 默认 10_000_000，`max_dom_bytes` 默认 1 GiB。解析不建节点。增删改只在 `#[cfg(test)]` 里。没有公开修改 API，也没有 DOM 序列化。
+- `tests/w3c/known-failures.txt` 有 16 条，类别都是策略（外部实体、UTF-16、命名空间、第 5 版名字）。套件不入库。
+
+**正在进行**
+
+- 草稿 [PR #6](https://github.com/linhemin/pure-xml-rs/pull/6)（分支 `cursor/purexml-m2c2-mutate`，头 `7c4b750`，2026-11-04）：DOM 修改和序列化，**未合并**。公开 API 包括 `create_element` / `create_text` / `create_cdata` / `create_comment` / `create_pi`、插入与删除、属性和命名空间、`Document::write_to` / `to_string`。`create_doctype` 仍是 `pub(crate)`。`tests/c2_m2.rs` 的 `make_doctype` 固定返回 `None`，因此 `doctype_public_without_system_rejected` 和 `doctype_omit_option_drops_doctype` 仍是 `#[ignore]`，在等公开的文档类型构建入口。分支上的 `edit.rs` 已有 crate 内测试拒绝「只有 PUBLIC、没有 SYSTEM」。PR 说明写到 `c0f49a0`，其后还有 `9d9bddc` 和 `7c4b750`，说明正文没有再改。这个分支仍不从解析器建树。
+
+**下一步**
+
+1. 先读 [`PROGRESS.md`](PROGRESS.md) 和 PR #6 的分支。不要在 `main` 上再写一套 DOM 修改或序列化。
+2. 接着做 PR #6 里还没落地的公开文档类型入口。两个被忽略的集成测试就卡在这里。`create_doctype` 保持 crate 私有是该分支上的决定（公开构造可以写出 `SYSTEM` 标识符）。要改可见性，先把这个风险和序列化规则一起定下来。
+3. PR #6 合入之后，`main` 上仍然没有：从 `Reader` 建 DOM（`dom/document.rs` 写着 “Parsing does not build nodes yet.”，PR #6 分支上这句还在）、XPath、校验，以及文首说的完整往返。`writer.rs` 写明 0.x 的 `Writer` 不是完整序列化器。这些项没有未合并的 PR，仓库里也没有排好的先后。不要新编里程碑编号。
+4. 文首和「留到 M2」仍把 DOM 整项留到后面；「模块」没有 `dom`；`CHANGELOG.md` 的 `[Unreleased]` 没有 PR #3 的增量读取，也没有 PR #5 的 DOM。本轮只加交接，用法、安全默认、编码、模块和许可证保持原样。其余过时句子见 [`PROGRESS.md`](PROGRESS.md)。
+
+**每次怎么更新**
+
+| 写在哪 | 写什么 |
+| --- | --- |
+| 这一节的「当前状态」 | 压缩到只打开 README 就能接着做：已落地、正在进行、下一步 |
+| [`PROGRESS.md`](PROGRESS.md) 顶部新的一节 | 日期、改了什么、还剩什么、阻塞、PR 或 issue 链接 |
+
+两处一起改。预算不够时，停掉功能修改，先完成这两处再提交。
+
 ## 用法
 
 ```rust
