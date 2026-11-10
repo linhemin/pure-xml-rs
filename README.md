@@ -18,7 +18,7 @@
 
 ### 当前状态（2026-11-10）
 
-`main` 为 `4a5cafb`（2026-11-04 合并 [PR #5](https://github.com/linhemin/pure-xml-rs/pull/5)）。版本 `0.1.0`，没有 tag。2026-11-10 查过 GitHub：没有 issue。未合并的有草稿 [PR #6](https://github.com/linhemin/pure-xml-rs/pull/6)，以及本交接 [PR #7](https://github.com/linhemin/pure-xml-rs/pull/7)。本轮没有重跑测试、W3C 或 bench。
+`main` 为 `1c4bdae5`（2026-11-10 合并 [PR #7](https://github.com/linhemin/pure-xml-rs/pull/7)，该 PR 只改了 `PROGRESS.md` 和 `README.md`）。代码在 `efb8be1`（合并 [PR #6](https://github.com/linhemin/pure-xml-rs/pull/6)）。版本 `0.1.0`。没有 issue。
 
 **已经在 main 上**
 
@@ -26,19 +26,22 @@
 - [PR #2](https://github.com/linhemin/pure-xml-rs/pull/2)（M2 PR-A）：属性值按字符限长（D11）；Reader 与 Writer 共用 NCName / QName（D23）。
 - [PR #3](https://github.com/linhemin/pure-xml-rs/pull/3)（M2 PR-B）：按完整顶层 token 增量读取。
 - [PR #4](https://github.com/linhemin/pure-xml-rs/pull/4)：文本里的 `>` 计入 `max_text_len`（D37）。
-- [PR #5](https://github.com/linhemin/pure-xml-rs/pull/5)（M2-C1）：只读 DOM arena。可以遍历；`max_nodes` 默认 10_000_000，`max_dom_bytes` 默认 1 GiB。解析不建节点。增删改只在 `#[cfg(test)]` 里。没有公开修改 API，也没有 DOM 序列化。
+- [PR #5](https://github.com/linhemin/pure-xml-rs/pull/5)（M2-C1）：只读 DOM arena。`max_nodes` 默认 10_000_000，`max_dom_bytes` 默认 1 GiB。
+- [PR #6](https://github.com/linhemin/pure-xml-rs/pull/6)（M2-C2）：DOM 修改和序列化。`create_doctype` 仍是 `pub(crate)`。这一版还不从解析器建 DOM。
 - `tests/w3c/known-failures.txt` 有 16 条，类别都是策略（外部实体、UTF-16、命名空间、第 5 版名字）。套件不入库。
 
 **正在进行**
 
-- 草稿 [PR #6](https://github.com/linhemin/pure-xml-rs/pull/6)（分支 `cursor/purexml-m2c2-mutate`，头 `7c4b750`，2026-11-04）：DOM 修改和序列化，**未合并**。公开 API 包括 `create_element` / `create_text` / `create_cdata` / `create_comment` / `create_pi`、插入与删除、属性和命名空间、`Document::write_to` / `to_string`。`create_doctype` 仍是 `pub(crate)`。`tests/c2_m2.rs` 的 `make_doctype` 固定返回 `None`，因此 `doctype_public_without_system_rejected` 和 `doctype_omit_option_drops_doctype` 仍是 `#[ignore]`，在等公开的文档类型构建入口。分支上的 `edit.rs` 已有 crate 内测试拒绝「只有 PUBLIC、没有 SYSTEM」。PR 说明写到 `c0f49a0`，其后还有 `9d9bddc` 和 `7c4b750`，说明正文没有再改。这个分支仍不从解析器建树。
+- 草稿 [PR #8](https://github.com/linhemin/pure-xml-rs/pull/8)（分支 `cursor/purexml-m2c3-parse`）：C3，`Document::parse` / `from_bytes` / `from_reader` 以及三个 `_with_config`，从解析事件线性建 DOM。D-C3-1、D-C3-2、DomBytes 上界这三项已在该分支修复。Tester staging 已同步到 v10.9.1。**未合并。**
 
 **下一步**
 
-1. 先读 [`PROGRESS.md`](PROGRESS.md) 和 PR #6 的分支。不要在 `main` 上再写一套 DOM 修改或序列化。
-2. 接着做 PR #6 里还没落地的公开文档类型入口。两个被忽略的集成测试就卡在这里。`create_doctype` 保持 crate 私有是该分支上的决定（公开构造可以写出 `SYSTEM` 标识符）。要改可见性，先把这个风险和序列化规则一起定下来。
-3. PR #6 合入之后，`main` 上仍然没有：从 `Reader` 建 DOM（`dom/document.rs` 写着 “Parsing does not build nodes yet.”，PR #6 分支上这句还在）、XPath、校验，以及文首说的完整往返。`writer.rs` 写明 0.x 的 `Writer` 不是完整序列化器。这些项没有未合并的 PR，仓库里也没有排好的先后。不要新编里程碑编号。
-4. 文首和「留到 M2」仍把 DOM 整项留到后面；「模块」没有 `dom`；`CHANGELOG.md` 的 `[Unreleased]` 没有 PR #3 的增量读取，也没有 PR #5 的 DOM。本轮只加交接，用法、安全默认、编码、模块和许可证保持原样。其余过时句子见 [`PROGRESS.md`](PROGRESS.md)。
+1. Tester 对 PR #8 做全量复验。
+2. Lead 批准后再合并 PR #8。合并前保持草稿。
+3. M2 收尾门槛只在合并后的 main 上做：每个 fuzz 目标跑 2 小时，用 g++ 做完整 ASan 构建；Tester 重跑 config/1KB、attr-dense/1KB、ns-dense/1MB 三组 bench。
+4. M2 结束后停下来等用户确认。不要启动 M2b。
+
+文首和「留到 M2」仍把 DOM 整项留到后面；「模块」没有 `dom`。本轮只改交接。用法、安全默认、编码、模块和许可证保持原样。其余过时句子见 [`PROGRESS.md`](PROGRESS.md)。
 
 **每次怎么更新**
 

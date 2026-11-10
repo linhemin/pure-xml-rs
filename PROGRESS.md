@@ -16,6 +16,13 @@
 
 ## 会话记录
 
+### 2026-11-10 — C3 在草稿 PR #8，交接改到这一步
+
+- 改了什么：这一笔只改 `PROGRESS.md` 和 `README.md`。在此之前，分支 `cursor/purexml-m2c3-parse` 已实现 C3：`Document::parse` / `from_bytes` / `from_reader` 以及三个 `_with_config`，从解析事件线性建 DOM。D-C3-1（DOM 序列化按 URI 内容逐元素比较而放大）、D-C3-2（Writer 的 URI 缓存不持有作为键的 `Arc`）、DomBytes 预估大于实际占用，这三项已在该分支修复。Tester staging 已同步到 v10.9.1。然后用普通 merge 把 `origin/main` `1c4bdae5c0ca272683ec747a00ed63891a6a7655` 合进来。该 main 是 [PR #7](https://github.com/linhemin/pure-xml-rs/pull/7)，相对 [PR #6](https://github.com/linhemin/pure-xml-rs/pull/6) 的合并提交 `efb8be1` 只多了这两份交接文档。没有改解析器、写出器、DOM 或测试。
+- 还剩什么：见「下一步」。
+- 阻塞：无。PR #8 仍是草稿。
+- 链接：[PR #8](https://github.com/linhemin/pure-xml-rs/pull/8)。验证数字写在该 PR 说明里。
+
 ### 2026-11-10 — 写交接规则和现状快照
 
 - 改了什么：在 `README.md` 增加「交接（必读）」（简体中文，含强制规则和当前状态）。新增本文件。没有改解析器、写出器、DOM、测试、用法示例、安全默认、编码、模块列表或许可证。
@@ -25,6 +32,19 @@
 - 本轮没有运行 `cargo test`、W3C 或 bench。下面的测试数字若来自 PR 说明，会标明日期，不当成 2026-11-10 的新结果。
 
 ## 下一步
+
+[PR #6](https://github.com/linhemin/pure-xml-rs/pull/6) 已随 `efb8be1` 在 `main` 上。C3 在草稿 [PR #8](https://github.com/linhemin/pure-xml-rs/pull/8)（分支 `cursor/purexml-m2c3-parse`），还没合并。按这个顺序做，不要跳：
+
+1. Tester 对 PR #8 做全量复验。
+2. Lead 批准后再合并 PR #8。合并前保持草稿。
+3. M2 收尾门槛只在合并后的 main 上做：
+   - 每个 fuzz 目标跑 2 小时，用 g++ 做完整 ASan 构建。
+   - Tester 重跑 config/1KB、attr-dense/1KB、ns-dense/1MB 三组 bench。
+4. M2 结束后停下来等用户确认。不要启动 M2b。
+
+下面是 PR #7 写交接时的记录，当时把 PR #6 当成还没合并。以本节开头和 README「当前状态」为准。
+
+### PR #7 当时写下的顺序（已过时）
 
 1. 读草稿 [PR #6](https://github.com/linhemin/pure-xml-rs/pull/6) 的分支 `cursor/purexml-m2c2-mutate`（调查时头为 `7c4b750`）。不要在 `main` 上平行再写一套 DOM 修改或序列化。
 2. PR #6 还缺公开的文档类型构建入口。`create_doctype` 是 `pub(crate)`。`tests/c2_m2.rs` 的 `make_doctype` 固定返回 `None`，所以下面两个集成测试仍是 `#[ignore]`：
