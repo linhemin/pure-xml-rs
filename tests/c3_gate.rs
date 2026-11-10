@@ -9,9 +9,12 @@
 //!    与对应的 Reader 路径结论完全一致：都成功时结构指纹（canon_doc == canon_events）和
 //!    doctype（name/system/public）相同；都失败时整个 `purexml::Error` 相同（kind 含
 //!    limit/actual、position、message——设计 §2 要求“原样返回”）。
-//! 2. `max_nodes_boundary_differential` / `max_dom_bytes_boundary_differential`：
-//!    限值恰等于所需 → 五条路径都成功且结果相同；限值 = 所需 − 1（即输入需要“限值 + 1”）→
-//!    五条路径都报 SecurityLimit{NodeCount|DomBytes}，limit/actual/position 五路一致。
+//! 2. `max_nodes_boundary_differential` / `max_dom_bytes_boundary_differential`（v10.9.1，
+//!    Lead 11-10 16:50 裁定 3）：“实际用量”从建好的树上量出（节点数靠遍历，DOM 字节靠
+//!    approx_heap_bytes 计量口径），不用实现的 reserve 预估。三档：恰等于 → 五条路径都成功；
+//!    少 1 → 五条路径都报 SecurityLimit{NodeCount|DomBytes}（limit=实际−1，actual>limit），
+//!    kind/position 五路一致；+1 → 都成功。另对每条路径二分“最小可成功限值”，必须 = 实际用量。
+//!    **89f6e78 上 max_dom_bytes 预期失败**（long-uri：预留 > 实际，恰等于被拒）。
 //! 3. `specified_default_attrs_all_paths`：ATTLIST 默认属性 specified=false（T-Q11 / Q4），五路一致。
 //!
 //! 运行：cargo test --test c3_gate（debug 即可，不计时）
@@ -247,49 +250,97 @@ fn expect_limit(e: &Error, want: LimitKind, limit: u64) -> Result<u64, String> {
     }
 }
 
-/// 五条路径：恰等于 → 都成功且结构/堆字节相同；少 1 → 都报同一个限额错误。
+type SetLimit = fn(ParserConfig, u64) -> ParserConfig;
+
+/// 单条路径在限值 `lim` 下是否成功（路径按名字取，五条路径各自独立二分）。
+fn path_ok(data: &[u8], set: SetLimit, lim: u64, path: &str) -> bool {
+    dom_paths_cfg(data, &set(ParserConfig::default(), lim))
+        .into_iter()
+        .find(|(p, _)| *p == path)
+        .map(|(_, r)| r.is_ok())
+        .expect("路径存在")
+}
+
+/// 二分：该路径能成功的最小限值（在 [0, hi] 内；hi 必须能成功）。
+/// 只依赖“成功/失败”这一外部可观察结果，不读实现的 reserve 预估。
+fn bisect_min_ok(data: &[u8], set: SetLimit, hi: u64, path: &str) -> Option<u64> {
+    if !path_ok(data, set, hi, path) {
+        return None;
+    }
+    let (mut lo, mut hi) = (0u64, hi); // 不变式：hi 成功；lo 之下未知/失败
+    if path_ok(data, set, 0, path) {
+        return Some(0);
+    }
+    // lo=0 失败
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if path_ok(data, set, mid, path) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    Some(hi)
+}
+
+/// 三档边界（Lead 11-10 16:50 裁定 3）：`need` = 实际用量（由调用方从建好的树测出）。
+/// - 限值 = need     → 五条路径都成功，结构相同；
+/// - 限值 = need − 1 → 五条路径都报 SecurityLimit{kind, limit=need−1, actual>limit}，kind/position 五路一致；
+/// - 限值 = need + 1 → 五条路径都成功，结构相同；
+/// - 另：每条路径二分出“能成功的最小限值”，必须恰好 = need（抓“预留 > 实际”导致的提前拒绝）。
 fn boundary(
     id: &str,
     data: &[u8],
     need: u64,
     kind: LimitKind,
-    set: fn(ParserConfig, u64) -> ParserConfig,
+    set: SetLimit,
     exact_actual: bool,
 ) -> Vec<String> {
     let mut fails = Vec::new();
     let base = Document::from_bytes(data).expect("语料须合法");
     let want = canon_doc(&base);
-    // 恰等于
-    for (p, r) in dom_paths_cfg(data, &set(ParserConfig::default(), need)) {
-        match r {
-            Ok(doc) => {
-                if canon_doc(&doc) != want {
-                    fails.push(format!("{id} {kind:?}={need} {p}：结构不同"));
+    // 恰等于 / +1
+    for lim in [need, need + 1] {
+        let tag = if lim == need { "恰等于" } else { "+1" };
+        for (p, r) in dom_paths_cfg(data, &set(ParserConfig::default(), lim)) {
+            match r {
+                Ok(doc) => {
+                    if canon_doc(&doc) != want {
+                        fails.push(format!("{id} {kind:?}={lim}（{tag}）{p}：结构不同"));
+                    }
+                    if doc.approx_heap_bytes() != base.approx_heap_bytes() {
+                        fails.push(format!(
+                            "{id} {kind:?}={lim}（{tag}）{p}：approx_heap_bytes {} != {}",
+                            doc.approx_heap_bytes(),
+                            base.approx_heap_bytes()
+                        ));
+                    }
                 }
-                if doc.approx_heap_bytes() != base.approx_heap_bytes() {
-                    fails.push(format!(
-                        "{id} {kind:?}={need} {p}：approx_heap_bytes {} != {}",
-                        doc.approx_heap_bytes(),
-                        base.approx_heap_bytes()
-                    ));
-                }
+                Err(e) => fails.push(format!(
+                    "{id} {kind:?}={lim}（{tag}，实际用量 {need}）{p} 被拒绝：{e:?}"
+                )),
             }
-            Err(e) => fails.push(format!("{id} {kind:?} 恰等于 {need} 时 {p} 失败：{e:?}")),
         }
     }
     // 少 1
+    if need == 0 {
+        fails.push(format!("{id} {kind:?}：实际用量为 0，语料无效"));
+        return fails;
+    }
     let lim = need - 1;
     let mut first: Option<(String, Error)> = None;
     for (p, r) in dom_paths_cfg(data, &set(ParserConfig::default(), lim)) {
         match r {
-            Ok(_) => fails.push(format!("{id} {kind:?}={lim}（需 {need}）{p}：未报错")),
+            Ok(_) => fails.push(format!(
+                "{id} {kind:?}={lim}（少 1，实际用量 {need}）{p}：未报错"
+            )),
             Err(e) => {
                 match expect_limit(&e, kind, lim) {
                     Ok(actual) if exact_actual && actual != need => fails.push(format!(
-                        "{id} {kind:?}={lim} {p}：actual {actual} != 需要 {need}"
+                        "{id} {kind:?}={lim} {p}：actual {actual} != 实际用量 {need}"
                     )),
                     Ok(_) => {}
-                    Err(m) => fails.push(format!("{id} {p}：{m}")),
+                    Err(m) => fails.push(format!("{id} {kind:?}={lim}（少 1）{p}：{m}")),
                 }
                 if e.position.offset > data.len() as u64 {
                     fails.push(format!("{id} {p}：offset {} 超出输入", e.position.offset));
@@ -307,6 +358,23 @@ fn boundary(
             }
         }
     }
+    // 二分：最小可成功限值 = 实际用量（上界取 4×need+64，给“预留过大”留出可测范围）
+    let paths: Vec<&str> = dom_paths_cfg(data, &set(ParserConfig::default(), u64::MAX))
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect();
+    for p in paths {
+        match bisect_min_ok(data, set, need.saturating_mul(4).saturating_add(64), p) {
+            Some(m) if m == need => {}
+            Some(m) => fails.push(format!(
+                "{id} {kind:?} {p}：二分得最小可成功限值 {m}，实际用量 {need}（差 {:+}）",
+                m as i64 - need as i64
+            )),
+            None => fails.push(format!(
+                "{id} {kind:?} {p}：限值 4×实际用量+64 仍被拒绝（实际用量 {need}）"
+            )),
+        }
+    }
     fails
 }
 
@@ -314,8 +382,9 @@ fn boundary(
 fn max_nodes_boundary_differential() {
     let mut fails = Vec::new();
     for (id, s) in limit_corpus() {
+        // 实际用量：遍历建好的树数出的节点数（文档节点 + 全部后代），不读实现内部计数
         let n = count_nodes(&Document::from_bytes(s.as_bytes()).unwrap());
-        // 节点逐个 reserve(1, …)，失败时 actual = 已有 + 1 = 需要数
+        // 节点逐个计数，失败时 actual = 需要数
         fails.extend(boundary(
             id,
             s.as_bytes(),
@@ -336,15 +405,27 @@ fn max_nodes_boundary_differential() {
     assert!(fails.is_empty(), "{}", fails.join("\n"));
 }
 
+/// 实际用量：不限额解析后在建好的树上量出的 DOM 字节（`approx_heap_bytes` 只读各 Vec 长度，
+/// 是 max_dom_bytes 的计量口径本身，不是 reserve 的预估）。五条路径各量一次，必须相同。
+fn measured_dom_bytes(id: &str, data: &[u8], fails: &mut Vec<String>) -> u64 {
+    let mut got: Vec<(&str, u64)> = Vec::new();
+    for (p, r) in dom_paths_cfg(data, &ParserConfig::default()) {
+        got.push((p, r.expect("语料须合法").approx_heap_bytes()));
+    }
+    let b = got[0].1;
+    if got.iter().any(|(_, v)| *v != b) {
+        fails.push(format!("{id}：各路径实际 DOM 字节不同 {got:?}"));
+    }
+    b
+}
+
 #[test]
 fn max_dom_bytes_boundary_differential() {
     let mut fails = Vec::new();
     for (id, s) in limit_corpus() {
-        let b = Document::from_bytes(s.as_bytes())
-            .unwrap()
-            .approx_heap_bytes();
-        // DomBytes 的 actual 取决于失败那次 reserve 的预估量，只要求 > limit 且五路一致。
-        // 注意：若 reserve 预估大于实际增长（如为共享 URI span 预留），“恰等于”会失败——这正是要抓的。
+        let b = measured_dom_bytes(id, s.as_bytes(), &mut fails);
+        // DomBytes 的 actual 取决于失败那次 reserve 的量，只要求 > limit 且五路一致。
+        // 预留必须是上界、且不得提前拒绝：恰等于实际用量必须通过（裁定 3）。
         fails.extend(boundary(
             id,
             s.as_bytes(),

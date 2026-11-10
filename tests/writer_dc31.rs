@@ -2,6 +2,8 @@
 //!
 //! **v10.9：只用 main 上已有的公开 API，main efb8be1 上可编译、可运行（应全部通过）。**
 //! 修 D-C3-1 前后都必须通过：修复只能改性能，不能改“重复属性”的判定。
+//! **v10.9.1**：D-C3-2 回归拆成两条独立、确定性的用例（误报一条、漏报一条，见文件末尾）；
+//! 89f6e78 上两条都预期失败，修复后必须通过。
 //! 性能门在 complexity_c3.rs（long_uri_joint / long_uri_amp，序列化路径）。
 //!
 //! 运行：cargo test --test writer_dc31
@@ -173,61 +175,98 @@ fn cross_event_cache_no_address_reuse_confusion() {
     assert_eq!(n, 2000);
 }
 
-/// PR #8 89f6e78 实测缺陷（Tester 11-10）：UriIdentity 的 by_ptr 以“非 canonical 的 Arc”地址为键，
-/// 却只保留 canonical Arc；键对应的分配释放后，地址被另一个内容不同的 URI 复用，就会命中旧条目。
-/// 结果：既有误报（{urn:y}a 与 {urn:x}a 被判重复），也有漏报（两个 {urn:y}a 被放行，写出
-/// 命名空间不良构的标签）。修复必须同时保留作为键的那个 Arc（或不以它的地址为键）。
-#[test]
-fn non_canonical_arc_address_reuse() {
-    let mut out = Vec::new();
-    let mut w = Writer::new(&mut out);
-    let x0: Arc<str> = Arc::from("urn:x");
-    let one = |a: Vec<Attribute<'static>>, d: &[(&'static str, &'static str)]| {
-        Event::EmptyElement(EmptyElement {
-            name: QName {
-                prefix: None,
-                local: XmlText::borrowed("e"),
-                namespace: None,
-            },
-            attributes: a,
-            namespaces: d
-                .iter()
-                .map(|(p, u)| Namespace {
-                    prefix: Some(XmlText::borrowed(p)),
-                    uri: XmlText::borrowed(u),
-                })
-                .collect(),
-        })
-    };
-    w.write_event(&one(vec![attr("p", "a", &x0)], &[("p", "urn:x")]))
+// ───────────────────────── D-C3-2（v10.9.1，Lead 11-10 16:50 裁定 2）─────────────────────────
+//
+// PR #8 89f6e78 实测缺陷：UriIdentity 的 by_ptr 以“非 canonical 的 Arc”地址为键，却只保留
+// canonical Arc；键对应的分配释放后，地址被另一个内容不同的 URI 复用，就会命中旧条目。
+//
+// 构造方式（确定性，不靠统计）：
+//   1. 事件 E1 用 x0（"urn:x"）注册 canonical；
+//   2. 事件 E2 用 b（另一个 Arc，内容同为 "urn:x"）——旧实现把 b 的地址记成 → x0；
+//   3. 记下 b 的地址后释放 b，立刻分配同长度的 c（"urn:y"）；
+//   4. 若 Writer 没有保留 b（strong_count==1）且 c 正好落在 b 的旧地址 → “地址复用”场景成立；
+//      若 Writer 保留了 b（strong_count>1，修法之一），地址不可能被复用，场景同样有效（应通过）。
+//   5. 两者都不成立就换一个地址重试（最多 64 次，失败的 c 留着不释放），仍不成立则 panic，
+//      绝不静默通过。
+// 断言各一条：误报重复（{urn:y}a 与 {urn:x}a 被判重复）、漏报重复（两个 {urn:y}a 被放行）。
+
+fn ev_one(a: Vec<Attribute<'static>>, d: &[(&'static str, &'static str)]) -> Event<'static> {
+    Event::EmptyElement(EmptyElement {
+        name: QName {
+            prefix: None,
+            local: XmlText::borrowed("e"),
+            namespace: None,
+        },
+        attributes: a,
+        namespaces: d
+            .iter()
+            .map(|(p, u)| Namespace {
+                prefix: Some(XmlText::borrowed(p)),
+                uri: XmlText::borrowed(u),
+            })
+            .collect(),
+    })
+}
+
+/// 走完第 1–4 步，返回 (Writer, x0, c, 场景说明)。c 的内容是 "urn:y"。
+fn address_reuse_setup(out: &mut Vec<u8>) -> (Writer<&mut Vec<u8>>, Arc<str>, Arc<str>, String) {
+    let mut w = Writer::new(out);
+    let x0: Arc<str> = Arc::from(String::from("urn:x"));
+    w.write_event(&ev_one(vec![attr("p", "a", &x0)], &[("p", "urn:x")]))
         .unwrap();
-    let mut false_dup = 0;
-    let mut missed_dup = 0;
-    for _ in 0..200 {
-        let b: Arc<str> = Arc::from(String::from("urn:x"));
-        w.write_event(&one(vec![attr("p", "a", &b)], &[("p", "urn:x")]))
+    let mut graveyard: Vec<Arc<str>> = Vec::new();
+    for attempt in 0..64 {
+        // Arc::from(&str) 只分配一次（ArcInner），中间没有临时 String 抢走刚释放的块
+        let b: Arc<str> = Arc::from("urn:x");
+        assert!(!Arc::ptr_eq(&b, &x0));
+        w.write_event(&ev_one(vec![attr("p", "a", &b)], &[("p", "urn:x")]))
             .unwrap();
+        let retained = Arc::strong_count(&b) > 1;
+        let addr = Arc::as_ptr(&b) as *const u8 as usize;
         drop(b);
-        let c: Arc<str> = Arc::from(String::from("urn:y"));
-        let r = w.write_event(&one(
-            vec![attr("p", "a", &c), attr("q", "a", &x0)],
-            &[("p", "urn:y"), ("q", "urn:x")],
-        ));
-        if r.is_err() {
-            false_dup += 1;
+        let c: Arc<str> = Arc::from("urn:y");
+        let reused = Arc::as_ptr(&c) as *const u8 as usize == addr;
+        if retained || reused {
+            let how = if retained {
+                format!("Writer 保留了作为键的 Arc（attempt {attempt}）")
+            } else {
+                format!("地址复用成立（attempt {attempt}）")
+            };
+            return (w, x0, c, how);
         }
-        let c2: Arc<str> = Arc::from("urn:y");
-        let r = w.write_event(&one(
-            vec![attr("p", "a", &c), attr("q", "a", &c2)],
-            &[("p", "urn:y"), ("q", "urn:y")],
-        ));
-        if r.is_ok() {
-            missed_dup += 1;
-        }
+        graveyard.push(c);
     }
-    assert_eq!(
-        (false_dup, missed_dup),
-        (0, 0),
-        "地址复用导致误报 {false_dup} 次、漏报 {missed_dup} 次（共 200 轮）"
+    panic!("64 次都没能构造出地址复用（分配器未复用地址），用例无效，不得视为通过");
+}
+
+/// 误报：c="urn:y" 与 x0="urn:x" 展开名不同，必须接受。
+#[test]
+fn d_c3_2_no_false_duplicate_after_address_reuse() {
+    let mut out = Vec::new();
+    let (mut w, x0, c, how) = address_reuse_setup(&mut out);
+    let r = w.write_event(&ev_one(
+        vec![attr("p", "a", &c), attr("q", "a", &x0)],
+        &[("p", "urn:y"), ("q", "urn:x")],
+    ));
+    assert!(
+        r.is_ok(),
+        "误报重复：{{urn:y}}a 与 {{urn:x}}a 被判重复（{how}）：{r:?}"
+    );
+}
+
+/// 漏报：c="urn:y" 与另一个 "urn:y" 展开名相同，必须报 duplicate attribute。
+#[test]
+fn d_c3_2_no_missed_duplicate_after_address_reuse() {
+    let mut out = Vec::new();
+    let (mut w, _x0, c, how) = address_reuse_setup(&mut out);
+    let c2: Arc<str> = Arc::from(String::from("urn:y"));
+    let r = w.write_event(&ev_one(
+        vec![attr("p", "a", &c), attr("q", "a", &c2)],
+        &[("p", "urn:y"), ("q", "urn:y")],
+    ));
+    let r: Result<String, WriteError> = r.map(|_| String::new());
+    assert!(
+        is_dup(&r),
+        "漏报重复：两个 {{urn:y}}a 被放行（{how}）：{r:?}"
     );
 }

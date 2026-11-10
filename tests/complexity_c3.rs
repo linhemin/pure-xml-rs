@@ -10,7 +10,11 @@
 //! - 建树路径：**C3 入口 `Document::from_bytes_with_config`（判定）**；mutation builder
 //!   （Reader 事件 → 公开修改 API，tests/common/dom_c2.rs）只记录、不判定，作对照（Lead Q3）
 //! - 序列化路径（Lead Q5，硬门槛）：`ser[c3]` = C3 建树（不计时）后 `Document::write_to`；
+//!   `ser[c3 to_string]` = 同上但走 `Document::to_string`（v10.9.1）；
 //!   `ser[reader→writer]` = Reader 事件直通 `Writer::write_event`（D-C3-1 在这条路径上，M1 起就有）
+//! - v10.9.1（Lead 11-10 16:50 裁定 1）：长 URI 两族（long_uri_joint、512 KiB 的 long_uri_amp）和
+//!   ns_scaled / ns_scaled_attrs 在三条序列化路径上全部是硬门槛（斜率 ≤ 1.2、放大 ≤ 10×），
+//!   `hard_gate_config_selftest` 锁定这一点（不需要 release）。89f6e78 上 ser[c3*] 预期失败。
 //!
 //! 固定前缀、只增加叶子数 L 的两组（Lead 指定的最坏输入）上，L 方向的斜率测不出
 //! O(L × 祖先声明数) 这种“线性但系数被放大”的代价，所以这两组另加放大倍数门槛：
@@ -49,6 +53,8 @@ const AMPLIFICATION_GATE: f64 = 10.0;
 /// 序列化输出上限：2 × 输入 + 64 KiB。
 const OUTPUT_FACTOR: usize = 2;
 const OUTPUT_SLACK: usize = 64 << 10;
+/// long_uri_amp：对照 URI 长度与被测 URI 长度（裁定 1：以 512 KiB 为准）。
+const LONG_URI_AMP_LENS: [usize; 2] = [16, 512 << 10];
 
 // ───────────────────────────── 可插拔的建树函数 ─────────────────────────────
 
@@ -148,6 +154,23 @@ fn ser_c3(data: &[u8], cfg: &ParserConfig) -> Result<Job, String> {
     }))
 }
 
+/// Document 序列化的另一个公开入口 `to_string`（Lead 11-10 16:50 裁定 1：to_string / write_to
+/// 都要测）。to_string 没法限制输出，所以准备阶段先用有上限的 write_to 跑一遍（不计时），
+/// 输出超限直接判失败，再计时 to_string。
+fn ser_c3_to_string(data: &[u8], cfg: &ParserConfig) -> Result<Job, String> {
+    let doc = c3_doc(data, cfg)?;
+    let cap = out_cap(data.len());
+    let mut w = Writer::new(CappedSink { written: 0, cap });
+    doc.write_to(&mut w)
+        .map_err(|e| format!("序列化失败（上限 {cap} B，to_string 未执行）：{e}"))?;
+    Ok(Box::new(move || {
+        let s = doc
+            .to_string()
+            .map_err(|e| format!("to_string 失败：{e}"))?;
+        Ok(std::hint::black_box(s).len())
+    }))
+}
+
 fn ser_reader_writer(data: &[u8], cfg: &ParserConfig) -> Result<Job, String> {
     let data = data.to_vec();
     let cfg = cfg.clone();
@@ -163,8 +186,10 @@ fn ser_reader_writer(data: &[u8], cfg: &ParserConfig) -> Result<Job, String> {
     }))
 }
 
+/// 序列化路径全部是硬门槛（v10.9.1）：Document 序列化（write_to、to_string）+ Writer 事件路径。
 const SER_PATHS: &[(&str, PrepFn)] = &[
     ("ser[c3]", ser_c3),
+    ("ser[c3 to_string]", ser_c3_to_string),
     ("ser[reader→writer]", ser_reader_writer),
 ];
 
@@ -521,7 +546,7 @@ fn amplification_gate(prep: Prep<'_>, path: &str, gate: bool) -> Vec<String> {
     // D-C3-1：固定 512 KiB URI，叶子边际（每叶）对照 16 字节 URI 下的同样叶子
     let leaves = [0usize, 1000, 4000, 16000, 64000];
     let mut marg = Vec::new();
-    for uri_len in [16usize, 512 << 10] {
+    for uri_len in LONG_URI_AMP_LENS {
         let fam = Family {
             name: if uri_len == 16 {
                 "long_uri_amp(U=16, L=0…64k)"
@@ -681,4 +706,39 @@ fn slope_fit_selftest() {
     let xs = [1.0, 2.0, 4.0, 8.0];
     assert!((slope(&xs, &xs.map(|x| 3.0 * x)) - 1.0).abs() < 1e-9);
     assert!((slope(&xs, &xs.map(|x| x * x)) - 2.0).abs() < 1e-9);
+}
+
+/// 锁定硬门槛配置（v10.9.1，不需要 release）：门槛常数、三条序列化路径、长 URI 512 KiB、
+/// ns_scaled 两族都在 families() 里（slope_gate 对 SER_PATHS 一律 gate=true）。
+#[test]
+fn hard_gate_config_selftest() {
+    assert_eq!(SLOPE_GATE, 1.2);
+    assert_eq!(AMPLIFICATION_GATE, 10.0);
+    let names: Vec<&str> = SER_PATHS.iter().map(|(n, _)| *n).collect();
+    assert_eq!(
+        names,
+        ["ser[c3]", "ser[c3 to_string]", "ser[reader→writer]"]
+    );
+    let fams = families();
+    for want in ["ns_scaled(", "ns_scaled_attrs(", "long_uri_joint("] {
+        assert!(
+            fams.iter().any(|f| f.name.starts_with(want)),
+            "families() 缺少 {want}"
+        );
+    }
+    let joint = fams
+        .iter()
+        .find(|f| f.name.starts_with("long_uri_joint("))
+        .unwrap();
+    assert!(
+        joint.points.iter().any(|(u, _)| *u as usize == 512 << 10),
+        "long_uri_joint 必须包含 512 KiB 点"
+    );
+    assert_eq!(LONG_URI_AMP_LENS, [16, 512 << 10]);
+    // long_uri_amp 的 512 KiB 点：生成器输出里 URI 长度 = 512 KiB
+    let d = long_uri(512 << 10, 1);
+    assert_eq!(
+        d.len(),
+        (512 << 10) + "<r xmlns:p=\"\">".len() + "<p:e p:a=\"\"/>".len() + "</r>".len()
+    );
 }
