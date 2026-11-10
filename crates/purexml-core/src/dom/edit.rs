@@ -1601,9 +1601,10 @@ mod tests {
         doc.append_child(root, dtd).unwrap();
         let element = doc.create_element(Name::local("r")).unwrap();
         doc.append_child(root, element).unwrap();
-        assert_eq!(
-            doc.to_string().unwrap(),
-            "<!DOCTYPE r PUBLIC \"-//Example//EN\" \"r.dtd\"><r/>"
-        );
+        assert_eq!(doc.to_string().unwrap(), "<!DOCTYPE r><r/>");
+        let stored = doc.get(dtd).unwrap().doctype().unwrap();
+        assert_eq!(stored.name, "r");
+        assert_eq!(stored.system_id, Some("r.dtd"));
+        assert_eq!(stored.public_id, Some("-//Example//EN"));
     }
 }

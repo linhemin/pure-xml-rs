@@ -19,6 +19,10 @@ impl Document {
     }
 
     /// Write the document. `omit_doctype` skips document-type nodes.
+    ///
+    /// A document type is written as `<!DOCTYPE name>`. System and public
+    /// identifiers stay on the node and are not written. An option to write
+    /// them is left for M3. The bytes are UTF-8, with no XML declaration.
     pub fn write_to_with<W: Write>(
         &self,
         writer: &mut crate::Writer<W>,
@@ -177,18 +181,14 @@ fn open_node<'a, W: Write>(
             if options.omit_doctype {
                 return Ok(());
             }
-            let Payload::Doctype {
-                name,
-                system,
-                public,
-            } = node.payload
-            else {
+            let Payload::Doctype { name, .. } = node.payload else {
                 return Ok(());
             };
             writer.write_event(&Event::Doctype(Doctype {
                 name: borrowed(doc, name),
-                system_id: system.map(|span| borrowed(doc, span)),
-                public_id: public.map(|span| borrowed(doc, span)),
+                // External ids stay on the node. Writing them is an M3 option.
+                system_id: None,
+                public_id: None,
                 has_internal_subset: false,
             }))
         }
@@ -496,7 +496,10 @@ mod tests {
         let element = doc.create_element(crate::dom::Name::local("r")).unwrap();
         doc.append_child(root, element).unwrap();
         let full = doc.to_string().unwrap();
-        assert!(full.contains("<!DOCTYPE r SYSTEM \"sys\">"));
+        assert!(full.starts_with("<!DOCTYPE r>"));
+        assert!(!full.contains("SYSTEM"));
+        let stored = doc.get(dtd).unwrap().doctype().unwrap();
+        assert_eq!(stored.system_id, Some("sys"));
         let omitted = doc
             .to_string_with(WriteOptions { omit_doctype: true })
             .unwrap();
