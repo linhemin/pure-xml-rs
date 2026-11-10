@@ -114,10 +114,7 @@ pub(crate) fn build_from(
         Document::with_config(config).map_err(|err| dom_error(err, Position::start(), config))?;
     let mut open = vec![0u32];
     let mut uris: HashMap<usize, (Arc<str>, StrSpan)> = HashMap::new();
-    loop {
-        let Some(event) = source.next_event()? else {
-            break;
-        };
+    while let Some(event) = source.next_event()? {
         let owned = OwnedEvent::from_event(event);
         let position = source.position();
         let defaulted = source.last_defaulted();

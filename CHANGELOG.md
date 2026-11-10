@@ -7,8 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Document::parse`, `parse_with_config`, `from_bytes`, `from_bytes_with_config`,
+  `from_reader`, and `from_reader_with_config` build a DOM in linear time.
+  An XML declaration is not stored. `to_string` is always UTF-8 and writes
+  `<!DOCTYPE name>` without system or public identifiers. `omit_doctype`
+  still drops the node. The identifiers remain readable on the node.
+
+### Security
+
+- **D-C3-1.** Checking distinct attributes hashed the namespace URI on every
+  attribute, and serialization allocated a fresh `Arc` for every element.
+  A long URI therefore made writing much slower than reading. The writer now
+  caches identity on the `Arc` address after one content compare, and
+  serialization reuses one `Arc` per arena span. Two different allocations
+  of the same URI are still the same attribute.
+
 ### Changed
 
+- `LimitKind` is `#[non_exhaustive]` and adds `NodeCount` and `DomBytes`.
+  `ErrorKind` is `#[non_exhaustive]`. A DOM node or byte cap is reported as
+  `ErrorKind::SecurityLimit` at the event that would have exceeded it.
+- Mutation stays O(depth) or O(subtree). Large documents should use `parse`.
 - MSRV is 1.99.1, raised from 1.70 to follow the local stable toolchain.
   The workspace edition is 2024 (`purexml`, `purexml-core`, and `purexml-fuzz`).
 - **D31.** `TotalInput` is positional. It is reported only when parsing needs

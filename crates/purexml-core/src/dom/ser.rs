@@ -90,8 +90,8 @@ enum Job {
     Close(u32),
 }
 
-fn write_at<'a, W: Write>(
-    doc: &'a Document,
+fn write_at<W: Write>(
+    doc: &Document,
     index: u32,
     writer: &mut crate::Writer<W>,
     options: WriteOptions,
@@ -201,16 +201,9 @@ fn open_node<'a, W: Write>(
 
 /// One `Arc` per arena span. The address is reused for every element that
 /// shares that span, so the writer does not hash the URI bytes again.
+#[derive(Default)]
 struct SpanArcs {
     by_span: HashMap<(u32, u32), Arc<str>>,
-}
-
-impl Default for SpanArcs {
-    fn default() -> Self {
-        Self {
-            by_span: HashMap::new(),
-        }
-    }
 }
 
 fn arc_at(doc: &Document, span: StrSpan, arcs: &mut SpanArcs) -> Arc<str> {
