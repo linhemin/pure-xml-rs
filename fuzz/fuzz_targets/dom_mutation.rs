@@ -13,11 +13,13 @@
 //! - 每一步之后统一断言（Lead 18:45）：to_string 要么 Err，要么 Reader 读回无错且结构与树一致
 //! - 失败的操作不能改树（结构指纹不变）
 //! - Q-C2-1（Lead 19:25）：没有根元素时 to_string 必须返回 `WriteError::NoRootElement`
+//! - O-C2-6（Lead 19:55）：文档节点的 NodeRef::write_to 与 to_string 一致（无根时同样报 NoRootElement、不写字节；
+//!   有根时输出逐字节相同）。7c4b750 已修，dom_c2::known_doc_node_defect 自 v10.8 起返回 None
 //! - D-C2-1（Lead 19:25）：往 CDATA/注释/PI 写入含 CR 的内容必须在修改阶段失败
 //!   （create_cdata/create_comment/set_text/set_pi_data 返回 InvalidChar；create_pi 可能先报 InvalidName），
 //!   且任何时刻树里（含未挂接节点）的 CDATA/注释/PI 都不含 CR
 //!
-//! 已知问题过滤：当前为空（v10.7 撤掉了 Q-C2-1、D-C2-1 的屏蔽，c0f49a0 已修）。
+//! 已知问题过滤：无。Q-C2-1、D-C2-1 的屏蔽在 v10.7 撤掉，O-C2-6 的登记在 v10.8 撤掉。
 //!
 //! 不调用 create_doctype。
 //!
@@ -220,6 +222,10 @@ fn check(doc: &Document, ids: &[NodeId], step: usize, op: u8) {
             other => {
                 panic!("第 {step} 步 op {op} 后没有根元素，期望 Err(NoRootElement)，实际 {other:?}")
             }
+        }
+        // O-C2-6（Lead 19:55）：文档节点的 NodeRef::write_to 也必须报 NoRootElement
+        if let Err(msg) = dom_c2::check_doc_node_write(doc, &Err(WriteError::NoRootElement)) {
+            panic!("第 {step} 步 op {op}：{msg}");
         }
         return;
     }

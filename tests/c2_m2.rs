@@ -4,7 +4,7 @@
 //! 结构比较规则见 `common/dom_c2.rs`（计划 §2.4）。
 //!
 //! 不调用 `create_doctype`（Implementer：将改为 pub(crate)）。Doctype 相关用例经
-//! [`make_doctype`] 适配，等 M2 收尾的公开构建入口，标 `#[ignore]`。
+//! [`make_doctype`] 适配，等 C3 公开解析/构建入口，标 `#[ignore]`。
 //!
 //! 运行：cargo test --test c2_m2
 //! 深树/大量兄弟用例默认运行；W3C 子集需要 `PUREXML_W3C_DIR` 或 tests/w3c/cache/xmlconf，缺失则跳过。
@@ -705,7 +705,7 @@ fn make_doctype(
 }
 
 #[test]
-#[ignore = "等 M2 收尾的公开构建入口；ser.rs 暂无对应单元测试（规则在 edit.rs create_doctype，PUBLIC 无 SYSTEM → Hierarchy）"]
+#[ignore = "等 C3 公开解析/构建入口"]
 fn doctype_public_without_system_rejected() {
     let mut doc = Document::new();
     let r = make_doctype(&mut doc, "r", None, Some("-//X//Y"))
@@ -714,7 +714,7 @@ fn doctype_public_without_system_rejected() {
 }
 
 #[test]
-#[ignore = "等 M2 收尾的公开构建入口；当前由 ser.rs 单元测试覆盖"]
+#[ignore = "等 C3 公开解析/构建入口"]
 fn doctype_omit_option_drops_doctype() {
     let mut doc = Document::new();
     let d = make_doctype(&mut doc, "r", Some("r.dtd"), None)
@@ -794,6 +794,65 @@ fn doc_without_root_element() {
     let rt = root(&doc);
     add_el(&mut doc, rt, Name::local("s"));
     assert_eq!(assert_serializes(&doc), "<s/>");
+}
+
+/// O-C2-6（Lead 19:55 裁定；7c4b750 已修，v10.8 取消 ignore）：没有根元素时，对文档节点调
+/// `NodeRef::write_to` 也必须返回 `WriteError::NoRootElement`，且不写任何字节；
+/// 子树、游离节点的 write_to 照旧不受影响。
+#[test]
+fn doc_node_write_to_without_root_element() {
+    fn write_node(doc: &Document, id: NodeId) -> (Result<(), WriteError>, Vec<u8>) {
+        let mut buf = Vec::new();
+        let r = doc.get(id).unwrap().write_to(&mut Writer::new(&mut buf));
+        (r, buf)
+    }
+    // 空文档
+    let doc = Document::new();
+    let (r, buf) = write_node(&doc, root(&doc));
+    assert!(
+        matches!(r, Err(WriteError::NoRootElement)),
+        "空文档的文档节点 write_to：期望 Err(NoRootElement)，实际 {r:?}，输出 {:?}",
+        String::from_utf8_lossy(&buf)
+    );
+    assert!(buf.is_empty(), "报错时不能写出字节：{buf:?}");
+
+    // 只有注释/PI，外加一个游离元素
+    let mut doc = Document::new();
+    let rt = root(&doc);
+    let c = doc.create_comment("only").unwrap();
+    doc.append_child(rt, c).unwrap();
+    let p = doc.create_pi("t", Some("d")).unwrap();
+    doc.append_child(rt, p).unwrap();
+    let e = doc.create_element(Name::local("e")).unwrap();
+    add_text(&mut doc, e, "t");
+    let (r, buf) = write_node(&doc, rt);
+    assert!(
+        matches!(r, Err(WriteError::NoRootElement)),
+        "仅注释/PI 文档的文档节点 write_to：期望 Err(NoRootElement)，实际 {r:?}，输出 {:?}",
+        String::from_utf8_lossy(&buf)
+    );
+    assert!(buf.is_empty(), "报错时不能写出字节：{buf:?}");
+    // 子树、游离节点不受影响
+    let (r, buf) = write_node(&doc, c);
+    assert!(r.is_ok());
+    assert_eq!(String::from_utf8(buf).unwrap(), "<!--only-->");
+    let (r, buf) = write_node(&doc, p);
+    assert!(r.is_ok());
+    assert_eq!(String::from_utf8(buf).unwrap(), "<?t d?>");
+    let (r, buf) = write_node(&doc, e);
+    assert!(r.is_ok());
+    assert_eq!(String::from_utf8(buf).unwrap(), "<e>t</e>");
+
+    // 删掉根元素后同样报错；挂回元素后文档节点 write_to 与 to_string 一致
+    let (mut doc, r0) = new_doc_with_root(Name::local("r"));
+    doc.remove(r0).unwrap();
+    let rt = root(&doc);
+    let (r, buf) = write_node(&doc, rt);
+    assert!(matches!(r, Err(WriteError::NoRootElement)) && buf.is_empty());
+    add_el(&mut doc, rt, Name::local("s"));
+    let (r, buf) = write_node(&doc, rt);
+    assert!(r.is_ok());
+    assert_eq!(String::from_utf8(buf).unwrap(), doc.to_string().unwrap());
 }
 
 #[test]

@@ -15,7 +15,7 @@
 use std::io::{BufRead, Read};
 
 use purexml::dom::{Document, DomError, Name, NodeId, NodeKind};
-use purexml::{Error, Event, ParserConfig, Reader};
+use purexml::{Error, Event, ParserConfig, Reader, WriteError, Writer};
 
 /// 自有的事件副本，脱离 Reader 的借用。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -431,12 +431,58 @@ pub enum Unified {
 /// 统一断言：序列化要么 Err，要么输出能读回且结构一致。
 /// 违反时返回 Err(说明)。`all_paths` 为真时五个读取结果都要一致。
 pub fn unified(doc: &Document, all_paths: bool) -> Result<Unified, String> {
-    let s1 = match doc.to_string() {
+    let s1 = doc.to_string();
+    check_doc_node_write(doc, &s1)?;
+    let s1 = match s1 {
         Ok(x) => x,
         Err(e) => return Ok(Unified::SerErr(format!("{e}"))),
     };
     check_readback(&s1, &canon_doc(doc), all_paths)?;
     Ok(Unified::Ok(s1))
+}
+
+/// 用文档节点的 `NodeRef::write_to` 写出整篇文档。
+pub fn write_doc_node(doc: &Document) -> (Result<(), WriteError>, Vec<u8>) {
+    let mut buf = Vec::new();
+    let r = match doc.root() {
+        Some(n) => n.write_to(&mut Writer::new(&mut buf)),
+        None => return (Ok(()), buf),
+    };
+    (r, buf)
+}
+
+/// 文档节点的 `NodeRef::write_to` 必须与 `Document::to_string` 一致（Lead 19:55，O-C2-6）：
+/// - to_string 报 NoRootElement → 文档节点 write_to 也报 NoRootElement，且不写字节；
+/// - to_string 成功 → 文档节点 write_to 成功且输出逐字节相同。
+pub fn check_doc_node_write(doc: &Document, s1: &Result<String, WriteError>) -> Result<(), String> {
+    let (r, buf) = write_doc_node(doc);
+    match s1 {
+        Err(WriteError::NoRootElement) => {
+            let exact = matches!(r, Err(WriteError::NoRootElement)) && buf.is_empty();
+            if exact || known_doc_node_defect().is_some() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "没有根元素：to_string 报 NoRootElement，文档节点 write_to 却是 {r:?}，输出 {:?}",
+                    String::from_utf8_lossy(&buf)
+                ))
+            }
+        }
+        Err(_) => Ok(()),
+        Ok(x) => match r {
+            Ok(()) if buf == x.as_bytes() => Ok(()),
+            other => Err(format!(
+                "文档节点 write_to 与 to_string 不一致：{other:?}\n  to_string = {x:?}\n  write_to = {:?}",
+                String::from_utf8_lossy(&buf)
+            )),
+        },
+    }
+}
+
+/// 已登记、等修复的缺陷登记表（文档节点 `NodeRef::write_to`）。
+/// O-C2-6 已在 7c4b750 修复（文档节点走 write_document，无根时报 NoRootElement），v10.8 起为空。
+pub fn known_doc_node_defect() -> Option<&'static str> {
+    None
 }
 
 /// 读回 `xml`，指纹必须等于 `want`。
