@@ -21,7 +21,7 @@
 - 改了什么：在 `README.md` 增加「交接（必读）」（简体中文，含强制规则和当前状态）。新增本文件。没有改解析器、写出器、DOM、测试、用法示例、安全默认、编码、模块列表或许可证。
 - 还剩什么：见下方「下一步」。库功能与快照时的 `main` 相同。
 - 阻塞：无。
-- 链接：本变更的 PR 合并后，把链接补进下一节。调查时用到的 PR 见「已合并的 PR」。
+- 链接：本交接是 [PR #7](https://github.com/linhemin/pure-xml-rs/pull/7)，未合并。功能上的未合并工作见下面的「草稿 PR #6」。
 - 本轮没有运行 `cargo test`、W3C 或 bench。下面的测试数字若来自 PR 说明，会标明日期，不当成 2026-11-10 的新结果。
 
 ## 下一步
@@ -47,7 +47,7 @@
 - 版本：根 `Cargo.toml` 与 `purexml-core` 都是 `0.1.0`。没有 git tag。
 - MSRV：`1.99.1`。edition：`2024`。工作区成员：`.` 与 `crates/purexml-core`。`fuzz/` 是独立 workspace（`purexml-fuzz`，`publish = false`）。
 - 许可证：MIT OR Apache-2.0。
-- 2026-11-10 用 `gh issue list` / `gh pr list` 查看：没有 issue（打开的和全部都没有）。打开的 PR 只有 #6，且是草稿。
+- 2026-11-10 用 `gh issue list` / `gh pr list` 查看：没有 issue（打开的和全部都没有）。打开的 PR 是草稿 #6，以及写这份交接的 #7。
 
 ## 已合并的 PR
 

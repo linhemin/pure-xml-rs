@@ -18,7 +18,7 @@
 
 ### 当前状态（2026-11-10）
 
-`main` 为 `4a5cafb`（2026-11-04 合并 [PR #5](https://github.com/linhemin/pure-xml-rs/pull/5)）。版本 `0.1.0`，没有 tag。2026-11-10 查过 GitHub：没有 issue；唯一未合并的 PR 是草稿 [PR #6](https://github.com/linhemin/pure-xml-rs/pull/6)。本轮没有重跑测试、W3C 或 bench。
+`main` 为 `4a5cafb`（2026-11-04 合并 [PR #5](https://github.com/linhemin/pure-xml-rs/pull/5)）。版本 `0.1.0`，没有 tag。2026-11-10 查过 GitHub：没有 issue。未合并的有草稿 [PR #6](https://github.com/linhemin/pure-xml-rs/pull/6)，以及本交接 [PR #7](https://github.com/linhemin/pure-xml-rs/pull/7)。本轮没有重跑测试、W3C 或 bench。
 
 **已经在 main 上**
 
