@@ -3,8 +3,10 @@
 //! 统一断言（Lead 18:45）：序列化要么返回 Err，要么输出能被 Reader 读回且结构与树一致。
 //! 结构比较规则见 `common/dom_c2.rs`（计划 §2.4）。
 //!
-//! 不调用 `create_doctype`（Implementer：将改为 pub(crate)）。Doctype 相关用例经
-//! [`make_doctype`] 适配，等 C3 公开解析/构建入口，标 `#[ignore]`。
+//! 不调用 `create_doctype`（pub(crate)）。v10.9：Doctype 用例改走 C3 公开入口 `Document::parse`
+//! （[`parse_doctype`]），去掉 `#[ignore]`；按 Lead Q6（2026-11-10）断言：解析保留
+//! name/system/public，序列化默认只写 `<!DOCTYPE name>`。
+//! **这一节依赖 C3 入口 `Document::parse`，main efb8be1 上无法编译**；其余用例与 v10.8 相同。
 //!
 //! 运行：cargo test --test c2_m2
 //! 深树/大量兄弟用例默认运行；W3C 子集需要 `PUREXML_W3C_DIR` 或 tests/w3c/cache/xmlconf，缺失则跳过。
@@ -16,7 +18,7 @@ use dom_c2::{
     OEv, Tok, Unified, build, build_with, canon_doc, canon_events, canon_tree, check_readback,
     read_all_paths, read_bytes, read_bytes_with, roundtrip, unified,
 };
-use purexml::dom::{Document, DomError, Name, NodeId, NodeKind, WriteOptions};
+use purexml::dom::{DoctypeName, Document, DomError, Name, NodeId, NodeKind, WriteOptions};
 use purexml::{ParserConfig, WriteError, Writer};
 
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
@@ -691,47 +693,102 @@ fn omit_doctype_noop_without_doctype() {
     assert_eq!(a, b);
 }
 
-// ───────────────────────────── Doctype（待定：等新 API） ─────────────────────────────
+// ───────────────────────────── Doctype（v10.9：C3 入口 + Lead Q6） ─────────────────────────────
 
-/// Doctype 适配层。`create_doctype` 将改为 pub(crate)，这里不能调用。
-/// 新的公开入口落地后只改这里。返回 None 表示当前没有合法入口。
-fn make_doctype(
-    _doc: &mut Document,
-    _name: &str,
-    _system: Option<&str>,
-    _public: Option<&str>,
-) -> Option<Result<NodeId, DomError>> {
-    None
+/// 拼 `<!DOCTYPE name …><name/>` 后走 C3 `Document::parse`（需要 C3）。
+fn doctype_xml(name: &str, sys: Option<&str>, publ: Option<&str>) -> String {
+    let ext = match (publ, sys) {
+        (Some(p), Some(s)) => format!(" PUBLIC \"{p}\" \"{s}\""),
+        (Some(p), None) => format!(" PUBLIC \"{p}\""),
+        (None, Some(s)) => format!(" SYSTEM \"{s}\""),
+        (None, None) => String::new(),
+    };
+    format!("<!DOCTYPE {name}{ext}><{name}/>")
 }
 
-#[test]
-#[ignore = "等 C3 公开解析/构建入口"]
-fn doctype_public_without_system_rejected() {
-    let mut doc = Document::new();
-    let r = make_doctype(&mut doc, "r", None, Some("-//X//Y"))
-        .expect("待定：没有合法的 doctype 公开入口");
-    assert!(r.is_err(), "PUBLIC 必须带 SYSTEM");
+fn parse_doctype(
+    name: &str,
+    sys: Option<&str>,
+    publ: Option<&str>,
+) -> Result<Document, purexml::Error> {
+    Document::parse(&doctype_xml(name, sys, publ))
 }
 
-#[test]
-#[ignore = "等 C3 公开解析/构建入口"]
-fn doctype_omit_option_drops_doctype() {
-    let mut doc = Document::new();
-    let d = make_doctype(&mut doc, "r", Some("r.dtd"), None)
-        .expect("待定：没有合法的 doctype 公开入口")
-        .unwrap();
-    let rt = root(&doc);
-    doc.append_child(rt, d).unwrap();
-    add_el(&mut doc, rt, Name::local("r"));
-    let full = doc.to_string().unwrap();
-    assert!(
-        full.starts_with("<!DOCTYPE r SYSTEM \"r.dtd\">"),
-        "{full:?}"
+fn first_doctype(doc: &Document) -> Option<DoctypeName<'_>> {
+    let n = doc.root()?.first_child()?;
+    assert_eq!(
+        n.kind(),
+        Some(NodeKind::Doctype),
+        "doctype 应是文档节点的第一个子节点"
     );
+    n.doctype()
+}
+
+/// PUBLIC 缺 SYSTEM：解析即拒绝（Syntax），错误与 Reader 完全一致。
+#[test]
+fn doctype_public_without_system_rejected() {
+    let xml = doctype_xml("r", None, Some("-//X//Y"));
+    let e = parse_doctype("r", None, Some("-//X//Y")).expect_err("PUBLIC 必须带 SYSTEM");
+    assert_eq!(e.kind, purexml::ErrorKind::Syntax, "{e:?}");
+    let (_, re) = read_bytes(xml.as_bytes()).expect_err("Reader 也必须拒绝");
+    assert_eq!(e, re, "DOM 错误应与 Reader 原样一致");
+}
+
+/// SYSTEM：doctype() 读得到 system_id；默认序列化只写 `<!DOCTYPE r>`（Q6）；omit_doctype 去掉。
+#[test]
+fn doctype_omit_option_drops_doctype() {
+    let doc = parse_doctype("r", Some("r.dtd"), None).unwrap();
+    assert_eq!(
+        first_doctype(&doc),
+        Some(DoctypeName {
+            name: "r",
+            system_id: Some("r.dtd"),
+            public_id: None,
+        })
+    );
+    let full = doc.to_string().unwrap();
+    assert_eq!(full, "<!DOCTYPE r><r/>", "Q6：默认不写 SYSTEM/PUBLIC");
     let omitted = doc
         .to_string_with(WriteOptions { omit_doctype: true })
         .unwrap();
     assert_eq!(omitted, "<r/>");
+}
+
+/// PUBLIC + SYSTEM：两者都能读到，默认都不写出；读回后 doctype 只有 name，s1 == s2。
+#[test]
+fn doctype_external_ids_read_but_not_written() {
+    let doc = parse_doctype("r", Some("r.dtd"), Some("-//X//Y")).unwrap();
+    assert_eq!(
+        first_doctype(&doc),
+        Some(DoctypeName {
+            name: "r",
+            system_id: Some("r.dtd"),
+            public_id: Some("-//X//Y"),
+        })
+    );
+    let s1 = doc.to_string().unwrap();
+    assert_eq!(s1, "<!DOCTYPE r><r/>");
+    let doc2 = Document::parse(&s1).unwrap();
+    assert_eq!(
+        first_doctype(&doc2),
+        Some(DoctypeName {
+            name: "r",
+            system_id: None,
+            public_id: None,
+        })
+    );
+    assert_eq!(doc2.to_string().unwrap(), s1);
+}
+
+/// 内部子集不进 DOM、不写出；实体照常展开（Reader 默认限额照常生效）。
+#[test]
+fn doctype_internal_subset_not_written() {
+    let doc = Document::parse(r#"<!DOCTYPE r [<!ENTITY e "x">]><r>&e;</r>"#).unwrap();
+    assert_eq!(doc.to_string().unwrap(), "<!DOCTYPE r><r>x</r>");
+    // 外部实体声明仍由 Reader 拒绝
+    let e = Document::parse(r#"<!DOCTYPE r [<!ENTITY e SYSTEM "file:///etc/passwd">]><r>&e;</r>"#)
+        .expect_err("外部实体");
+    assert_eq!(e.kind, purexml::ErrorKind::ExternalEntityForbidden, "{e:?}");
 }
 
 // ───────────────────────────── 文档形状 ─────────────────────────────
