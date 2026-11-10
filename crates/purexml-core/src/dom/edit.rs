@@ -82,6 +82,9 @@ impl Document {
 
     /// A detached element. Insert it with [`Self::append_child`] or the insert methods.
     ///
+    /// A prefix whose URI is missing or empty is [`DomError::Namespace`]. The
+    /// document is unchanged. The same name is rejected on an attribute.
+    ///
     /// Creating the node is O(1). Linking it is O(depth). Build a large
     /// document with [`Self::parse`].
     pub fn create_element(&mut self, name: Name<'_>) -> Result<NodeId, DomError> {
@@ -697,6 +700,9 @@ impl Document {
     ) -> Result<(), DomError> {
         let prefix = prefix.and_then(|span| self.str_at(span));
         let namespace = namespace.and_then(|span| self.str_at(span));
+        if prefix.is_some() && namespace.is_none_or(|uri| uri.is_empty()) {
+            return Err(DomError::Namespace);
+        }
         if attribute && prefix.is_none() {
             return if namespace.is_none() {
                 Ok(())
@@ -1078,7 +1084,9 @@ impl Document {
         if name.prefix == Some("xml") && name.namespace != Some(XML_NAMESPACE) {
             return Err(DomError::Namespace);
         }
-        if name.prefix.is_some() && name.namespace.is_none() {
+        // A prefix with a missing or empty URI cannot be serialized. Attributes
+        // already fail here; elements must fail here too, not at `to_string`.
+        if name.prefix.is_some() && name.namespace.is_none_or(|uri| uri.is_empty()) {
             return Err(DomError::Namespace);
         }
         if name.namespace == Some(XML_NAMESPACE) && name.prefix != Some("xml") {
@@ -1606,5 +1614,75 @@ mod tests {
         assert_eq!(stored.name, "r");
         assert_eq!(stored.system_id, Some("r.dtd"));
         assert_eq!(stored.public_id, Some("-//Example//EN"));
+    }
+
+    #[test]
+    fn prefixed_empty_namespace_is_rejected_like_an_attribute() {
+        let mut doc = Document::new();
+        let root = doc.root().unwrap().id();
+        let element = doc.create_element(Name::local("r")).unwrap();
+        doc.append_child(root, element).unwrap();
+        let before = doc.to_string().unwrap();
+        let nodes = doc.node_count();
+
+        let err = doc
+            .create_element(Name::qualified("", Some("p"), "e"))
+            .unwrap_err();
+        assert_eq!(err, DomError::Namespace);
+        assert_eq!(doc.node_count(), nodes);
+        assert_eq!(doc.to_string().unwrap(), before);
+
+        let err = doc
+            .set_attribute(element, Name::qualified("", Some("p"), "a"), "1")
+            .unwrap_err();
+        assert_eq!(err, DomError::Namespace);
+        assert_eq!(doc.to_string().unwrap(), before);
+
+        let bad = detached_prefixed_empty(&mut doc);
+        assert_eq!(
+            doc.append_child(element, bad).unwrap_err(),
+            DomError::Namespace
+        );
+        assert!(doc.get(bad).unwrap().parent().is_none());
+
+        let sibling = doc.create_element(Name::local("s")).unwrap();
+        doc.append_child(element, sibling).unwrap();
+        let linked = doc.to_string().unwrap();
+        assert_eq!(
+            doc.insert_before(bad, sibling).unwrap_err(),
+            DomError::Namespace
+        );
+        assert_eq!(
+            doc.insert_after(bad, sibling).unwrap_err(),
+            DomError::Namespace
+        );
+        assert!(doc.get(bad).unwrap().parent().is_none());
+        assert_eq!(doc.to_string().unwrap(), linked);
+
+        let wrap = doc.create_element(Name::local("w")).unwrap();
+        doc.link_last(wrap.index(), bad.index());
+        assert_eq!(
+            doc.append_child(element, wrap).unwrap_err(),
+            DomError::Namespace
+        );
+        assert!(doc.get(wrap).unwrap().parent().is_none());
+        assert_eq!(doc.to_string().unwrap(), linked);
+    }
+
+    fn detached_prefixed_empty(doc: &mut Document) -> super::NodeId {
+        use super::{ElementData, NodeKind, Payload, Range};
+
+        let prefix = doc.intern_checked("p").unwrap();
+        let namespace = doc.intern_checked("").unwrap();
+        let local = doc.intern_checked("e").unwrap();
+        let slot = doc.elements.len() as u32;
+        doc.elements.push(ElementData {
+            namespace: Some(namespace),
+            prefix: Some(prefix),
+            local,
+            attrs: Range { start: 0, len: 0 },
+            ns_decls: Range { start: 0, len: 0 },
+        });
+        doc.push_detached(NodeKind::Element, Payload::Element(slot))
     }
 }
