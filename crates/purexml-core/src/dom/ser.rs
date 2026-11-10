@@ -98,6 +98,7 @@ fn write_at<'a, W: Write>(
 ) -> Result<(), WriteError> {
     let mut scope = OutScope::empty();
     scope.push(Some("xml"), crate::event::XML_NAMESPACE);
+    let mut arcs = SpanArcs::default();
     let mut stack = vec![Job::Open(index)];
     let mut guard = doc.nodes.len().saturating_mul(4);
     while let Some(job) = stack.pop() {
@@ -109,10 +110,12 @@ fn write_at<'a, W: Write>(
             Job::Close(current) => {
                 scope.leave();
                 writer.write_event(&Event::EndElement(EndElement {
-                    name: element_name(doc, current)?,
+                    name: element_name(doc, current, &mut arcs)?,
                 }))?;
             }
-            Job::Open(current) => open_node(doc, current, &mut stack, writer, options, &mut scope)?,
+            Job::Open(current) => open_node(
+                doc, current, &mut stack, writer, options, &mut scope, &mut arcs,
+            )?,
         }
     }
     Ok(())
@@ -125,6 +128,7 @@ fn open_node<'a, W: Write>(
     writer: &mut crate::Writer<W>,
     options: WriteOptions,
     scope: &mut OutScope<'a>,
+    arcs: &mut SpanArcs,
 ) -> Result<(), WriteError> {
     let node = &doc.nodes[index as usize];
     if !node.alive {
@@ -142,8 +146,8 @@ fn open_node<'a, W: Write>(
         }
         NodeKind::Element => {
             let namespaces = namespaces_in_scope(doc, index, scope)?;
-            let name = element_name(doc, index)?;
-            let attributes = attributes(doc, index);
+            let name = element_name(doc, index, arcs)?;
+            let attributes = attributes(doc, index, arcs);
             let kids = children(doc, index);
             if kids.is_empty() {
                 writer.write_event(&Event::EmptyElement(EmptyElement {
@@ -195,26 +199,59 @@ fn open_node<'a, W: Write>(
     }
 }
 
-fn element_name(doc: &Document, index: u32) -> Result<QName<'_>, WriteError> {
+/// One `Arc` per arena span. The address is reused for every element that
+/// shares that span, so the writer does not hash the URI bytes again.
+struct SpanArcs {
+    by_span: HashMap<(u32, u32), Arc<str>>,
+}
+
+impl Default for SpanArcs {
+    fn default() -> Self {
+        Self {
+            by_span: HashMap::new(),
+        }
+    }
+}
+
+fn arc_at(doc: &Document, span: StrSpan, arcs: &mut SpanArcs) -> Arc<str> {
+    let key = (span.start, span.len);
+    if let Some(existing) = arcs.by_span.get(&key) {
+        return Arc::clone(existing);
+    }
+    let text = doc.str_at(span).unwrap_or("");
+    let arc: Arc<str> = Arc::from(text);
+    arcs.by_span.insert(key, Arc::clone(&arc));
+    arc
+}
+
+fn element_name<'a>(
+    doc: &'a Document,
+    index: u32,
+    arcs: &mut SpanArcs,
+) -> Result<QName<'a>, WriteError> {
     let Payload::Element(slot) = doc.nodes[index as usize].payload else {
         return Err(WriteError::Syntax("missing element payload".to_string()));
     };
     let element = &doc.elements[slot as usize];
+    let namespace = element.namespace.and_then(|span| {
+        let text = doc.str_at(span)?;
+        if text.is_empty() {
+            None
+        } else {
+            Some(arc_at(doc, span, arcs))
+        }
+    });
     Ok(QName {
         prefix: element
             .prefix
             .and_then(|span| doc.str_at(span))
             .map(XmlText::borrowed),
         local: XmlText::borrowed(doc.str_at(element.local).unwrap_or("")),
-        namespace: element
-            .namespace
-            .and_then(|span| doc.str_at(span))
-            .filter(|uri| !uri.is_empty())
-            .map(Arc::<str>::from),
+        namespace,
     })
 }
 
-fn attributes(doc: &Document, index: u32) -> Vec<Attribute<'_>> {
+fn attributes<'a>(doc: &'a Document, index: u32, arcs: &mut SpanArcs) -> Vec<Attribute<'a>> {
     let Payload::Element(slot) = doc.nodes[index as usize].payload else {
         return Vec::new();
     };
@@ -234,9 +271,8 @@ fn attributes(doc: &Document, index: u32) -> Vec<Attribute<'_>> {
                 local: XmlText::borrowed(doc.str_at(attr.local).unwrap_or("")),
                 namespace: attr
                     .namespace
-                    .and_then(|span| doc.str_at(span))
-                    .filter(|uri| !uri.is_empty())
-                    .map(Arc::<str>::from),
+                    .filter(|span| doc.str_at(*span).is_some_and(|uri| !uri.is_empty()))
+                    .map(|span| arc_at(doc, span, arcs)),
             },
             value: XmlText::borrowed(doc.str_at(attr.value).unwrap_or("")),
         })
