@@ -78,6 +78,20 @@ pub struct Reader<S> {
     poison: Option<Error>,
 }
 
+impl<S> Reader<S> {
+    /// Non-xmlns default attributes appended by the last start or empty tag.
+    ///
+    /// Defaults follow explicit attributes. `xmlns` and `xmlns:*` are not
+    /// included. Zero when that tag had no attribute defaults.
+    pub(crate) fn last_defaulted(&self) -> usize {
+        self.engine.last_defaulted
+    }
+
+    pub(crate) fn build_cursor(&self) -> Position {
+        self.engine.pos_now()
+    }
+}
+
 impl<'a> Reader<&'a [u8]> {
     /// Parse `input` as UTF-8 XML. A UTF-8 BOM is skipped.
     ///
@@ -581,6 +595,13 @@ struct Engine {
     /// full length. Defaults do not move `expanded_bytes` or
     /// `expansion_count`.
     ratio_bytes: u64,
+    /// Non-xmlns default attributes appended by the last start or empty tag.
+    ///
+    /// `xmlns` and `xmlns:*` defaults are not counted. They are namespace
+    /// declarations, not attributes. The count is zero when the element had
+    /// no attribute defaults. The DOM builder marks that many trailing
+    /// attributes `specified = false`.
+    last_defaulted: usize,
 }
 
 impl Engine {
@@ -626,6 +647,7 @@ impl Engine {
             expansion_count: 0,
             expanded_bytes: 0,
             ratio_bytes: 0,
+            last_defaulted: 0,
         }
         .with_builtin_namespaces()
     }
@@ -1880,6 +1902,7 @@ impl Engine {
     ) -> Result<()> {
         let pending = {
             let Some(list) = self.attlists.get(element) else {
+                self.last_defaulted = 0;
                 return Ok(());
             };
             let mut explicit = HashSet::with_capacity(attrs.len());
@@ -1893,6 +1916,7 @@ impl Engine {
                 .map(|(index, _)| index)
                 .collect::<Vec<_>>()
         };
+        let mut defaulted = 0usize;
         for index in pending {
             let (name, value) = {
                 let def = &self.attlists.get(element).expect("attribute list").order[index];
@@ -1907,8 +1931,13 @@ impl Engine {
             self.ratio_bytes = self.ratio_bytes.saturating_add(charge);
             let position = self.err_pos();
             self.check_expansion_ratio(input, position)?;
+            let xmlns = name == "xmlns" || name.starts_with("xmlns:");
             attrs.push((owned_qname(&name), RawStr::Shared(value)));
+            if !xmlns {
+                defaulted += 1;
+            }
         }
+        self.last_defaulted = defaulted;
         Ok(())
     }
 
@@ -2110,7 +2139,7 @@ impl Engine {
         let resolved_name = self.resolve_name(input, qname, true)?;
         // Hash the interned allocation's address, not the URI bytes. `Arc<str>`
         // hashes by content, which makes a long namespace URI cost O(URI) per attribute.
-        let mut seen_exp: HashSet<(usize, String)> = HashSet::new();
+        let mut seen_exp: HashSet<((usize, usize), String)> = HashSet::new();
         let mut resolved_attrs = Vec::with_capacity(regular.len());
         for (name, value) in regular {
             let resolved = self.resolve_name(input, name, false)?;
@@ -3820,16 +3849,72 @@ fn materialize_attr(input: &[u8], attr: ResolvedAttr) -> Attribute<'_> {
     }
 }
 
-fn ns_ptr(namespace: &Option<Arc<str>>) -> usize {
+fn ns_ptr(namespace: &Option<Arc<str>>) -> (usize, usize) {
     namespace
         .as_ref()
-        .map(|uri| Arc::as_ptr(uri) as *const u8 as usize)
-        .unwrap_or(0)
+        .map(|uri| (Arc::as_ptr(uri) as *const u8 as usize, uri.len()))
+        .unwrap_or((0, 0))
 }
 
 fn materialize_ns(input: &[u8], ns: RawNs) -> Namespace<'_> {
     Namespace {
         prefix: ns.prefix.map(|prefix| prefix.into_text(input)),
         uri: ns.uri.into_text(input),
+    }
+}
+
+#[cfg(test)]
+mod last_defaulted_tests {
+    use super::Reader;
+    use crate::event::Event;
+
+    #[test]
+    fn last_defaulted_ignores_xmlns_and_keeps_trailing_defaults() {
+        let xml = r#"<!DOCTYPE doc [
+            <!ATTLIST r a CDATA "1">
+            <!ATTLIST r xmlns CDATA "urn:x">
+            <!ATTLIST r b CDATA "2">
+        ]><doc><r c="3"/><r/></doc>"#;
+        let mut reader = Reader::from_str(xml);
+        let mut seen = 0;
+        loop {
+            match reader.read_event().unwrap() {
+                Some(Event::EmptyElement(element)) => {
+                    let locals: Vec<_> = element
+                        .attributes
+                        .iter()
+                        .map(|attr| attr.name.local.as_str().to_string())
+                        .collect();
+                    let has_default_xmlns = element.namespaces.iter().any(|ns| ns.prefix.is_none());
+                    drop(element);
+                    if seen == 0 {
+                        assert_eq!(locals, ["c", "a", "b"]);
+                        assert!(has_default_xmlns);
+                    } else {
+                        assert_eq!(locals, ["a", "b"]);
+                    }
+                    assert_eq!(reader.last_defaulted(), 2);
+                    seen += 1;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert_eq!(seen, 2);
+    }
+
+    #[test]
+    fn last_defaulted_is_zero_without_defaults() {
+        let mut reader = Reader::from_str(r#"<r a="1"/>"#);
+        loop {
+            match reader.read_event().unwrap() {
+                Some(Event::EmptyElement(_)) => {
+                    assert_eq!(reader.last_defaulted(), 0);
+                    break;
+                }
+                Some(_) => {}
+                None => panic!("missing element"),
+            }
+        }
     }
 }

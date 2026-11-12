@@ -22,6 +22,9 @@ pub enum ErrorClass {
     Syntax,
     Encoding,
     Io,
+    /// ErrorKind 是 #[non_exhaustive]（C3 / Lead Q1）：库新增、本层还不认识的变体。
+    /// 不归入任何已知类别；`limit` 字段保存 `Debug` 全文，差分时仍可比较、断言不会静默通过。
+    Unknown,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +83,8 @@ fn classify(e: purexml::Error) -> Failure {
         ErrorKind::Syntax => (ErrorClass::Syntax, None, None, None),
         ErrorKind::Encoding => (ErrorClass::Encoding, None, None, None),
         ErrorKind::Io => (ErrorClass::Io, None, None, None),
+        // #[non_exhaustive]：未知变体单列为 Unknown，Debug 全文放进 limit 供比较
+        other => (ErrorClass::Unknown, Some(format!("{other:?}")), None, None),
     };
     Failure {
         class,

@@ -73,3 +73,10 @@ path = "fuzz_targets/dom_mutation.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "parse_dom_roundtrip"
+path = "fuzz_targets/parse_dom_roundtrip.rs"
+test = false
+doc = false
+bench = false

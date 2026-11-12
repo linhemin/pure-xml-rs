@@ -8,6 +8,7 @@
 //! A removed node stays in the arena as a tombstone; [`Document::get`] returns
 //! [`None`] for it, and for an id from another document.
 
+mod build;
 mod document;
 mod edit;
 mod ser;

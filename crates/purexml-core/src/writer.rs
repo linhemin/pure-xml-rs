@@ -5,8 +5,9 @@
 //! URIs. Round-tripping a DOM is out of scope for 0.x.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::sync::Arc;
 
 use crate::event::{
     Attribute, Doctype, EmptyElement, EndElement, Event, Namespace, ProcessingInstruction, QName,
@@ -203,19 +204,73 @@ fn check_ncname(name: &str) -> Result<(), WriteError> {
     }
 }
 
+/// Remembers namespace URIs by `Arc` address after the first content compare.
+///
+/// The address is only a fast path. Two different allocations with the same
+/// URI still compare equal. `by_ptr` holds the `Arc` whose address is the
+/// key, so a later allocation cannot reuse that address while the cache
+/// still names it.
+struct UriIdentity {
+    /// `(data pointer, length)` of a held `Arc` → content id.
+    /// Length is part of the key so two slices that start at the same
+    /// address are not treated as one URI.
+    by_ptr: HashMap<(usize, usize), (Arc<str>, u32)>,
+    /// Canonical `Arc` for each distinct URI content → id.
+    by_text: HashMap<Arc<str>, u32>,
+    next: u32,
+}
+
+impl UriIdentity {
+    fn new() -> Self {
+        Self {
+            by_ptr: HashMap::new(),
+            by_text: HashMap::new(),
+            next: 1,
+        }
+    }
+
+    fn canonical(&mut self, uri: &Arc<str>) -> usize {
+        let key = (Arc::as_ptr(uri) as *const u8 as usize, uri.len());
+        if let Some((_, id)) = self.by_ptr.get(&key) {
+            return *id as usize;
+        }
+        let id = if let Some(id) = self.by_text.get(uri).copied() {
+            id
+        } else {
+            let id = self.next;
+            self.next = self.next.saturating_add(1);
+            self.by_text.insert(Arc::clone(uri), id);
+            id
+        };
+        // Hold this allocation. Dropping it would let a different URI reuse `ptr`.
+        self.by_ptr.insert(key, (Arc::clone(uri), id));
+        id as usize
+    }
+}
+
 /// Expanded name when a namespace URI is present, otherwise the lexical QName.
-fn attribute_identity<'a>(name: &'a QName<'a>) -> (Option<&'a str>, Option<&'a str>, &'a str) {
-    if name.namespace.is_some() {
-        (name.namespace.as_deref(), None, name.local.as_str())
+///
+/// A URI is identified by the canonical `Arc` chosen in `cache`. That choice
+/// matches a full string compare: different `Arc`s with the same contents share
+/// one id.
+fn attribute_identity<'a>(
+    name: &'a QName<'a>,
+    cache: &mut UriIdentity,
+) -> (Option<usize>, Option<&'a str>, &'a str) {
+    if let Some(uri) = &name.namespace {
+        (Some(cache.canonical(uri)), None, name.local.as_str())
     } else {
         (None, name.prefix.as_deref(), name.local.as_str())
     }
 }
 
-fn check_distinct_attributes(attributes: &[Attribute<'_>]) -> Result<(), WriteError> {
+fn check_distinct_attributes(
+    attributes: &[Attribute<'_>],
+    cache: &mut UriIdentity,
+) -> Result<(), WriteError> {
     let mut seen = HashSet::with_capacity(attributes.len());
     for attr in attributes {
-        if !seen.insert(attribute_identity(&attr.name)) {
+        if !seen.insert(attribute_identity(&attr.name, cache)) {
             return Err(WriteError::Syntax(format!(
                 "duplicate attribute `{}`",
                 attr.name.local
@@ -264,6 +319,8 @@ pub struct Writer<W> {
     /// Declarations of elements opened and not yet closed, outermost first.
     /// `None` is the default namespace, which does not apply to attributes.
     ns_stack: Vec<Vec<(Option<String>, String)>>,
+    /// Cross-call cache so a long URI is hashed once per `Arc`, not once per attribute.
+    uris: UriIdentity,
 }
 
 impl<W: Write> Writer<W> {
@@ -272,6 +329,7 @@ impl<W: Write> Writer<W> {
         Self {
             sink,
             ns_stack: Vec::new(),
+            uris: UriIdentity::new(),
         }
     }
 
@@ -490,7 +548,7 @@ impl<W: Write> Writer<W> {
             check_qname(&attr.name)?;
             check_chars(&attr.value, "attribute value")?;
         }
-        check_distinct_attributes(attributes)?;
+        check_distinct_attributes(attributes, &mut self.uris)?;
         check_namespace_decls(namespaces)?;
         self.sink.write_all(b"<")?;
         self.write_qname(name)?;
@@ -733,6 +791,84 @@ mod tests {
         assert_eq!(
             xml,
             "<root a=\"1&amp;2&lt;3&quot;4\">x&lt;y&amp;z&gt;<e/><!--hi--><![CDATA[a]]]]><![CDATA[>b]]><?target data?></root>"
+        );
+    }
+
+    #[test]
+    fn same_uri_contents_are_one_attribute_even_with_different_arcs() {
+        use std::sync::Arc;
+
+        use crate::event::{Attribute, EmptyElement, Event, Namespace, QName, XmlText};
+
+        let left: Arc<str> = Arc::from("urn:same");
+        let right: Arc<str> = Arc::from("urn:same");
+        assert_ne!(Arc::as_ptr(&left), Arc::as_ptr(&right));
+        let element = EmptyElement {
+            name: QName {
+                prefix: None,
+                local: XmlText::borrowed("e"),
+                namespace: None,
+            },
+            attributes: vec![
+                Attribute {
+                    name: QName {
+                        prefix: Some(XmlText::borrowed("p")),
+                        local: XmlText::borrowed("a"),
+                        namespace: Some(left),
+                    },
+                    value: XmlText::borrowed("1"),
+                },
+                Attribute {
+                    name: QName {
+                        prefix: Some(XmlText::borrowed("q")),
+                        local: XmlText::borrowed("a"),
+                        namespace: Some(Arc::clone(&right)),
+                    },
+                    value: XmlText::borrowed("2"),
+                },
+            ],
+            namespaces: vec![
+                Namespace {
+                    prefix: Some(XmlText::borrowed("p")),
+                    uri: XmlText::borrowed("urn:same"),
+                },
+                Namespace {
+                    prefix: Some(XmlText::borrowed("q")),
+                    uri: XmlText::borrowed("urn:same"),
+                },
+            ],
+        };
+        let mut writer = Writer::new(Vec::new());
+        let err = writer
+            .write_event(&Event::EmptyElement(element))
+            .unwrap_err();
+        assert!(matches!(err, WriteError::Syntax(_)));
+        assert!(writer.get_ref().is_empty());
+
+        let again = EmptyElement {
+            name: QName {
+                prefix: None,
+                local: XmlText::borrowed("e"),
+                namespace: None,
+            },
+            attributes: vec![Attribute {
+                name: QName {
+                    prefix: Some(XmlText::borrowed("q")),
+                    local: XmlText::borrowed("b"),
+                    namespace: Some(right),
+                },
+                value: XmlText::borrowed("3"),
+            }],
+            namespaces: vec![Namespace {
+                prefix: Some(crate::event::XmlText::borrowed("q")),
+                uri: crate::event::XmlText::borrowed("urn:same"),
+            }],
+        };
+        writer.write_event(&Event::EmptyElement(again)).unwrap();
+        assert!(
+            String::from_utf8(writer.into_inner())
+                .unwrap()
+                .contains("q:b")
         );
     }
 }

@@ -148,7 +148,7 @@ pub(super) struct NsDecl {
     pub(super) uri: StrSpan,
 }
 
-/// Filled by the skeleton tests. Parsing does not build nodes yet.
+/// Payload of one node. The parser and the mutation API share this layout.
 #[derive(Copy, Clone)]
 #[allow(dead_code)]
 pub(super) enum Payload {
@@ -293,9 +293,17 @@ impl Document {
         self.nodes.len() as u64
     }
 
-    /// Logical heap bytes. Allocator capacity is not included.
+    /// Logical DOM bytes. Allocator capacity and spare `Vec` capacity are
+    /// not included.
     ///
+    /// The sum is the arena's UTF-8 length plus `size_of` times the number of
+    /// node, element, attribute, and namespace-declaration records. A URI
+    /// span shared by several names is stored once and counted once.
     /// Tombstones and attribute records that were copied aside still count.
+    ///
+    /// [`ParserConfig::max_dom_bytes`] uses this same total. A document whose
+    /// total equals the cap is kept. A build step whose total would be
+    /// greater is rejected with [`crate::LimitKind::DomBytes`].
     #[doc(hidden)]
     pub fn approx_heap_bytes(&self) -> u64 {
         (self.arena.len() as u64)
@@ -311,6 +319,28 @@ impl Document {
 
     pub(super) fn byte_cap(&self) -> u64 {
         self.max_dom_bytes.min(u32::MAX as u64)
+    }
+
+    pub(super) fn intern_span(&mut self, text: &str) -> Result<StrSpan, DomError> {
+        let start = u32::try_from(self.arena.len()).map_err(|_| DomError::Limit {
+            kind: DomLimit::DomBytes,
+            limit: self.byte_cap(),
+            actual: self.byte_cap().saturating_add(1),
+        })?;
+        let len = u32::try_from(text.len()).map_err(|_| DomError::Limit {
+            kind: DomLimit::DomBytes,
+            limit: self.byte_cap(),
+            actual: self.byte_cap().saturating_add(1),
+        })?;
+        if start.checked_add(len).is_none() {
+            return Err(DomError::Limit {
+                kind: DomLimit::DomBytes,
+                limit: self.byte_cap(),
+                actual: self.byte_cap().saturating_add(1),
+            });
+        }
+        self.arena.push_str(text);
+        Ok(StrSpan { start, len })
     }
 
     pub(super) fn reserve(&self, extra_nodes: u64, extra_bytes: u64) -> Result<(), DomError> {

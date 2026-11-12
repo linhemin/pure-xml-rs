@@ -1,4 +1,8 @@
 //! DOM mutation. Every `Err` returns before the arena or the links change.
+//!
+//! Each operation here is O(depth) or O(subtree): it walks ancestors or
+//! descendants to check hierarchy, depth, and namespaces. Build a large
+//! document with [`Document::parse`] instead of inserting nodes one by one.
 
 use std::cmp::Ordering;
 use std::mem::size_of;
@@ -77,6 +81,12 @@ impl Document {
     }
 
     /// A detached element. Insert it with [`Self::append_child`] or the insert methods.
+    ///
+    /// A prefix whose URI is missing or empty is [`DomError::Namespace`]. The
+    /// document is unchanged. The same name is rejected on an attribute.
+    ///
+    /// Creating the node is O(1). Linking it is O(depth). Build a large
+    /// document with [`Self::parse`].
     pub fn create_element(&mut self, name: Name<'_>) -> Result<NodeId, DomError> {
         self.check_element_name(name)?;
         let strings = name_bytes(name);
@@ -218,6 +228,8 @@ impl Document {
     }
 
     /// Link `child` as the last child of `parent`, moving it if it already has a parent.
+    ///
+    /// O(depth). Build a large document with [`Self::parse`].
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) -> Result<(), DomError> {
         let parent = self.require(parent)?;
         let child = self.require(child)?;
@@ -229,6 +241,8 @@ impl Document {
     }
 
     /// Insert `child` immediately before `reference`.
+    ///
+    /// O(depth). Build a large document with [`Self::parse`].
     pub fn insert_before(&mut self, child: NodeId, reference: NodeId) -> Result<(), DomError> {
         let reference = self.require(reference)?;
         let child = self.require(child)?;
@@ -243,6 +257,8 @@ impl Document {
     }
 
     /// Insert `child` immediately after `reference`.
+    ///
+    /// O(depth). Build a large document with [`Self::parse`].
     pub fn insert_after(&mut self, child: NodeId, reference: NodeId) -> Result<(), DomError> {
         let reference = self.require(reference)?;
         let child = self.require(child)?;
@@ -257,6 +273,8 @@ impl Document {
     }
 
     /// Unlink `node` and copy namespace bindings it still needs onto its root.
+    ///
+    /// O(depth) or O(subtree). Build a large document with [`Document::parse`].
     ///
     /// The node stays live. After this returns, the subtree does not depend on
     /// an ancestor declaration.
@@ -276,6 +294,8 @@ impl Document {
     }
 
     /// Unlink `node` and tombstone it and every descendant. Slots are not reused.
+    ///
+    /// O(subtree). Build a large document with [`Document::parse`].
     pub fn remove(&mut self, node: NodeId) -> Result<(), DomError> {
         let index = self.require(node)?;
         if self.nodes[index as usize].kind == NodeKind::Document {
@@ -314,6 +334,8 @@ impl Document {
     }
 
     /// Set an attribute, replacing any attribute with the same expanded name.
+    ///
+    /// O(depth). Build a large document with [`Document::parse`].
     ///
     /// The expanded name is the namespace URI plus the local name. A second
     /// call with a different prefix still replaces the old attribute when the
@@ -678,6 +700,9 @@ impl Document {
     ) -> Result<(), DomError> {
         let prefix = prefix.and_then(|span| self.str_at(span));
         let namespace = namespace.and_then(|span| self.str_at(span));
+        if prefix.is_some() && namespace.is_none_or(|uri| uri.is_empty()) {
+            return Err(DomError::Namespace);
+        }
         if attribute && prefix.is_none() {
             return if namespace.is_none() {
                 Ok(())
@@ -1059,7 +1084,9 @@ impl Document {
         if name.prefix == Some("xml") && name.namespace != Some(XML_NAMESPACE) {
             return Err(DomError::Namespace);
         }
-        if name.prefix.is_some() && name.namespace.is_none() {
+        // A prefix with a missing or empty URI cannot be serialized. Attributes
+        // already fail here; elements must fail here too, not at `to_string`.
+        if name.prefix.is_some() && name.namespace.is_none_or(|uri| uri.is_empty()) {
             return Err(DomError::Namespace);
         }
         if name.namespace == Some(XML_NAMESPACE) && name.prefix != Some("xml") {
@@ -1449,7 +1476,7 @@ impl Document {
         node.next = None;
     }
 
-    fn link_last(&mut self, parent: u32, child: u32) {
+    pub(super) fn link_last(&mut self, parent: u32, child: u32) {
         let last = self.nodes[parent as usize].last_child;
         if let Some(last) = last {
             self.nodes[last as usize].next = Some(child);
@@ -1582,9 +1609,80 @@ mod tests {
         doc.append_child(root, dtd).unwrap();
         let element = doc.create_element(Name::local("r")).unwrap();
         doc.append_child(root, element).unwrap();
+        assert_eq!(doc.to_string().unwrap(), "<!DOCTYPE r><r/>");
+        let stored = doc.get(dtd).unwrap().doctype().unwrap();
+        assert_eq!(stored.name, "r");
+        assert_eq!(stored.system_id, Some("r.dtd"));
+        assert_eq!(stored.public_id, Some("-//Example//EN"));
+    }
+
+    #[test]
+    fn prefixed_empty_namespace_is_rejected_like_an_attribute() {
+        let mut doc = Document::new();
+        let root = doc.root().unwrap().id();
+        let element = doc.create_element(Name::local("r")).unwrap();
+        doc.append_child(root, element).unwrap();
+        let before = doc.to_string().unwrap();
+        let nodes = doc.node_count();
+
+        let err = doc
+            .create_element(Name::qualified("", Some("p"), "e"))
+            .unwrap_err();
+        assert_eq!(err, DomError::Namespace);
+        assert_eq!(doc.node_count(), nodes);
+        assert_eq!(doc.to_string().unwrap(), before);
+
+        let err = doc
+            .set_attribute(element, Name::qualified("", Some("p"), "a"), "1")
+            .unwrap_err();
+        assert_eq!(err, DomError::Namespace);
+        assert_eq!(doc.to_string().unwrap(), before);
+
+        let bad = detached_prefixed_empty(&mut doc);
         assert_eq!(
-            doc.to_string().unwrap(),
-            "<!DOCTYPE r PUBLIC \"-//Example//EN\" \"r.dtd\"><r/>"
+            doc.append_child(element, bad).unwrap_err(),
+            DomError::Namespace
         );
+        assert!(doc.get(bad).unwrap().parent().is_none());
+
+        let sibling = doc.create_element(Name::local("s")).unwrap();
+        doc.append_child(element, sibling).unwrap();
+        let linked = doc.to_string().unwrap();
+        assert_eq!(
+            doc.insert_before(bad, sibling).unwrap_err(),
+            DomError::Namespace
+        );
+        assert_eq!(
+            doc.insert_after(bad, sibling).unwrap_err(),
+            DomError::Namespace
+        );
+        assert!(doc.get(bad).unwrap().parent().is_none());
+        assert_eq!(doc.to_string().unwrap(), linked);
+
+        let wrap = doc.create_element(Name::local("w")).unwrap();
+        doc.link_last(wrap.index(), bad.index());
+        assert_eq!(
+            doc.append_child(element, wrap).unwrap_err(),
+            DomError::Namespace
+        );
+        assert!(doc.get(wrap).unwrap().parent().is_none());
+        assert_eq!(doc.to_string().unwrap(), linked);
+    }
+
+    fn detached_prefixed_empty(doc: &mut Document) -> super::NodeId {
+        use super::{ElementData, NodeKind, Payload, Range};
+
+        let prefix = doc.intern_checked("p").unwrap();
+        let namespace = doc.intern_checked("").unwrap();
+        let local = doc.intern_checked("e").unwrap();
+        let slot = doc.elements.len() as u32;
+        doc.elements.push(ElementData {
+            namespace: Some(namespace),
+            prefix: Some(prefix),
+            local,
+            attrs: Range { start: 0, len: 0 },
+            ns_decls: Range { start: 0, len: 0 },
+        });
+        doc.push_detached(NodeKind::Element, Payload::Element(slot))
     }
 }

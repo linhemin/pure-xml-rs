@@ -1,5 +1,6 @@
 //! Serialize a document or a subtree through [`crate::Writer`].
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -18,6 +19,10 @@ impl Document {
     }
 
     /// Write the document. `omit_doctype` skips document-type nodes.
+    ///
+    /// A document type is written as `<!DOCTYPE name>`. System and public
+    /// identifiers stay on the node and are not written. An option to write
+    /// them is left for M3. The bytes are UTF-8, with no XML declaration.
     pub fn write_to_with<W: Write>(
         &self,
         writer: &mut crate::Writer<W>,
@@ -27,6 +32,9 @@ impl Document {
     }
 
     /// `write_to` into a `String`.
+    ///
+    /// The bytes are always UTF-8. An XML declaration is not written: a
+    /// declaration in the input is not stored on the document.
     pub fn to_string(&self) -> Result<String, WriteError> {
         self.to_string_with(WriteOptions::default())
     }
@@ -88,6 +96,9 @@ fn write_at<W: Write>(
     writer: &mut crate::Writer<W>,
     options: WriteOptions,
 ) -> Result<(), WriteError> {
+    let mut scope = OutScope::with_capacity(doc.ns_decls.len());
+    scope.push(Some("xml"), crate::event::XML_NAMESPACE);
+    let mut arcs = SpanArcs::default();
     let mut stack = vec![Job::Open(index)];
     let mut guard = doc.nodes.len().saturating_mul(4);
     while let Some(job) = stack.pop() {
@@ -96,21 +107,28 @@ fn write_at<W: Write>(
         }
         guard -= 1;
         match job {
-            Job::Close(current) => writer.write_event(&Event::EndElement(EndElement {
-                name: element_name(doc, current)?,
-            }))?,
-            Job::Open(current) => open_node(doc, current, &mut stack, writer, options)?,
+            Job::Close(current) => {
+                scope.leave();
+                writer.write_event(&Event::EndElement(EndElement {
+                    name: element_name(doc, current, &mut arcs)?,
+                }))?;
+            }
+            Job::Open(current) => open_node(
+                doc, current, &mut stack, writer, options, &mut scope, &mut arcs,
+            )?,
         }
     }
     Ok(())
 }
 
-fn open_node<W: Write>(
-    doc: &Document,
+fn open_node<'a, W: Write>(
+    doc: &'a Document,
     index: u32,
     stack: &mut Vec<Job>,
     writer: &mut crate::Writer<W>,
     options: WriteOptions,
+    scope: &mut OutScope<'a>,
+    arcs: &mut SpanArcs,
 ) -> Result<(), WriteError> {
     let node = &doc.nodes[index as usize];
     if !node.alive {
@@ -127,16 +145,18 @@ fn open_node<W: Write>(
             Ok(())
         }
         NodeKind::Element => {
-            let namespaces = covered_namespaces(doc, index)?;
-            let name = element_name(doc, index)?;
-            let attributes = attributes(doc, index);
+            let namespaces = namespaces_in_scope(doc, index, scope)?;
+            let name = element_name(doc, index, arcs)?;
+            let attributes = attributes(doc, index, arcs);
             let kids = children(doc, index);
             if kids.is_empty() {
                 writer.write_event(&Event::EmptyElement(EmptyElement {
                     name,
                     attributes,
                     namespaces,
-                }))
+                }))?;
+                scope.leave();
+                Ok(())
             } else {
                 stack.push(Job::Close(index));
                 for child in kids.into_iter().rev() {
@@ -165,44 +185,66 @@ fn open_node<W: Write>(
             if options.omit_doctype {
                 return Ok(());
             }
-            let Payload::Doctype {
-                name,
-                system,
-                public,
-            } = node.payload
-            else {
+            let Payload::Doctype { name, .. } = node.payload else {
                 return Ok(());
             };
             writer.write_event(&Event::Doctype(Doctype {
                 name: borrowed(doc, name),
-                system_id: system.map(|span| borrowed(doc, span)),
-                public_id: public.map(|span| borrowed(doc, span)),
+                // External ids stay on the node. Writing them is an M3 option.
+                system_id: None,
+                public_id: None,
                 has_internal_subset: false,
             }))
         }
     }
 }
 
-fn element_name(doc: &Document, index: u32) -> Result<QName<'_>, WriteError> {
+/// One `Arc` per arena span. The address is reused for every element that
+/// shares that span, so the writer does not hash the URI bytes again.
+#[derive(Default)]
+struct SpanArcs {
+    by_span: HashMap<(u32, u32), Arc<str>>,
+}
+
+fn arc_at(doc: &Document, span: StrSpan, arcs: &mut SpanArcs) -> Arc<str> {
+    let key = (span.start, span.len);
+    if let Some(existing) = arcs.by_span.get(&key) {
+        return Arc::clone(existing);
+    }
+    let text = doc.str_at(span).unwrap_or("");
+    let arc: Arc<str> = Arc::from(text);
+    arcs.by_span.insert(key, Arc::clone(&arc));
+    arc
+}
+
+fn element_name<'a>(
+    doc: &'a Document,
+    index: u32,
+    arcs: &mut SpanArcs,
+) -> Result<QName<'a>, WriteError> {
     let Payload::Element(slot) = doc.nodes[index as usize].payload else {
         return Err(WriteError::Syntax("missing element payload".to_string()));
     };
     let element = &doc.elements[slot as usize];
+    let namespace = element.namespace.and_then(|span| {
+        let text = doc.str_at(span)?;
+        if text.is_empty() {
+            None
+        } else {
+            Some(arc_at(doc, span, arcs))
+        }
+    });
     Ok(QName {
         prefix: element
             .prefix
             .and_then(|span| doc.str_at(span))
             .map(XmlText::borrowed),
         local: XmlText::borrowed(doc.str_at(element.local).unwrap_or("")),
-        namespace: element
-            .namespace
-            .and_then(|span| doc.str_at(span))
-            .filter(|uri| !uri.is_empty())
-            .map(Arc::<str>::from),
+        namespace,
     })
 }
 
-fn attributes(doc: &Document, index: u32) -> Vec<Attribute<'_>> {
+fn attributes<'a>(doc: &'a Document, index: u32, arcs: &mut SpanArcs) -> Vec<Attribute<'a>> {
     let Payload::Element(slot) = doc.nodes[index as usize].payload else {
         return Vec::new();
     };
@@ -222,9 +264,8 @@ fn attributes(doc: &Document, index: u32) -> Vec<Attribute<'_>> {
                 local: XmlText::borrowed(doc.str_at(attr.local).unwrap_or("")),
                 namespace: attr
                     .namespace
-                    .and_then(|span| doc.str_at(span))
-                    .filter(|uri| !uri.is_empty())
-                    .map(Arc::<str>::from),
+                    .filter(|span| doc.str_at(*span).is_some_and(|uri| !uri.is_empty()))
+                    .map(|span| arc_at(doc, span, arcs)),
             },
             value: XmlText::borrowed(doc.str_at(attr.value).unwrap_or("")),
         })
@@ -236,16 +277,136 @@ struct Binding<'a> {
     uri: &'a str,
 }
 
-/// Declarations stored on the element, plus any binding its name or attributes
-/// need so the start tag stays namespace-well-formed on its own.
-fn covered_namespaces<'a>(doc: &'a Document, index: u32) -> Result<Vec<Namespace<'a>>, WriteError> {
+/// Declarations already written by an ancestor, plus the ones this element adds.
+///
+/// Stored declarations are always emitted, including ones an ancestor already
+/// wrote. A binding is invented only when the name needs one that is not in
+/// this scope. A subtree write starts from a fresh scope, so its root stays
+/// self-contained.
+struct OutScope<'a> {
+    /// One frame per open element, plus a base frame for `xml`.
+    ///
+    /// Declarations are appended here instead of inserted into a map of every
+    /// prefix. A map that grows with the declaration count rehashes and makes
+    /// `ns_scaled` look superlinear. Lookups scan the open frames; a cache
+    /// remembers a prefix until the next push or pop.
+    frames: Vec<Vec<(Option<&'a str>, &'a str)>>,
+    defaults: Vec<&'a str>,
+    cache: HashMap<&'a str, (u64, &'a str)>,
+    epoch: u64,
+    /// `(data pointer, length)` of a URI already interned, mapping to the one
+    /// canonical `&str` for that content. Length is part of the key: an empty
+    /// slice and a longer slice can share a starting address.
+    proven: HashMap<(usize, usize), &'a str>,
+    /// Content intern table. The key is the canonical string itself.
+    by_text: HashMap<&'a str, &'a str>,
+}
+
+impl<'a> OutScope<'a> {
+    fn with_capacity(decls: usize) -> Self {
+        let mut frames = Vec::with_capacity(64);
+        frames.push(Vec::new());
+        Self {
+            frames,
+            defaults: Vec::new(),
+            cache: HashMap::new(),
+            epoch: 1,
+            proven: HashMap::with_capacity(decls.min(64)),
+            by_text: HashMap::with_capacity(decls.min(64)),
+        }
+    }
+
+    fn lookup(&mut self, prefix: Option<&str>) -> Option<&'a str> {
+        match prefix {
+            None => self.defaults.last().copied(),
+            Some(prefix) => self.lookup_prefix(prefix),
+        }
+    }
+
+    fn lookup_prefix(&mut self, prefix: &str) -> Option<&'a str> {
+        if let Some(&(epoch, uri)) = self.cache.get(prefix)
+            && epoch == self.epoch
+        {
+            return Some(uri);
+        }
+        for frame in self.frames.iter().rev() {
+            for (bound, uri) in frame.iter().rev() {
+                if bound.is_some_and(|bound| bound == prefix) {
+                    let uri = *uri;
+                    let key = bound.unwrap();
+                    self.cache.insert(key, (self.epoch, uri));
+                    return Some(uri);
+                }
+            }
+        }
+        None
+    }
+
+    fn push(&mut self, prefix: Option<&'a str>, uri: &'a str) {
+        if prefix.is_none() {
+            self.defaults.push(uri);
+        }
+        self.frames
+            .last_mut()
+            .expect("base frame")
+            .push((prefix, uri));
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    fn enter(&mut self) {
+        self.frames.push(Vec::new());
+    }
+
+    fn leave(&mut self) {
+        let frame = self.frames.pop().expect("element frame");
+        let defaults = frame.iter().filter(|(prefix, _)| prefix.is_none()).count();
+        let len = self.defaults.len();
+        self.defaults.truncate(len.saturating_sub(defaults));
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// One id per URI content. `(pointer, length)` is only a fast path; the
+    /// first sight of that pair hashes the bytes and joins the content table.
+    fn canonical(&mut self, uri: &'a str) -> &'a str {
+        let key = (uri.as_ptr() as usize, uri.len());
+        if let Some(canon) = self.proven.get(&key).copied() {
+            return canon;
+        }
+        if let Some(canon) = self.by_text.get(uri).copied() {
+            self.proven.insert(key, canon);
+            return canon;
+        }
+        self.by_text.insert(uri, uri);
+        self.proven.insert(key, uri);
+        uri
+    }
+
+    /// True when both strings are the same namespace URI.
+    fn same_uri(&mut self, existing: &'a str, uri: &'a str) -> bool {
+        let left = self.canonical(existing);
+        let right = self.canonical(uri);
+        left.as_ptr() == right.as_ptr() && left.len() == right.len()
+    }
+}
+
+fn namespaces_in_scope<'a>(
+    doc: &'a Document,
+    index: u32,
+    scope: &mut OutScope<'a>,
+) -> Result<Vec<Namespace<'a>>, WriteError> {
     let Payload::Element(slot) = doc.nodes[index as usize].payload else {
         return Ok(Vec::new());
     };
     let element = &doc.elements[slot as usize];
-    let mut bindings = stored_bindings(doc, index);
-    require_element_binding(
-        &mut bindings,
+    scope.enter();
+    let mut out = Vec::new();
+    for binding in stored_bindings(doc, index) {
+        scope.push(binding.prefix, binding.uri);
+        out.push(namespace_of(binding));
+    }
+    require_element(
+        scope,
+        &mut out,
         element.prefix.and_then(|span| doc.str_at(span)),
         element
             .namespace
@@ -256,21 +417,23 @@ fn covered_namespaces<'a>(doc: &'a Document, index: u32) -> Result<Vec<Namespace
     let start = range.start as usize;
     let end = start + range.len as usize;
     for attr in doc.attrs.get(start..end).unwrap_or(&[]) {
-        require_attribute_binding(
-            &mut bindings,
+        require_attribute(
+            scope,
+            &mut out,
             attr.prefix.and_then(|span| doc.str_at(span)),
             attr.namespace
                 .and_then(|span| doc.str_at(span))
                 .unwrap_or(""),
         )?;
     }
-    Ok(bindings
-        .into_iter()
-        .map(|binding| Namespace {
-            prefix: binding.prefix.map(XmlText::borrowed),
-            uri: XmlText::borrowed(binding.uri),
-        })
-        .collect())
+    Ok(out)
+}
+
+fn namespace_of(binding: Binding<'_>) -> Namespace<'_> {
+    Namespace {
+        prefix: binding.prefix.map(XmlText::borrowed),
+        uri: XmlText::borrowed(binding.uri),
+    }
 }
 
 fn stored_bindings(doc: &Document, index: u32) -> Vec<Binding<'_>> {
@@ -294,8 +457,9 @@ fn stored_bindings(doc: &Document, index: u32) -> Vec<Binding<'_>> {
 }
 
 /// The element name uses the default namespace when it has no prefix.
-fn require_element_binding<'a>(
-    bindings: &mut Vec<Binding<'a>>,
+fn require_element<'a>(
+    scope: &mut OutScope<'a>,
+    out: &mut Vec<Namespace<'a>>,
     prefix: Option<&'a str>,
     uri: &'a str,
 ) -> Result<(), WriteError> {
@@ -309,22 +473,26 @@ fn require_element_binding<'a>(
         };
     }
     if prefix.is_none() && uri.is_empty() {
-        if let Some(existing) = bindings.iter().find(|binding| binding.prefix.is_none())
-            && !existing.uri.is_empty()
+        if scope
+            .lookup(None)
+            .is_some_and(|existing| !existing.is_empty())
         {
-            return Err(WriteError::Syntax(
-                "default namespace does not match the element name".to_string(),
-            ));
+            scope.push(None, "");
+            out.push(Namespace {
+                prefix: None,
+                uri: XmlText::borrowed(""),
+            });
         }
         return Ok(());
     }
-    align_binding(bindings, prefix, uri)
+    align_scope(scope, out, prefix, uri)
 }
 
 /// An unprefixed attribute is in no namespace. The default namespace does not
 /// apply to it, so serialization must not invent a prefix or a declaration.
-fn require_attribute_binding<'a>(
-    bindings: &mut Vec<Binding<'a>>,
+fn require_attribute<'a>(
+    scope: &mut OutScope<'a>,
+    out: &mut Vec<Namespace<'a>>,
     prefix: Option<&'a str>,
     uri: &'a str,
 ) -> Result<(), WriteError> {
@@ -340,23 +508,22 @@ fn require_attribute_binding<'a>(
             ))
         };
     }
-    align_binding(bindings, prefix, uri)
+    align_scope(scope, out, prefix, uri)
 }
 
-fn align_binding<'a>(
-    bindings: &mut Vec<Binding<'a>>,
+fn align_scope<'a>(
+    scope: &mut OutScope<'a>,
+    out: &mut Vec<Namespace<'a>>,
     prefix: Option<&'a str>,
     uri: &'a str,
 ) -> Result<(), WriteError> {
-    if let Some(existing) = bindings.iter().find(|binding| binding.prefix == prefix) {
-        return if existing.uri == uri {
+    if let Some(existing) = scope.lookup(prefix) {
+        return if scope.same_uri(existing, uri) {
             Ok(())
         } else {
             Err(WriteError::Syntax(format!(
-                "prefix `{}` is bound to `{}` and `{}`",
+                "prefix `{}` is bound to `{existing}` and `{uri}`",
                 prefix.unwrap_or(""),
-                existing.uri,
-                uri
             )))
         };
     }
@@ -365,7 +532,11 @@ fn align_binding<'a>(
             "a prefixed name has no namespace URI".to_string(),
         ));
     }
-    bindings.push(Binding { prefix, uri });
+    scope.push(prefix, uri);
+    out.push(Namespace {
+        prefix: prefix.map(XmlText::borrowed),
+        uri: XmlText::borrowed(uri),
+    });
     Ok(())
 }
 
@@ -403,8 +574,10 @@ fn children(doc: &Document, parent: u32) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
+    use super::OutScope;
     use crate::dom::Document;
-    use crate::dom::edit::WriteOptions;
+    use crate::dom::document::NodeKind;
+    use crate::dom::edit::{Name, WriteOptions};
 
     #[test]
     fn omit_doctype_drops_a_system_identifier() {
@@ -415,11 +588,138 @@ mod tests {
         let element = doc.create_element(crate::dom::Name::local("r")).unwrap();
         doc.append_child(root, element).unwrap();
         let full = doc.to_string().unwrap();
-        assert!(full.contains("<!DOCTYPE r SYSTEM \"sys\">"));
+        assert!(full.starts_with("<!DOCTYPE r>"));
+        assert!(!full.contains("SYSTEM"));
+        let stored = doc.get(dtd).unwrap().doctype().unwrap();
+        assert_eq!(stored.system_id, Some("sys"));
         let omitted = doc
             .to_string_with(WriteOptions { omit_doctype: true })
             .unwrap();
         assert!(!omitted.contains("<!DOCTYPE"));
         assert!(omitted.contains("<r"));
+    }
+
+    #[test]
+    fn ancestor_declarations_are_not_invented_again() {
+        let xml = r#"<r xmlns="urn:b" xmlns:p="urn:a"><c xmlns="urn:b"><p:d xmlns:p="urn:a" p:x="1"/></c></r>"#;
+        let doc = Document::parse(xml).unwrap();
+        let once = doc.to_string().unwrap();
+        assert_eq!(once, xml);
+        let twice = Document::parse(&once).unwrap().to_string().unwrap();
+        assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn no_namespace_child_clears_a_default_namespace() {
+        let mut doc = Document::new();
+        let root = doc.root().unwrap().id();
+        let element = doc
+            .create_element(Name::qualified("urn:b", None, "r"))
+            .unwrap();
+        doc.declare_namespace(element, None, "urn:b").unwrap();
+        doc.append_child(root, element).unwrap();
+        let child = doc.create_element(Name::local("c")).unwrap();
+        doc.link_last(element.index(), child.index());
+        assert_eq!(
+            doc.to_string().unwrap(),
+            r#"<r xmlns="urn:b"><c xmlns=""/></r>"#
+        );
+    }
+
+    #[test]
+    fn same_uri_rejects_slices_that_share_a_starting_address() {
+        let buf = "abcdef";
+        let empty = &buf[..0];
+        let five = &buf[..5];
+        let six = &buf[..6];
+        assert_eq!(empty.as_ptr(), five.as_ptr());
+        assert_eq!(five.as_ptr(), six.as_ptr());
+        let mut scope = OutScope::with_capacity(4);
+        assert!(!scope.same_uri(empty, five));
+        assert!(!scope.same_uri(five, six));
+        assert!(scope.same_uri(five, five));
+    }
+
+    #[test]
+    fn same_uri_accepts_equal_contents_at_different_addresses() {
+        let left = "urn:b".to_string();
+        let right = "urn:b".to_string();
+        assert_ne!(left.as_ptr(), right.as_ptr());
+        let mut scope = OutScope::with_capacity(2);
+        assert!(scope.same_uri(left.as_str(), right.as_str()));
+    }
+
+    #[test]
+    fn empty_default_and_nonempty_uri_round_trip() {
+        let xml = r#"<r xmlns=""><c xmlns="urn:b"><d xmlns=""/></c></r>"#;
+        let doc = Document::parse(xml).unwrap();
+        let once = doc.to_string().unwrap();
+        let again = Document::parse(&once).unwrap();
+        assert_eq!(element_shape(&doc), element_shape(&again));
+        assert_eq!(again.to_string().unwrap(), once);
+    }
+
+    fn element_shape(doc: &Document) -> Vec<(String, Option<String>)> {
+        let mut out = Vec::new();
+        let mut node = doc.root().and_then(|root| root.first_child());
+        let mut guard = doc.node_count();
+        while let Some(current) = node {
+            if guard == 0 {
+                break;
+            }
+            guard -= 1;
+            if current.kind() == Some(NodeKind::Element) {
+                let name = current.name().unwrap();
+                out.push((name.local.to_string(), name.namespace.map(str::to_string)));
+                if let Some(child) = current.first_child() {
+                    node = Some(child);
+                    continue;
+                }
+            }
+            node = current.next_sibling().or_else(|| {
+                let mut parent = current.parent();
+                while let Some(up) = parent {
+                    if let Some(next) = up.next_sibling() {
+                        return Some(next);
+                    }
+                    parent = up.parent();
+                }
+                None
+            });
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod d_c3_3_scratch_tests {
+    use super::OutScope;
+
+    /// 内部构造：同一 arena 里的空切片与非空切片同址、不同长度。
+    #[test]
+    fn same_start_different_len_is_not_same_uri() {
+        let arena = String::from("urn:b");
+        let empty = &arena[0..0];
+        let full = &arena[0..5];
+        assert_eq!(empty.as_ptr(), full.as_ptr());
+        let mut scope = OutScope::with_capacity(0);
+        assert!(
+            !scope.same_uri(empty, full),
+            "空 URI 与 urn:b 被判为同一 URI"
+        );
+        let other = String::from("urn:b");
+        assert!(scope.same_uri(&other, full), "同内容不同地址应判相同");
+    }
+
+    /// 反向：先 canonical 非空，再遇到同址空切片。
+    #[test]
+    fn same_start_reverse_order() {
+        let arena = String::from("urn:a");
+        let full = &arena[0..5];
+        let empty = &arena[0..0];
+        let mut scope = OutScope::with_capacity(0);
+        let other = String::from("urn:a");
+        assert!(scope.same_uri(&other, full));
+        assert!(!scope.same_uri(&other, empty), "空 URI 被当成 urn:a");
     }
 }

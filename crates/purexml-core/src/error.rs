@@ -40,8 +40,9 @@ impl fmt::Display for Position {
 ///
 /// `limit` and `actual` on [`ErrorKind::SecurityLimit`] use the same units for
 /// every variant except that callers should treat the numbers as opaque counts
-/// of the resource named here (bytes, depth, or repetitions).
+/// of the resource named here (bytes, depth, nodes, or repetitions).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum LimitKind {
     /// General-entity nesting depth. A document-level reference is depth 1.
     EntityDepth,
@@ -106,6 +107,21 @@ pub enum LimitKind {
     /// the subset longer than the limit. The position is that offending byte
     /// itself.
     InternalSubsetLength,
+    /// Nodes in one document, including the document node and tombstones.
+    ///
+    /// Checked while building a DOM, after the event that would create the
+    /// node. `actual` is the node count that would result.
+    NodeCount,
+    /// Logical DOM bytes ([`crate::dom::Document::approx_heap_bytes`]), not
+    /// allocator capacity.
+    ///
+    /// The meter is the arena's UTF-8 length plus one record size for each
+    /// node, element, attribute, and namespace declaration. A URI span shared
+    /// by several names is stored once and counted once. A build whose total
+    /// equals `max_dom_bytes` is kept. The next byte over that cap is
+    /// rejected. `actual` is the byte count that reserve predicted for the
+    /// step that crossed the cap.
+    DomBytes,
 }
 
 impl fmt::Display for LimitKind {
@@ -123,6 +139,8 @@ impl fmt::Display for LimitKind {
             Self::AttrValueLength => "attribute value length",
             Self::TokenLength => "token length",
             Self::InternalSubsetLength => "internal subset length",
+            Self::NodeCount => "node count",
+            Self::DomBytes => "dom bytes",
         })
     }
 }
@@ -131,6 +149,7 @@ impl fmt::Display for LimitKind {
 ///
 /// Human-readable detail lives on [`Error::message`]. Match on this enum in tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ErrorKind {
     /// A [`ParserConfig`](crate::ParserConfig) limit was exceeded.
     SecurityLimit {

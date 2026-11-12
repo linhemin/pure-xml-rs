@@ -70,7 +70,9 @@ fn key_of(e: &purexml::Error) -> Key {
         purexml::ErrorKind::ExternalEntityForbidden => {
             (ErrorClass::ExternalEntityForbidden, None, None, None)
         }
-        _ => (ErrorClass::Io, None, None, None),
+        purexml::ErrorKind::Io => (ErrorClass::Io, None, None, None),
+        // #[non_exhaustive]：未知变体不能并入 Io，单列 Unknown 并保留 Debug 全文用于比较
+        other => (ErrorClass::Unknown, Some(format!("{other:?}")), None, None),
     };
     (c, k, l, a, p)
 }
